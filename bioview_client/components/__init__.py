@@ -6,6 +6,7 @@ from .device_status import DeviceStatusPanel
 from .experiment_settings import ExperimentSettingsPanel
 from .log_display import LogDisplayPanel
 from .plot_grid import PlotGrid
+from .server_connector import ServerConnector
 from .text_dialog import TextDialog
 from .usrp_device_config import UsrpDeviceConfigPanel
 
@@ -17,6 +18,7 @@ __all__ = [
     "ExperimentSettingsPanel",
     "LogDisplayPanel",
     "PlotGrid",
+    "ServerConnector",
     "TextDialog",
     "UsrpDeviceConfigPanel",
 ]

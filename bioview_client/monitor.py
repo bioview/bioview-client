@@ -22,6 +22,7 @@ from bioview_client.components import (
     ExperimentSettingsPanel,
     LogDisplayPanel,
     PlotGrid,
+    ServerConnector, 
     TextDialog,
     UsrpDeviceConfigPanel,
 )
@@ -111,6 +112,9 @@ class BioViewMonitor(QMainWindow):
         main_layout = QVBoxLayout(central_widget)
 
         # Top shelf container
+        self.server_connector_panel = ServerConnector() 
+        main_layout.addWidget(self.server_connector_panel, stretch=1)
+
         top_layout = QHBoxLayout()
 
         # All controls are in one container
@@ -159,7 +163,7 @@ class BioViewMonitor(QMainWindow):
             self.usrp_config_panel[idx] = UsrpDeviceConfigPanel(cfg)
             experiment_layout.addWidget(self.usrp_config_panel[idx], stretch=1)
 
-        controls_layout.addLayout(experiment_layout, stretch=4)
+        controls_layout.addLayout(experiment_layout, stretch=1)
         top_layout.addLayout(controls_layout, stretch=3)
 
         # Metadata Panels
@@ -335,8 +339,12 @@ class BioViewMonitor(QMainWindow):
     
      
 if __name__ == "__main__":
+    # import qdarktheme
+
+    # qdarktheme.enable_hi_dpi()
     app = QApplication(sys.argv)
-    
+    # qdarktheme.setup_theme(theme = 'auto')
+
     # Create and show main window
     window = BioViewMonitor()
     window.show()

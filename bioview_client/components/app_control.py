@@ -24,16 +24,14 @@ class AppControlPanel(QGroupBox):
         padlen = 8
 
         # Connect Button
-        self.connect_button = QPushButton("   Connect")
+        self.connect_button = QPushButton("Connect")
         self.connect_button.setIcon(qta.icon("fa6s.house", color=get_qcolor("purple")))
-        self.connect_button.setStyleSheet(f"padding: {padlen}px;")
         self.connect_button.clicked.connect(self.on_connect_clicked)
         layout.addWidget(self.connect_button)
 
         # Start Button
-        self.start_button = QPushButton("   Start")
+        self.start_button = QPushButton("Start")
         self.start_button.setIcon(qta.icon("fa6s.play", color=get_qcolor("green")))
-        self.start_button.setStyleSheet(f"padding: {padlen}px;")
         self.start_button.setEnabled(False)
         self.start_button.clicked.connect(self.on_start_clicked)
         layout.addWidget(self.start_button)
@@ -44,34 +42,31 @@ class AppControlPanel(QGroupBox):
         layout.addWidget(self.save_checkbox)
 
         # Instructions Checkbox (for audio/popups, etc)
-        self.instructions_checkbox = QCheckBox(" Instructions ?")
+        self.instructions_checkbox = QCheckBox("Instructions ?")
         self.instructions_checkbox.clicked.connect(self.on_instructions_toggled)
         layout.addWidget(self.instructions_checkbox)
 
         # Stop Button
-        self.stop_button = QPushButton("   Stop")
+        self.stop_button = QPushButton("Stop")
         self.stop_button.setIcon(qta.icon("fa6s.stop", color=get_qcolor("red")))
-        self.stop_button.setStyleSheet(f"padding: {padlen}px;")
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.on_stop_clicked)
         layout.addWidget(self.stop_button)
 
         # Gain Balance Button
-        self.gain_balance_button = QPushButton("   Gain Balance")
+        self.gain_balance_button = QPushButton("Gain Balance")
         self.gain_balance_button.setIcon(
             qta.icon("fa6s.rotate", color=get_qcolor("blue"))
         )
-        self.gain_balance_button.setStyleSheet(f"padding: {padlen}px;")
         self.gain_balance_button.setEnabled(False)
         self.gain_balance_button.clicked.connect(self.on_gain_balance_clicked)
         layout.addWidget(self.gain_balance_button)
 
         # Frequency Sweep Button
-        self.freq_sweep_button = QPushButton("   Frequency Sweep")
+        self.freq_sweep_button = QPushButton("Frequency Sweep")
         self.freq_sweep_button.setIcon(
             qta.icon("fa6s.rotate", color=get_qcolor("blue"))
         )
-        self.freq_sweep_button.setStyleSheet(f"padding: {padlen}px;")
         self.freq_sweep_button.setEnabled(False)
         self.freq_sweep_button.clicked.connect(self.on_freq_sweep_clicked)
         layout.addWidget(self.freq_sweep_button)
