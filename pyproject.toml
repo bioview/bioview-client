@@ -1,0 +1,21 @@
+[project]
+name = "bioview-client"
+version = "0.9.3"
+description = "A front-end for real-time visualization of data acquired by the BioView server"
+authors = [
+    {name = "Aakash Kapoor",email = "113218196+meowkash@users.noreply.github.com"}
+]
+license = {text = "GPL-v3"}
+readme = "README.md"
+requires-python = ">=3.12, <3.13"
+dependencies = [
+    "pyqt6 (>=6.9.1,<7.0.0)",
+    "pyqtgraph (>=0.13.7,<0.14.0)",
+    "qtawesome (>=1.4.0,<2.0.0)",
+    "darkdetect (>=0.8.0,<0.9.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
