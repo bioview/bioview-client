@@ -21,7 +21,6 @@ class AppControlPanel(QGroupBox):
 
         # Initialize UI
         layout = QHBoxLayout()
-        padlen = 8
 
         # Connect Button
         self.connect_button = QPushButton("Connect")
