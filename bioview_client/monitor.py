@@ -18,13 +18,13 @@ from bioview_client.components import (
     AnnotateEventPanel,
     AppControlPanel,
     ConfigurationPrompt,
-    DeviceStatusPanel,
     ExperimentSettingsPanel,
     LogDisplayPanel,
     PlotGrid,
     ServerConnector, 
     TextDialog,
     UsrpDeviceConfigPanel,
+    StatusBar
 )
 from bioview_client.handler import Client
 from bioview_client.constants import DEFAULT_COMMON_CONFIGURATION
@@ -188,13 +188,7 @@ class BioViewMonitor(QMainWindow):
         central_widget.setLayout(main_layout)
 
         # Status Bar
-        self.status_bar = QStatusBar()
-        self.setStatusBar(self.status_bar)
-        self.device_status_panel = DeviceStatusPanel(self.devices)
-        # Add device status panel to status bar (on the right side)
-        self.status_bar.addPermanentWidget(self.device_status_panel)
-        # Add some info text to status bar
-        self.status_bar.showMessage("Ready")
+        self.setStatusBar(StatusBar(self))
 
     def _connect_logging(self):
         self.plot_grid.logEvent.connect(self.log_display_panel.log_message)

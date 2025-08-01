@@ -52,13 +52,13 @@ class Client(QThread):
     # Data signals for graphical output
     data_received = pyqtSignal(np.ndarray) 
     
-    def __init__(self, address='localhost', control_port=9999, data_port=9998):
+    def __init__(self, address='localhost', data_port=9998, control_port=9999):
         super().__init__()
         
         # Connection parameters
         self.address = address
-        self.control_port = control_port
         self.data_port = data_port
+        self.control_port = control_port
         
         # Sockets
         self.control_socket = None

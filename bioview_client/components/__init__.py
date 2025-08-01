@@ -7,18 +7,20 @@ from .experiment_settings import ExperimentSettingsPanel
 from .log_display import LogDisplayPanel
 from .plot_grid import PlotGrid
 from .server_connector import ServerConnector
+from .status_bar import StatusBar
 from .text_dialog import TextDialog
 from .usrp_device_config import UsrpDeviceConfigPanel
 
 __all__ = [
     "AnnotateEventPanel",
     "AppControlPanel",
-    "ConfigPrompt",
+    "ConfigurationPrompt",
     "DeviceStatusPanel",
     "ExperimentSettingsPanel",
     "LogDisplayPanel",
     "PlotGrid",
     "ServerConnector",
+    "StatusBar", 
     "TextDialog",
     "UsrpDeviceConfigPanel",
 ]
