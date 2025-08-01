@@ -9,7 +9,7 @@ import logging # TODO: Remove
 from pathlib import Path
 
 from PyQt6.QtGui import QGuiApplication, QIcon
-from PyQt6.QtWidgets import QApplication, QHBoxLayout, QMainWindow, QStatusBar, QVBoxLayout, QWidget, QDialog
+from PyQt6.QtWidgets import QApplication, QHBoxLayout, QMainWindow, QVBoxLayout, QWidget, QDialog
 
 from typing import List, Dict
 from bioview_client.constants import ConnectionStatus, RunningStatus, DataSource
@@ -21,10 +21,9 @@ from bioview_client.components import (
     ExperimentSettingsPanel,
     LogDisplayPanel,
     PlotGrid,
-    ServerConnector, 
+    StatusBar,
     TextDialog,
-    UsrpDeviceConfigPanel,
-    StatusBar
+    UsrpDeviceConfigPanel
 )
 from bioview_client.handler import Client
 from bioview_client.constants import DEFAULT_COMMON_CONFIGURATION
@@ -112,9 +111,6 @@ class BioViewMonitor(QMainWindow):
         main_layout = QVBoxLayout(central_widget)
 
         # Top shelf container
-        self.server_connector_panel = ServerConnector() 
-        main_layout.addWidget(self.server_connector_panel, stretch=1)
-
         top_layout = QHBoxLayout()
 
         # All controls are in one container
