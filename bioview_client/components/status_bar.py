@@ -1,84 +1,9 @@
 import socket
 from PyQt6.QtGui import QColor, QPainter, QPen
 from PyQt6.QtWidgets import (QHBoxLayout, QPushButton, QComboBox, QStatusBar, QLabel, QWidget)
-from PyQt6.QtCore import pyqtSignal, QThread, QEvent, Qt
+from PyQt6.QtCore import pyqtSignal, QEvent, Qt
 
 from bioview_client.constants import ConnectionStatus
-
-class NetworkScanner(QThread):
-    scan_progress = pyqtSignal(int)
-    scan_complete = pyqtSignal()
-    server_found = pyqtSignal(str, int)
-    
-    def __init__(self, data_port=8888, control_port=8889):
-        super().__init__()
-        # Available servers should have both data and control port
-        self.data_port = data_port
-        self.control_port = control_port
-        self.scanning = False
-        
-    def run(self):
-        """Scan local network for servers"""
-        self.scanning = True
-        
-        # Get local IP range
-        local_ip = self.get_local_ip()
-        if not local_ip:
-            self.scan_complete.emit()
-            return
-            
-        # Extract network prefix (assumes /24 subnet)
-        ip_parts = local_ip.split('.')
-        network_prefix = '.'.join(ip_parts[:3])
-        
-        # Scan IP range
-        for i in range(1, 255):
-            if not self.scanning:
-                break
-                
-            target_ip = f"{network_prefix}.{i}"
-            
-            try:
-                # Quick connection test
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(0.1)  # 100ms timeout
-                
-                # NOTE: This may be potentially vulnerable. However, since this is being done over a local network itself, the risks may be low. 
-                # TODO: Confirm security with someone who deals with a networking stack. 
-
-                # We will only try connecting to control ports
-                result = sock.connect_ex((target_ip, self.control_port))
-                
-                if result == 0:
-                    # Server found
-                    self.server_found.emit(target_ip, self.data_port, self.control_port)
-                
-                sock.close()
-                
-            except Exception:
-                pass
-            
-            # Update progress
-            progress = int((i / 254) * 100)
-            self.scan_progress.emit(progress)
-        
-        self.scan_complete.emit()
-    
-    def get_local_ip(self):
-        """Get the local IP address"""
-        try:
-            # Connect to a remote address to determine local IP
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.connect(("8.8.8.8", 80)) 
-            local_ip = sock.getsockname()[0]
-            sock.close()
-            return local_ip
-        except Exception:
-            return None
-    
-    def stop_scan(self):
-        """Stop the network scan"""
-        self.scanning = False
 
 class ServerConnector(QWidget):
     '''

@@ -21,57 +21,198 @@ import json
 import struct # TODO: Remove by confirming packet structure
 import socket 
 import numpy as np
+from enum import Enum, auto
+from typing import List, Dict
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from bioview_client.constants import Command, Response, MAX_BUFFER_SIZE
+from bioview_client.constants import Command, Response, DataSource, MAX_BUFFER_SIZE, APP_VERSION, SUPPORTED_COMMANDS
+from bioview_client.utils import get_ip
 
-SUPPORTED_COMMANDS = [
-    Command.PING,
-    Command.DISCOVER,
-    Command.CONNECT,
-    Command.DISCONNECT,
-    Command.CONFIGURE,
-    Command.START,
-    Command.STOP,
-    Command.UPDATE
-]
+class CLIENT_STATUS(Enum):
+    DEFAULT = auto      # Nothing is going on
+    SCANNING = auto
+    SERVER_CONNECTED = auto
+    SERVER_DISCONNECTED = auto
+    STREAMING = auto
 
 class Client(QThread):
-    # Control signals that provide the functionality listed above
-    server_connected = pyqtSignal()
-    server_disconnected = pyqtSignal()
-    device_connected = pyqtSignal(str)
-    device_connection_failed = pyqtSignal(str)
-    device_disconnected = pyqtSignal()
-    streaming_started = pyqtSignal()
-    streaming_stopped = pyqtSignal()
+    # Server control signals 
+    server_scan_completed = pyqtSignal()
+    server_connected = pyqtSignal(bool)
+    server_disconnected = pyqtSignal(bool)
+    
+    # Server info signals 
+    server_scan_progress = pyqtSignal(int)
+    server_status = pyqtSignal(dict)
+    
+    # Device control signals 
+    device_connected = pyqtSignal(str, bool)
+    device_disconnected = pyqtSignal(str, bool)
+    streaming_started = pyqtSignal(bool)
+    streaming_stopped = pyqtSignal(bool)
+    
+    # Device info signals 
+    devices_discovered = pyqtSignal(dict)
+    
+    # General info signals
     error_occurred = pyqtSignal(str)
     log_message = pyqtSignal(str, str)
     
     # Data signals for graphical output
-    data_received = pyqtSignal(np.ndarray) 
+    data_received = pyqtSignal(DataSource, np.ndarray) 
     
-    def __init__(self, address='localhost', data_port=9998, control_port=9999):
+    def __init__(self, data_port=9998, control_port=9999):
         super().__init__()
         
-        # Connection parameters
-        self.address = address
-        self.data_port = data_port
-        self.control_port = control_port
+        # Client network parameters
+        self.address: str = get_ip() 
+        self.network_prefix: str = self.address[:self.address.rindex('.')]
+
+        # Connection parameters 
+        self.discovered_servers: List[Dict] = []
+        self.selected_server: Dict = {} # (hostname: IP)
+        
+        self.data_port: int = data_port
+        self.control_port: int = control_port
+        
+        # Threads for command and data handling 
+        self.command_thread = None 
+        self.data_thread = None
         
         # Sockets
         self.control_socket = None
         self.data_socket = None
         
         # State
-        self.control_connected = False
-        self.data_connected = False
+        self.status = CLIENT_STATUS.DEFAULT
         self.running = False
         
         # Data streaming
         self.streaming_active = False
         
+    ### Server commands 
+    def ping_server(self):
+        """Test server connectivity"""
+        response, response_code = self.send_control_command(Command.PING_SERVER)
+        
+        if response_code == 'success':
+            server_info = response.get('server_info', {})
+            self.log_message.emit("info", f"Server ping successful - {server_info.get('server_type', 'unknown')}")
+            return True
+        else:
+            self.log_message.emit("error", "Server ping failed")
+            return False
+
+    def discover_servers(self): 
+        # Scan IP range
+        for i in range(1, 255):
+            if self.status != CLIENT_STATUS.SCANNING:
+                break
+                
+            target_ip = f"{self.network_prefix}.{i}"
+            
+            # TODO: Add message logging to text box 
+            try:
+                # Quick connection test
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(0.1)  # 100ms timeout
+                
+                # NOTE: This may be potentially vulnerable. However, since this is being done over a local network itself, the risks may be low. 
+                # TODO: Confirm security with someone who deals with a networking stack. 
+
+                # We will only try connecting to control ports
+                result = sock.connect_ex((target_ip, self.control_port))
+                
+                if result == 0:
+                    # Server found
+                    self.server_found.emit(target_ip, self.data_port, self.control_port)
+                
+                sock.close()
+                
+            except Exception:
+                pass
+            
+            # Update progress
+            progress = int((i / 254) * 100)
+            self.server_scan_progress.emit(progress)
+        
+        self.server_scan_completed.emit(True)
+        
+    def connect_to_server(self):
+        if self.server_address is None: 
+            self.log_message.emit('warn', 'No server selected for connection. Automatically choosing an available server.')
+            self.discover_servers()
+            if len(self.discovered_servers) == 0: 
+                self.log_message.emit('error', 'No valid servers available.')
+            else: 
+                self.selected_server = self.discovered_servers[0]
+                self.log_message.emit('info', f'Connecting to server: {self.selected_server}')
+
+        try:
+            # Connect to control server - close pre-existing connections
+            if self.control_socket:
+                self.control_socket.close()
+            
+            self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.control_socket.settimeout(5.0)
+            self.control_socket.connect((self.address, self.control_port))
+            self.control_connected = True
+            
+            self.log_message.emit("debug", "Connected to control server")
+            
+            # Start listening to commands
+            self.command_thread = DataStreamer(running=self.streaming_active)
+            data_thread.data_received.connect(self.data_received)
+            data_thread.log_message.connect(self.log_message)
+            data_thread.start()
+
+            # Connect to data server - close pre-existing connections
+            if self.data_socket:
+                self.data_socket.close()
+            
+            self.data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.data_socket.settimeout(5.0)
+            self.data_socket.connect((self.address, self.data_port))
+            self.data_connected = True
+            
+            self.log_message.emit("debug", f"Connected to data server")
+
+            # Emit status 
+            self.status = CLIENT_STATUS.SERVER_CONNECTED
+            self.server_connected.emit(True)
+        
+        except Exception as e:
+            self.status = CLIENT_STATUS.DEFAULT
+            self.log_message.emit("error", f"Server connection failed: {e}")
+            self.server_connected.emit(False)
+
+    def disconnect_from_server(self):
+        """Disconnect from servers"""
+        if self.control_socket:
+            try:
+                self.control_socket.close()
+            except:
+                pass
+            self.control_socket = None
+        
+        if self.data_socket:
+            try:
+                self.data_socket.close()
+            except:
+                pass
+            self.data_socket = None
+        
+        if self.control_connected or self.data_connected:
+            self.control_connected = False
+            self.data_connected = False
+            self.server_disconnected.emit()
+            self.log_message.emit("info", "Disconnected from server")
+    
+    def get_server_status(self):
+        '''Gets server status from connected server(s)'''
+        pass 
+
     def start_client(self):
         """Start the client worker"""
         self.running = True
@@ -103,71 +244,9 @@ class Client(QThread):
             
             time.sleep(0.1)
     
-    def connect_control(self):
-        """Connect to control server"""
-        try:
-            if self.control_socket:
-                self.control_socket.close()
-            
-            self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.control_socket.settimeout(5.0)
-            self.control_socket.connect((self.address, self.control_port))
-            self.control_connected = True
-            
-            self.log_message.emit("debug", f"Connected to control server at {self.address}:{self.control_port}")
-            return True
-            
-        except Exception as e:
-            self.log_message.emit("error", f"Failed to connect to control server: {e}")
-            return False
+    ### Device commands
     
-    def connect_data(self):
-        """Connect to data streaming server"""
-        try:
-            if self.data_socket:
-                self.data_socket.close()
-            
-            self.data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.data_socket.settimeout(5.0)
-            self.data_socket.connect((self.address, self.data_port))
-            self.data_connected = True
-            
-            self.log_message.emit("debug", f"Connected to data server at {self.address}:{self.data_port}")
-            
-            # Start data receiving thread
-            data_thread = DataStreamer(running=self.streaming_active)
-            data_thread.data_received.connect(self.data_received)
-            data_thread.log_message.connect(self.log_message)
-            data_thread.start()
-            
-            return True
-            
-        except Exception as e:
-            self.log_message.emit("error", f"Failed to connect to data server: {e}")
-            return False
-    
-    def disconnect_from_server(self):
-        """Disconnect from servers"""
-        if self.control_socket:
-            try:
-                self.control_socket.close()
-            except:
-                pass
-            self.control_socket = None
-        
-        if self.data_socket:
-            try:
-                self.data_socket.close()
-            except:
-                pass
-            self.data_socket = None
-        
-        if self.control_connected or self.data_connected:
-            self.control_connected = False
-            self.data_connected = False
-            self.server_disconnected.emit()
-            self.log_message.emit("info", "Disconnected from server")
-    
+    ### General functions
     def send_control_command(self, command_type, params=None):
         """Send control command to server"""
         if not self.control_connected:
@@ -196,18 +275,6 @@ class Client(QThread):
             self.error_occurred.emit(f"Control communication error: {e}")
             self.disconnect_from_server()
             return None
-    
-    def ping_server(self):
-        """Test server connectivity"""
-        response = self.send_control_command(Command.PING)
-        
-        if response and response.get('type') == 'success':
-            server_info = response.get('server_info', {})
-            self.log_message.emit("info", f"Server ping successful - {server_info.get('server_type', 'unknown')}")
-            return True
-        else:
-            self.log_message.emit("error", "Server ping failed")
-            return False
     
     def discover_devices(self):
         """Discover devices"""
@@ -318,7 +385,89 @@ class Client(QThread):
         
     def update_params(self, config): 
         pass 
+
+# TODO: Move this into client handler
+class NetworkScanner(QThread):
+    scan_progress = pyqtSignal(int)
+    scan_complete = pyqtSignal()
+    server_found = pyqtSignal(str, int)
     
+    def __init__(self, data_port=8888, control_port=8889):
+        super().__init__()
+        self.client_info = {
+            "hostname": socket.gethostname(), # In order to broadcast to servers
+            "application": "BioView",
+            "version": APP_VERSION
+        }
+
+        # Available servers should have both data and control port
+        self.data_port = data_port
+        self.control_port = control_port
+        self.scanning = False
+        
+    def run(self):
+        """Scan local network for servers"""
+        self.scanning = True
+        
+        # Get local IP range
+        local_ip = self.get_local_ip()
+        if not local_ip:
+            self.scan_complete.emit()
+            return
+            
+        # Extract network prefix (assumes /24 subnet)
+        ip_parts = local_ip.split('.')
+        network_prefix = '.'.join(ip_parts[:3])
+        
+        # Scan IP range
+        for i in range(1, 255):
+            if not self.scanning:
+                break
+                
+            target_ip = f"{network_prefix}.{i}"
+            
+            try:
+                # Quick connection test
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(0.1)  # 100ms timeout
+                
+                # NOTE: This may be potentially vulnerable. However, since this is being done over a local network itself, the risks may be low. 
+                # TODO: Confirm security with someone who deals with a networking stack. 
+
+                # We will only try connecting to control ports
+                result = sock.connect_ex((target_ip, self.control_port))
+                
+                if result == 0:
+                    # Server found
+                    self.server_found.emit(target_ip, self.data_port, self.control_port)
+                
+                sock.close()
+                
+            except Exception:
+                pass
+            
+            # Update progress
+            progress = int((i / 254) * 100)
+            self.scan_progress.emit(progress)
+        
+        self.scan_complete.emit()
+    
+    def get_local_ip(self):
+        """Get the local IP address"""
+        try:
+            # Connect to a remote address to determine local IP
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.connect(("8.8.8.8", 80)) 
+            local_ip = sock.getsockname()[0]
+            sock.close()
+            return local_ip
+        except Exception:
+            return None
+    
+    def stop_scan(self):
+        """Stop the network scan"""
+        self.scanning = False
+
 class DataStreamer(QThread): 
     log_message = pyqtSignal(str, str)
     data_received = pyqtSignal(np.ndarray)
