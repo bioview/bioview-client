@@ -61,9 +61,13 @@ class Client(QThread):
         self.network_prefix: str = self.address[:self.address.rindex('.')]
 
         # Servers
-        self.discovered_servers: List[Dict] = []
-        self.selected_server: Dict = {} # (hostname: IP)
+        self.discovered_servers: Dict = {} # (server_name: IP)
+        self.selected_server: str =  "" # server_name
+        self.server_number = 1 # Just a temporary initialization constant
         
+        # Devices
+        self.connected_devices: List = [] # each item is a device id
+
         # Ports 
         self.data_port: int = data_port
         self.control_port: int = control_port
@@ -79,19 +83,20 @@ class Client(QThread):
         # Client state
         self.status = ClientStatus.DEFAULT
         
-    ### Server commands 
+    ### Server commands
+    #Handled
     def ping_server(self):
         """Test server connectivity"""
-        response, response_code = self.send_control_command(Command.PING_SERVER)
+        response = self.send_control_command(Command.PING_SERVER)
         
-        if response_code == 'success':
+        if response.get('type') == 'success':
             server_info = response.get('server_info', {})
             self.log_message.emit("info", f"Server ping successful - {server_info.get('server_type', 'unknown')}")
             return True
         else:
             self.log_message.emit("error", "Server ping failed")
             return False
-
+    #Handled
     def discover_servers(self): 
         # Scan IP range
         for i in range(1, 255):
@@ -104,7 +109,7 @@ class Client(QThread):
             try:
                 # Quick connection test
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(0.1)  # 100ms timeout
+                sock.settimeout(5.0)  # 5sec timeout
                 
                 # NOTE: This may be potentially vulnerable. However, since this is being done over a local network itself, the risks may be low. 
                 # TODO: Confirm security with someone who deals with a networking stack. 
@@ -114,7 +119,8 @@ class Client(QThread):
                 
                 if result == 0:
                     # Server found
-                    self.server_found.emit(target_ip, self.data_port, self.control_port)
+                    server_name = self.generate_server_name()
+                    self.server_found.emit(server_name, target_ip, self.data_port, self.control_port)
                 
                 sock.close()
                 
@@ -126,15 +132,15 @@ class Client(QThread):
             self.server_scan_progress.emit(progress)
         
         self.server_scan_completed.emit(True)
-        
+    #Handled
     def connect_to_server(self):
-        if self.selected_server == {}: 
+        if self.selected_server == "": 
             self.log_message.emit('warn', 'No server selected for connection. Automatically choosing an available server.')
             self.discover_servers()
-            if len(self.discovered_servers) == 0: 
+            if len(self.discovered_servers.keys()) == 0: 
                 self.log_message.emit('error', 'No valid servers available.')
             else: 
-                self.selected_server = self.discovered_servers[0]
+                self.selected_server = list(self.discovered_servers)[0]
                 self.log_message.emit('info', f'Connecting to server: {self.selected_server}')
 
         try:
@@ -143,8 +149,8 @@ class Client(QThread):
                 self.control_socket.close()
             
             self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.control_socket.connect((self.discovered_servers[self.selected_server], self.control_port))
             self.control_socket.settimeout(5.0)
-            self.control_socket.connect((self.selected_server['address'], self.control_port))
             self.control_connected = True
             
             self.log_message.emit("debug", "Connected to control server")
@@ -154,8 +160,8 @@ class Client(QThread):
                 self.data_socket.close()
             
             self.data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.data_socket.connect((self.discovered_servers[self.selected_server], self.data_port))
             self.data_socket.settimeout(5.0)
-            self.data_socket.connect((self.selected_server['address'], self.data_port))
             self.data_connected = True
             
             self.log_message.emit("debug", f"Connected to data server")
@@ -168,7 +174,7 @@ class Client(QThread):
             self.status = ClientStatus.DEFAULT
             self.log_message.emit("error", f"Server connection failed: {e}")
             self.server_connected.emit(False)
-
+    #Handled
     def disconnect_from_server(self):
         if self.control_socket:
             try:
@@ -187,8 +193,9 @@ class Client(QThread):
         self.status = ClientStatus.SERVER_DISCONNECTED
         self.server_disconnected.emit(True)         
         self.log_message.emit("info", "Disconnected from server")
+        self.selected_server = ""
     
-    ### Device Commands 
+    ########## Device Commands ########## 
     
 
     def start_client(self):
@@ -225,19 +232,22 @@ class Client(QThread):
             time.sleep(0.1)
     
     ### General functions
-    def send_control_command(self, command_type, params=None):
+    #Handled
+    def send_control_command(self, command_type: str, params: Dict = None):
         """Send control command to server"""
         if not self.control_connected:
             self.error_occurred.emit("Not connected to control server")
+            self.disconnect_from_server()
             return None
         
         if command_type not in SUPPORTED_COMMANDS: 
             self.error_occurred.emit("Invalid command sent")
+            self.disconnect_from_server()
             return None
         
         command = {
             'type': command_type.value,
-            'params': params or {}
+            'params': {} if params is None else params
         }
         
         try:
@@ -251,14 +261,15 @@ class Client(QThread):
             
         except Exception as e:
             self.error_occurred.emit(f"Control communication error: {e}")
-            self.disconnect_from_server()
+            #self.disconnect_from_server()
             return None
     
+    #Handled
     def discover_devices(self):
         """Discover devices"""
         self.log_message.emit("info", "Discovering devices...")
         response = self.send_control_command(Command.DISCOVER)
-        
+
         if response and response.get('type') == 'success':
             devices = response.get('devices', [])
             self.log_message.emit("info", f"Found {len(devices)} devices")
@@ -268,101 +279,149 @@ class Client(QThread):
             self.error_occurred.emit(f"Device discovery failed: {error_msg}")
             return []
     
-    def connect_device(self, device_id = None):
-        """Connect to device"""
+    #Handled
+    def connect_devices(self, device_ids: List = None):
+        """Connect to devices"""
         self.log_message.emit("info", f"Connecting...")
-        response = self.send_control_command(Command.CONNECT, {'id': device_id})
+        devices_status = []
+        for device_id in device_ids:
+            response = self.send_control_command(Command.CONNECT, {'id': device_id})
         
-        if response and response.get('type') == Response.SUCCESS.value:
-            self.log_message.emit("info", "Device connected successfully")
-            self.device_connected.emit(device_id)
-            return True
-        else:
-            error_msg = response.get('message', 'Unknown error') if response else 'No response'
-            self.error_occurred.emit(f"Device connection failed: {error_msg}")
-            self.device_connection_failed.emit(device_id)
-            return False
+            if response and response.get('type') == 'success':
+                self.log_message.emit("info", f"Device {device_id} connected successfully")
+                self.device_connected.emit(device_id)
+                devices_status.append(True)
+                self.connect_devices.append(device_id)
+            else:
+                error_msg = response.get('message', 'Unknown error') if response else 'No response'
+                self.error_occurred.emit(f"Device connection failed: {error_msg}")
+                self.device_connection_failed.emit(device_id)
+                devices_status.append(False)
+        
+        return devices_status
     
-    def disconnect_device(self):
+    #Handled
+    def disconnect_devices(self, device_ids: List = None):
         """Disconnect from device"""
         self.log_message.emit("info", "Disconnecting device...")
-        
-        # Stop streaming first
+        devices_status = []
         if self.streaming_active:
-            self.stop_streaming()
+            self.stop_streaming(device_ids)
+        for device_id in device_ids:
+            response = self.send_control_command(Command.DISCONNECT, {'id': device_id})
         
-        response = self.send_control_command(Command.DISCONNECT)
+            if response and response.get('type') == 'success':
+                self.log_message.emit("info", "Device disconnected")
+                self.device_disconnected.emit(device_id)
+                devices_status.append(True)
+            else:
+                error_msg = response.get('message', 'Unknown error') if response else 'No response'
+                self.error_occurred.emit(f"Disconnect failed: {error_msg}")
+                devices_status.append(False)
         
-        if response and response.get('type') == 'success':
-            self.log_message.emit("info", "Device disconnected")
-            self.device_disconnected.emit()
-            return True
-        else:
-            error_msg = response.get('message', 'Unknown error') if response else 'No response'
-            self.error_occurred.emit(f"Disconnect failed: {error_msg}")
-            return False
+        return devices_status
     
-    def start_streaming(self):
+    #Handled
+    def start_streaming(self, device_ids: List = None):
         """Start real-time data streaming"""
         self.log_message.emit("info", "Starting data streaming...")
-        response = self.send_control_command(Command.START)
+        devices_status = []
+        for device_id in device_ids:
+            response = self.send_control_command(Command.START, {'id': device_id})
         
-        if response and response.get('type') == 'success':
-            self.streaming_active = True
-            self.log_message.emit("info", "Data streaming started")
-            self.streaming_started.emit()
+            if response and response.get('type') == 'success':
+                self.streaming_active = True
+                self.log_message.emit("info", "Data streaming started")
+                self.streaming_started.emit()
             
-            # Connect to data server
-            if not self.data_connected:
-                self.connect_data()
-            
-            return True
+                # Connect to data server
+                ############################# Need to clarify this ############################################
+                # if not self.data_connected:
+                #    self.connect_data()
+            devices_status.append(True)
         else:
             error_msg = response.get('message', 'Unknown error') if response else 'No response'
             self.error_occurred.emit(f"Failed to start streaming: {error_msg}")
-            return False
-    
-    def stop_streaming(self):
+            devices_status.append(False)
+
+        return devices_status
+
+    #Handled
+    def stop_streaming(self, device_ids: List = None):
         """Stop data streaming"""
         self.log_message.emit("info", "Stopping data streaming...")
         
         self.streaming_active = False
-        
+        devices_status = []
         # Disconnect data socket
-        if self.data_socket:
-            try:
-                self.data_socket.close()
-            except:
-                pass
-            self.data_socket = None
-            self.data_connected = False
+        # if self.data_socket:
+        #     try:
+        #         self.data_socket.close()
+        #     except:
+        #         pass
+        #     self.data_socket = None
+        #     self.data_connected = False
+        for device_id in device_ids:
+            response = self.send_control_command(Command.STOP)
+            
+            if response and response.get('type') == 'success':
+                self.log_message.emit("info", "Data streaming stopped")
+                self.streaming_stopped.emit()
+                devices_status.append(True)
+            else:
+                error_msg = response.get('message', 'Unknown error') if response else 'No response'
+                self.error_occurred.emit(f"Failed to stop streaming: {error_msg}")
+                devices_status.append(False)
         
-        response = self.send_control_command(Command.STOP)
-        
-        if response and response.get('type') == 'success':
-            self.log_message.emit("info", "Data streaming stopped")
-            self.streaming_stopped.emit()
-            return True
-        else:
-            error_msg = response.get('message', 'Unknown error') if response else 'No response'
-            self.error_occurred.emit(f"Failed to stop streaming: {error_msg}")
-            return False
+        return devices_status
     
-    def configure_device(self, device_id, config):
+    #Handled
+    def update_device_configs(self, device_ids: List = None, device_configs: List = None):
         """Configure device parameters"""
-        self.log_message.emit("info", "Configuring device: {device_id}")
-        response = self.send_control_command(Command.CONFIGURE, {'id': device_id, 'config': config})
+        assert len(device_ids) == len(device_configs), "Number of devices and configs doesn't match"
         
-        if response and response.get('type') == 'success':
-            self.log_message.emit("info", "Device configured successfully")
-            return True
-        else:
-            error_msg = response.get('message', 'Unknown error') if response else 'No response'
-            self.error_occurred.emit(f"Configuration failed: {error_msg}")
-            return False
+        devices_status = []
+                
+        for idx in range(len(device_ids)):
+            self.log_message.emit("info", f"Configuring device: {device_ids[idx]}")
+            response = self.send_control_command(Command.CONFIGURE, {'id': device_ids[idx], 'config': device_configs[idx]})
+            
+            if response and response.get('type') == 'success':
+                self.log_message.emit("info", f"Device {device_ids[idx]} configured successfully")
+                devices_status.append(True)
+            else:
+                error_msg = response.get('message', 'Unknown error') if response else 'No response'
+                self.error_occurred.emit(f"Configuration failed: {error_msg}")
+                devices_status.append(False)
         
-    def update_params(self, config): 
-        pass 
+        return devices_status
+            
+    #Handled
+    def update_device_configs(self, device_ids: List = None, device_firmwares: List = None):
+        """Configure device parameters"""
+        assert len(device_ids) == len(device_firmwares), "Number of devices and firmware updates doesn't match"
+        
+        devices_status = []
+                
+        for idx in range(len(device_ids)):
+            self.log_message.emit("info", f"Configuring device: {device_ids[idx]}")
+            response = self.send_control_command(Command.CONFIGURE, {'id': device_ids[idx], 'config': device_firmwares[idx]})
+            
+            if response and response.get('type') == 'success':
+                self.log_message.emit("info", f"Device {device_ids[idx]} configured successfully")
+                devices_status.append(True)
+            else:
+                error_msg = response.get('message', 'Unknown error') if response else 'No response'
+                self.error_occurred.emit(f"Configuration failed: {error_msg}")
+                devices_status.append(False)
+
+        return devices_status 
+
+    def generate_server_name(self):
+        self.server_number += 1
+        return f'Server{self.server_number - 1}'
+
+
 
 class DataStreamer(QThread): 
     log_message = pyqtSignal(str, str)
@@ -444,3 +503,8 @@ class DataStreamer(QThread):
         
     def stop(self): 
         self.running = False
+    
+
+    if __name__ == "__main__":
+        client_handler = Client()
+        
