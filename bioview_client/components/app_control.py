@@ -2,7 +2,8 @@ import qtawesome as qta
 from PyQt6.QtWidgets import QGroupBox, QPushButton, QHBoxLayout, QCheckBox
 from PyQt6.QtCore import pyqtSignal, QEvent
 
-from bioview_client.constants import ConnectionStatus, RunningStatus, get_qcolor
+from bioview_common import ConnectionStatus, RunningStatus
+from bioview_client.constants import get_qcolor
 
 
 class AppControlPanel(QGroupBox):

@@ -3,7 +3,7 @@ from PyQt6.QtGui import QColor, QPainter, QPen
 from PyQt6.QtWidgets import (QHBoxLayout, QPushButton, QComboBox, QStatusBar, QLabel, QWidget)
 from PyQt6.QtCore import pyqtSignal, QEvent, Qt
 
-from bioview_client.constants import ConnectionStatus
+from bioview_common import ConnectionStatus
 
 class ServerConnector(QWidget):
     '''

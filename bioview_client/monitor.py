@@ -12,7 +12,7 @@ from PyQt6.QtGui import QGuiApplication, QIcon
 from PyQt6.QtWidgets import QApplication, QHBoxLayout, QMainWindow, QVBoxLayout, QWidget, QDialog
 
 from typing import List, Dict
-from bioview_client.constants import ConnectionStatus, RunningStatus, DataSource
+from bioview_common import ConnectionStatus, RunningStatus, DataSource
 
 from bioview_client.components import (
     AnnotateEventPanel,

@@ -14,12 +14,13 @@ from PyQt6.QtWidgets import (
     QSpinBox,
 )
 
-from bioview_client.constants import (
+from bioview_common import (
     ConnectionStatus,
     DataSource,
     RunningStatus,
-    get_qcolor
 )
+
+from bioview_client.constants import get_qcolor
 
 class CheckableListView(QListView):
     def __init__(self, combo_box):

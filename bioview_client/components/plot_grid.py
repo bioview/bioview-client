@@ -7,7 +7,8 @@ from PyQt6.QtCore import QEvent, QTimer, pyqtSignal
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import QGridLayout, QWidget
 
-from bioview_client.constants import DataSource, get_color_by_idx
+from bioview_common import DataSource
+from bioview_client.constants import get_color_by_idx
 
 
 class PlotManager:

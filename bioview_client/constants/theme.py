@@ -1,5 +1,9 @@
+from typing import Dict, Tuple
+
 import darkdetect
 from PyQt6.QtGui import QColor
+
+from bioview_common import ConnectionStatus 
 
 # Ref: Cbrewer diverging color scheme (deprecated)
 PLOT_COLORS = {
@@ -43,3 +47,9 @@ def get_color_tuple(name):
 def get_color_by_idx(idx=0):
     idx = idx % len(COLOR_SCHEME)
     return get_color_tuple(list(COLOR_SCHEME.keys())[idx])
+
+CONNECTION_STATE_COLORS: Dict[ConnectionStatus, Tuple] = {
+    ConnectionStatus.DISCONNECTED: get_qcolor("red"),
+    ConnectionStatus.CONNECTING: get_qcolor("yellow"),
+    ConnectionStatus.CONNECTED: get_qcolor("green")
+}
