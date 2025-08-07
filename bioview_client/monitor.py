@@ -10,6 +10,7 @@ from pathlib import Path
 
 from PyQt6.QtGui import QGuiApplication, QIcon
 from PyQt6.QtWidgets import QApplication, QHBoxLayout, QMainWindow, QVBoxLayout, QWidget, QDialog
+from PyQt6.QtCore import QThread, QObject, pyqtSignal
 
 from typing import List, Dict
 from bioview_common import DeviceStatus, DataSource
@@ -27,6 +28,9 @@ from bioview_client.handler import Client
 from bioview_client.constants import DEFAULT_COMMON_CONFIGURATION
 
 class BioViewMonitor(QMainWindow):
+    event_type_and_data = pyqtSignal(dict)
+
+
     def __init__(
         self,
         device_config: List[Dict] = [],
@@ -190,24 +194,44 @@ class BioViewMonitor(QMainWindow):
             panel.logEvent.connect(self.log_display_panel.log_message)
         
     def setup_client(self):
-        """Connect to client"""
+        ''' 
+        Setup the Client() object with slots for the various signals and the corresponding Qthread worker thread.
+        After the setup, move the Client() object to the worker thread & start the thread to spawn the client handler
+        '''
         self.client_worker = Client()
+        self.worker_thread = QThread()
+        self.client_worker.moveToThread(self.worker_thread)
         
-        # Connect signals
+        # Connect main window slots to the Client() signals
         self.client_worker.server_connected.connect(self.on_server_connected)
         self.client_worker.server_disconnected.connect(self.on_server_disconnected)
         self.client_worker.error_occurred.connect(lambda msg: self.log_display_panel.log_message("error", msg))
         self.client_worker.log_message.connect(self.log_display_panel.log_message)
         
-        # self.client_worker.streaming_started.connect(self.on_streaming_started)
-        # self.client_worker.streaming_stopped.connect(self.on_streaming_stopped)
+        self.client_worker.streaming_started.connect(self.on_streaming_started)
+        self.client_worker.streaming_stopped.connect(self.on_streaming_stopped)
         self.client_worker.device_connected.connect(self.handle_device_connected)
         self.client_worker.device_connection_failed.connect(self.handle_device_connection_failed)
         self.client_worker.device_disconnected.connect(self.handle_device_disconnected)
-    
+
+        self.worker_thread.started.connect(lambda: self.log_display_panel.log_message("info", "Starting Client Handler"))
+        self.worker_thread.finished.connect(self.stop_client)
+
+        # Connect Client() slots to main window signals
+        self.event_type_and_data.connect(self.client_worker.parse_event)
+
         # Start client
-        self.client_worker.start_client()
-        
+        self.start_client()
+    
+
+    def start_client(self):
+        self.client_worker.running = True
+        self.worker_thread.start()
+    
+    def stop_client(self):
+        self.worker_thread.quit()
+        self.worker_thread.wait()
+
     def closeEvent(self, event):
         """Handle application close"""
         if self.client_worker:
