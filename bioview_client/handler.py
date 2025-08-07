@@ -23,11 +23,18 @@ import socket
 import numpy as np
 from typing import List, Dict
 
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import QThread, QObject, pyqtSignal
 
-from bioview_common import ClientStatus, get_ip, APP_VERSION, DataSource, Command, SUPPORTED_COMMANDS, Response, MAX_BUFFER_SIZE 
+from bioview_common import get_ip, APP_VERSION, DataSource, Command, SUPPORTED_COMMANDS, Response, MAX_BUFFER_SIZE 
 
-class Client(QThread):
+class CLIENT_STATUS(Enum):
+    DEFAULT = auto()      # Nothing is going on by default
+    SCANNING = auto()
+    SERVER_CONNECTED = auto()
+    SERVER_DISCONNECTED = auto()
+    STREAMING = auto()
+
+class Client(QObject):
     # Server control signals 
     server_scan_completed = pyqtSignal()
     server_connected = pyqtSignal(bool)
@@ -56,47 +63,88 @@ class Client(QThread):
     def __init__(self, data_port=9998, control_port=9999):
         super().__init__()
         
-        # Client network parameters
+        # Client parameters
         self.address: str = get_ip() 
         self.network_prefix: str = self.address[:self.address.rindex('.')]
+        self.running: bool = False
+        self.status: CLIENT_STATUS = CLIENT_STATUS.DEFAULT
 
         # Servers
-        self.discovered_servers: Dict = {} # (server_name: IP)
+        self.discovered_servers: Dict[str, str] = {} # (server_name: IP)
         self.selected_server: str =  "" # server_name
-        self.server_number = 1 # Just a temporary initialization constant
+        self.server_number: int = 1 # Just a temporary initialization constant
         
         # Devices
-        self.connected_devices: List = [] # each item is a device id
+        self.connected_devices: List[str] = [] # each item is a device id
+        self.streaming_active: bool = False
 
         # Ports 
         self.data_port: int = data_port
         self.control_port: int = control_port
         
         # Threads
-        self.data_thread = None
-        self.control_thread = None 
+        # self.data_thread = None
+        # self.control_thread = None 
         
         # Sockets
-        self.data_socket = None
-        self.control_socket = None
+        self.data_socket: socket.socket = None
+        self.control_socket: socket.socket = None
         
-        # Client state
-        self.status = ClientStatus.DEFAULT
-        
+    
+    def parse_event(self, event: Dict = None):
+        if event.get('type') is None:
+            self.error_occurred.emit("Error occurred becuase no command was specified")
+        elif event.get('type') not in SUPPORTED_COMMANDS:
+            self.error_occurred.emit("Error occurred because the command specified is currently not supported by the application")
+        else:
+            match event.get('type'):
+                case 'PING_SERVER':
+                    pass
+                case 'DISCOVER_SERVERS':
+                    pass
+                case 'CONNECT_SERVER':
+                    pass
+                case 'DISCONNECT_SERVER':
+                    pass
+                case 'DISCOVER_DEVICES':
+                    pass
+                case 'INITIALIZE_DEVICES':
+                    pass
+                case 'CONNECT_DEVICES':
+                    pass
+                case 'DISCONNECT_DEVICES':
+                    pass
+                case 'START_STREAMING':
+                    pass
+                case 'STOP_STREAMING':
+                    pass
+                case 'GET_DEVICE_STATUS':
+                    pass
+                case 'UPDATE_DEVICE_FIRMWARE':
+                    pass
+                case 'UPDATE_RUNNING_PARAMETER':
+                    pass
+                case _:
+                    pass
+
     ### Server commands
     #Handled
-    def ping_server(self):
+    def ping_server(self, server_name: str = None) -> bool:
         """Test server connectivity"""
+        if server_name is None:
+            self.log_message.emit('warn', 'No server selected for pinging. Automatically choosing an available server')
+            server_name = list(self.discovered_servers.keys())[0]
+        
         response = self.send_control_command(Command.PING_SERVER)
         
         if response.get('type') == 'success':
-            server_info = response.get('server_info', {})
+            server_info = response.get('payload').get('server_info', {})
             self.log_message.emit("info", f"Server ping successful - {server_info.get('server_type', 'unknown')}")
             return True
         else:
             self.log_message.emit("error", "Server ping failed")
             return False
-    #Handled
+
     def discover_servers(self): 
         # Scan IP range
         for i in range(1, 255):
@@ -132,7 +180,7 @@ class Client(QThread):
             self.server_scan_progress.emit(progress)
         
         self.server_scan_completed.emit(True)
-    #Handled
+
     def connect_to_server(self):
         if self.selected_server == "": 
             self.log_message.emit('warn', 'No server selected for connection. Automatically choosing an available server.')
@@ -174,7 +222,7 @@ class Client(QThread):
             self.status = ClientStatus.DEFAULT
             self.log_message.emit("error", f"Server connection failed: {e}")
             self.server_connected.emit(False)
-    #Handled
+
     def disconnect_from_server(self):
         if self.control_socket:
             try:
@@ -197,23 +245,24 @@ class Client(QThread):
     
     ########## Device Commands ########## 
     
-
+    '''
     def start_client(self):
         """Start the client worker"""
         self.running = True
         self.start()
-    
+    '''
+
     def stop_client(self):
         """Stop the client worker"""
         self.running = False
         self.disconnect_from_server()
-        self.quit()
-        self.wait()
-    
+        # self.quit()
+        # self.wait()
+    '''
     def run(self):
         # Once server is connected, start sending commands and listening for data. 
         self.log_message.emit("info", "Starting client handler...")
-        
+        self.running = True
         while self.running:
 
             if self.status != ClientStatus.SERVER_CONNECTED:
@@ -230,9 +279,9 @@ class Client(QThread):
                 self.connect_data()
             
             time.sleep(0.1)
-    
+    '''
     ### General functions
-    #Handled
+
     def send_control_command(self, command_type: str, params: Dict = None):
         """Send control command to server"""
         if not self.control_connected:
@@ -264,7 +313,7 @@ class Client(QThread):
             #self.disconnect_from_server()
             return None
     
-    #Handled
+
     def discover_devices(self):
         """Discover devices"""
         self.log_message.emit("info", "Discovering devices...")
@@ -279,7 +328,6 @@ class Client(QThread):
             self.error_occurred.emit(f"Device discovery failed: {error_msg}")
             return []
     
-    #Handled
     def connect_devices(self, device_ids: List = None):
         """Connect to devices"""
         self.log_message.emit("info", f"Connecting...")
@@ -300,7 +348,6 @@ class Client(QThread):
         
         return devices_status
     
-    #Handled
     def disconnect_devices(self, device_ids: List = None):
         """Disconnect from device"""
         self.log_message.emit("info", "Disconnecting device...")
@@ -321,7 +368,6 @@ class Client(QThread):
         
         return devices_status
     
-    #Handled
     def start_streaming(self, device_ids: List = None):
         """Start real-time data streaming"""
         self.log_message.emit("info", "Starting data streaming...")
@@ -346,7 +392,7 @@ class Client(QThread):
 
         return devices_status
 
-    #Handled
+
     def stop_streaming(self, device_ids: List = None):
         """Stop data streaming"""
         self.log_message.emit("info", "Stopping data streaming...")
@@ -375,7 +421,7 @@ class Client(QThread):
         
         return devices_status
     
-    #Handled
+
     def update_device_configs(self, device_ids: List = None, device_configs: List = None):
         """Configure device parameters"""
         assert len(device_ids) == len(device_configs), "Number of devices and configs doesn't match"
@@ -396,7 +442,7 @@ class Client(QThread):
         
         return devices_status
             
-    #Handled
+    
     def update_device_configs(self, device_ids: List = None, device_firmwares: List = None):
         """Configure device parameters"""
         assert len(device_ids) == len(device_firmwares), "Number of devices and firmware updates doesn't match"
@@ -422,7 +468,7 @@ class Client(QThread):
         return f'Server{self.server_number - 1}'
 
 
-
+'''
 class DataStreamer(QThread): 
     log_message = pyqtSignal(str, str)
     data_received = pyqtSignal(np.ndarray)
@@ -503,8 +549,8 @@ class DataStreamer(QThread):
         
     def stop(self): 
         self.running = False
-    
+'''
 
-    if __name__ == "__main__":
-        client_handler = Client()
+if __name__ == "__main__":
+    client_handler = Client()
         
