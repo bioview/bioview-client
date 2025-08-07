@@ -21,19 +21,11 @@ import json
 import struct # TODO: Remove by confirming packet structure
 import socket 
 import numpy as np
-from enum import Enum, auto
 from typing import List, Dict
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from bioview_common import get_ip, APP_VERSION, DataSource, Command, SUPPORTED_COMMANDS, Response, MAX_BUFFER_SIZE 
-
-class CLIENT_STATUS(Enum):
-    DEFAULT = auto      # Nothing is going on
-    SCANNING = auto
-    SERVER_CONNECTED = auto
-    SERVER_DISCONNECTED = auto
-    STREAMING = auto
+from bioview_common import ClientStatus, get_ip, APP_VERSION, DataSource, Command, SUPPORTED_COMMANDS, Response, MAX_BUFFER_SIZE 
 
 class Client(QThread):
     # Server control signals 
@@ -85,7 +77,7 @@ class Client(QThread):
         self.control_socket = None
         
         # Client state
-        self.status = CLIENT_STATUS.DEFAULT
+        self.status = ClientStatus.DEFAULT
         
     ### Server commands 
     def ping_server(self):
@@ -103,7 +95,7 @@ class Client(QThread):
     def discover_servers(self): 
         # Scan IP range
         for i in range(1, 255):
-            if self.status != CLIENT_STATUS.SCANNING:
+            if self.status != ClientStatus.SCANNING:
                 break
                 
             target_ip = f"{self.network_prefix}.{i}"
@@ -169,11 +161,11 @@ class Client(QThread):
             self.log_message.emit("debug", f"Connected to data server")
 
             # Emit status 
-            self.status = CLIENT_STATUS.SERVER_CONNECTED
+            self.status = ClientStatus.SERVER_CONNECTED
             self.server_connected.emit(True)
 
         except Exception as e:
-            self.status = CLIENT_STATUS.DEFAULT
+            self.status = ClientStatus.DEFAULT
             self.log_message.emit("error", f"Server connection failed: {e}")
             self.server_connected.emit(False)
 
@@ -192,7 +184,7 @@ class Client(QThread):
                 pass
             self.data_socket = None
         
-        self.status = CLIENT_STATUS.SERVER_DISCONNECTED
+        self.status = ClientStatus.SERVER_DISCONNECTED
         self.server_disconnected.emit(True)         
         self.log_message.emit("info", "Disconnected from server")
     
@@ -217,7 +209,7 @@ class Client(QThread):
         
         while self.running:
 
-            if self.status != CLIENT_STATUS.SERVER_CONNECTED:
+            if self.status != ClientStatus.SERVER_CONNECTED:
                 
             # Try to maintain control connection
                 if self.connect_control():

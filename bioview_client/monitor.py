@@ -12,7 +12,7 @@ from PyQt6.QtGui import QGuiApplication, QIcon
 from PyQt6.QtWidgets import QApplication, QHBoxLayout, QMainWindow, QVBoxLayout, QWidget, QDialog
 
 from typing import List, Dict
-from bioview_common import ConnectionStatus, RunningStatus, DataSource
+from bioview_common import DeviceStatus, DataSource
 
 from bioview_client.components import (
     AnnotateEventPanel,
@@ -59,12 +59,11 @@ class BioViewMonitor(QMainWindow):
             for device_id, device_cfg in device_config.items(): 
                 self.devices[device_id] = {
                     'config': device_cfg,
-                    'state': ConnectionStatus.DISCONNECTED
+                    'state': DeviceStatus.DISCONNECTED
                 }
 
         self.common_config['available_channels'] = []
 
-        self.running_status = RunningStatus.NOINIT
         self.saving_status = False
 
         # Track instruction
@@ -259,51 +258,49 @@ class BioViewMonitor(QMainWindow):
     def handle_connection_requested(self): 
         if self.client_worker: 
             for device_id in self.devices.keys(): 
-                self.device_status_panel.update_device_state(device_id, ConnectionStatus.CONNECTING)
+                self.device_status_panel.update_device_state(device_id, DeviceStatus.CONNECTING)
                 self.client_worker.connect_device(device_id=device_id)
     
     def handle_device_connected(self, device_id):         
         if device_id is not None:
-            self.devices[device_id]['state'] = ConnectionStatus.CONNECTED
-            self.device_status_panel.update_device_state(device_id, ConnectionStatus.CONNECTED)
+            self.devices[device_id]['state'] = DeviceStatus.CONNECTED
+            self.device_status_panel.update_device_state(device_id, DeviceStatus.CONNECTED)
         else:
             # In this case all devices were requested for connection 
             for device_id in self.devices.keys():
-                self.devices[device_id]['state'] = ConnectionStatus.CONNECTED
-                self.device_status_panel.update_device_state(device_id, ConnectionStatus.CONNECTED)
+                self.devices[device_id]['state'] = DeviceStatus.CONNECTED
+                self.device_status_panel.update_device_state(device_id, DeviceStatus.CONNECTED)
         
         # Check if all are connected and if so, disable UI buttons 
         self.update_buttons()
         
     def handle_device_connection_failed(self, device_id): 
         if device_id is not None:
-            self.devices[device_id]['state'] = ConnectionStatus.DISCONNECTED
-            self.device_status_panel.update_device_state(device_id, ConnectionStatus.DISCONNECTED)
+            self.devices[device_id]['state'] = DeviceStatus.DISCONNECTED
+            self.device_status_panel.update_device_state(device_id, DeviceStatus.DISCONNECTED)
         else:
             # In this case all devices were requested for connection 
             for device_id in self.devices.keys():
-                self.devices[device_id]['state'] = ConnectionStatus.DISCONNECTED
-                self.device_status_panel.update_device_state(device_id, ConnectionStatus.DISCONNECTED)
+                self.devices[device_id]['state'] = DeviceStatus.DISCONNECTED
+                self.device_status_panel.update_device_state(device_id, DeviceStatus.DISCONNECTED)
           
         self.update_buttons()
       
     def handle_device_disconnected(self): 
         # Disconnect devices
         for device_id in self.devices.keys(): 
-            self.devices[device_id]['state'] = ConnectionStatus.DISCONNECTED
-            self.device_status_panel.update_device_state(device_id, ConnectionStatus.DISCONNECTED)
+            self.devices[device_id]['state'] = DeviceStatus.DISCONNECTED
+            self.device_status_panel.update_device_state(device_id, DeviceStatus.DISCONNECTED)
       
         self.update_buttons()
        
     def handle_streaming_start_requested(self): 
         if self.client_worker: 
             self.client_worker.start_streaming()
-            self.running_status = RunningStatus.RUNNING
     
     def handle_streaming_stop_requested(self): 
         if self.client_worker: 
             self.client_worker.stop_streaming()
-            self.running_status = RunningStatus.STOPPED
      
     def update_save_state(self):
         self.saving_status = True  
@@ -318,14 +315,14 @@ class BioViewMonitor(QMainWindow):
     def update_buttons(self): 
         connected = True 
         for device_dict in self.devices.values(): 
-            if device_dict['state'] == ConnectionStatus.DISCONNECTED: 
+            if device_dict['state'] == DeviceStatus.DISCONNECTED: 
                 connected = False 
                 break 
         
         if connected: 
-            self.app_control_panel.update_button_states(ConnectionStatus.CONNECTED, RunningStatus.STOPPED)
+            self.app_control_panel.update_button_states(DeviceStatus.CONNECTED)
         else: 
-            self.app_control_panel.update_button_states(ConnectionStatus.DISCONNECTED, RunningStatus.NOINIT)
+            self.app_control_panel.update_button_states(DeviceStatus.DISCONNECTED)
     
      
 if __name__ == "__main__":

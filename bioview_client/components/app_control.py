@@ -2,7 +2,7 @@ import qtawesome as qta
 from PyQt6.QtWidgets import QGroupBox, QPushButton, QHBoxLayout, QCheckBox
 from PyQt6.QtCore import pyqtSignal, QEvent
 
-from bioview_common import ConnectionStatus, RunningStatus
+from bioview_common import DeviceStatus
 from bioview_client.constants import get_qcolor
 
 
@@ -88,23 +88,38 @@ class AppControlPanel(QGroupBox):
             self._update_icons()
         return super().event(event)
 
-    def update_button_states(self, connection_status, running_status):
-        if connection_status == ConnectionStatus.CONNECTED:
-            self.start_button.setEnabled(running_status == RunningStatus.STOPPED)
-            self.stop_button.setEnabled(running_status == RunningStatus.RUNNING)
-            self.save_checkbox.setEnabled(running_status == RunningStatus.STOPPED)
+    def update_button_states(self, device_status):
+        if device_status == DeviceStatus.NOINIT:
+            self.connect_button.setEnabled(True)
+            self.gain_balance_button.setEnabled(False)
+
+        elif device_status == DeviceStatus.CONNECTING:
             self.connect_button.setEnabled(False)
+            self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(False)
+
+        elif device_status == DeviceStatus.CONNECTED:
+            self.start_button.setEnabled(True)
+            self.stop_button.setEnabled(False)
+            self.save_checkbox.setEnabled(True)
+            self.connect_button.setEnabled(False)
+
+        elif device_status == DeviceStatus.STREAMING:
+            self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(True)
+            self.save_checkbox.setEnabled(False)
             self.gain_balance_button.setEnabled(True)
-        elif connection_status == ConnectionStatus.DISCONNECTED:
+
+        elif device_status == DeviceStatus.DISCONNECTED:
             self.connect_button.setEnabled(True)
             self.start_button.setEnabled(False)
             self.save_checkbox.setEnabled(True)
             self.stop_button.setEnabled(False)
             self.gain_balance_button.setEnabled(False)
-        elif connection_status == ConnectionStatus.CONNECTING:
-            self.connect_button.setEnabled(False)
-            self.start_button.setEnabled(False)
-            self.stop_button.setEnabled(False)
+
+        else: 
+            # TODO: Log error 
+            pass 
 
     def on_connect_clicked(self):
         self.connectionInitiated.emit()

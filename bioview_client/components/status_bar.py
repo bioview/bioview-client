@@ -3,7 +3,7 @@ from PyQt6.QtGui import QColor, QPainter, QPen
 from PyQt6.QtWidgets import (QHBoxLayout, QPushButton, QComboBox, QStatusBar, QLabel, QWidget)
 from PyQt6.QtCore import pyqtSignal, QEvent, Qt
 
-from bioview_common import ConnectionStatus
+from bioview_common import DeviceStatus
 
 class ServerConnector(QWidget):
     '''
@@ -212,7 +212,7 @@ class StatusIndicator(QWidget):
     Disconnected: Red
     """
 
-    def __init__(self, state=ConnectionStatus.DISCONNECTED, size: int = 12):
+    def __init__(self, state=DeviceStatus.DISCONNECTED, size: int = 12):
         super().__init__()
         self.state = state
         self.size = size
@@ -240,7 +240,7 @@ class StatusIndicator(QWidget):
         )
 
 class DeviceStatusWidget(QWidget):
-    def __init__(self, device_name, device_state=ConnectionStatus.DISCONNECTED):
+    def __init__(self, device_name, device_state=DeviceStatus.DISCONNECTED):
         super().__init__()
         self.device_name = device_name
         self.device_state = device_state
@@ -292,7 +292,7 @@ class DeviceStatusPanel(QWidget):
             self._update_icons()
         return super().event(event)
 
-    def add_device(self, device_name, device_state=ConnectionStatus.DISCONNECTED):
+    def add_device(self, device_name, device_state=DeviceStatus.DISCONNECTED):
         device_widget = DeviceStatusWidget(device_name, device_state)
         self.device_widgets[device_name] = device_widget
         self.layout.addWidget(device_widget)

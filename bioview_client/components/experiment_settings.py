@@ -15,9 +15,8 @@ from PyQt6.QtWidgets import (
 )
 
 from bioview_common import (
-    ConnectionStatus,
-    DataSource,
-    RunningStatus,
+    DeviceStatus,
+    DataSource
 )
 
 from bioview_client.constants import get_qcolor
@@ -270,13 +269,18 @@ class ExperimentSettingsPanel(QGroupBox):
         self.config[param_name] = value
         # TODO: Add callback to propagate this 
 
-    def update_button_states(self, connection_status, running_status):
-        if connection_status == ConnectionStatus.CONNECTED:
-            self.rows_input.setEnabled(running_status == RunningStatus.STOPPED)
-            self.cols_input.setEnabled(running_status == RunningStatus.STOPPED)
-            self.file_name.setEnabled(running_status == RunningStatus.STOPPED)
-            self.folder_path.setEnabled(running_status == RunningStatus.STOPPED)
-            self.browse_button.setEnabled(running_status == RunningStatus.STOPPED)
+    def update_button_states(self, device_status):
+        if device_status == DeviceStatus.STREAMING: 
+            # Do not allow grid updates during streaming
+            self.rows_input.setEnabled(False)
+            self.cols_input.setEnabled(False)
+            # Do not allow changing save file path mid-streaming to avoid data loss 
+            self.file_name.setEnabled(False)
+            self.folder_path.setEnabled(False)
+            self.browse_button.setEnabled(False)
         else:
             self.rows_input.setEnabled(True)
             self.cols_input.setEnabled(True)
+            self.file_name.setEnabled(True)
+            self.folder_path.setEnabled(True)
+            self.browse_button.setEnabled(True)
