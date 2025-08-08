@@ -28,7 +28,7 @@ from bioview_client.handler import Client
 from bioview_client.constants import DEFAULT_COMMON_CONFIGURATION
 
 class BioViewMonitor(QMainWindow):
-    event_type_and_data = pyqtSignal(dict)
+    event_signal = pyqtSignal(dict)
 
 
     def __init__(
@@ -218,7 +218,7 @@ class BioViewMonitor(QMainWindow):
         self.worker_thread.finished.connect(self.stop_client)
 
         # Connect Client() slots to main window signals
-        self.event_type_and_data.connect(self.client_worker.parse_event)
+        self.event_signal.connect(self.client_worker.parse_event)
 
         # Start client
         self.start_client()
