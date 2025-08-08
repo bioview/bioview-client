@@ -91,33 +91,53 @@ class Client(QObject):
         self.control_socket: socket.socket = None
         
     
-    def parse_event(self, event: Dict = None):
+    def parse_event(self, event: Dict = None) -> None:
         if event.get('type') is None:
             self.error_occurred.emit("Error occurred becuase no command was specified")
         elif event.get('type') not in SUPPORTED_COMMANDS:
             self.error_occurred.emit("Error occurred because the command specified is currently not supported by the application")
         else:
-            match event.get('type'):
+            event_type = event.get('type')
+            event_data = event.get('payload')
+            match event_type:
                 case 'PING_SERVER':
-                    pass
+                    if len(self.discovered_servers) == 0:
+                        self.error_occurred.emit("No server has been discovered yet")
+                    elif event_data is None:
+                        self.log_message.emit('warn', 'No server is specified for pinging. Automatically choosing an available server')
+                        server_name = list(self.discovered_servers.keys())[0]
+                    else:
+                        server_name = event_data.get('server_name')
+                        if server_name is None:
+                            self.log_message.emit('warn', 'No server is specified for pinging. Automatically choosing an available server')
+                            server_name = list(self.discovered_servers.keys())[0]
+                        elif server_name not in self.discovered_servers:
+                            self.error_occurred.emit("The specified server has not been discovered yet")
+                            return None
+        
+                    self.ping_server(server_name)
+
                 case 'DISCOVER_SERVERS':
-                    pass
+                    if event_data is not None or event_data is not {}:
+                        self.log_message.emit('No need to send any payload data for discovering servers')
+                    self.discover_servers()
+
                 case 'CONNECT_SERVER':
-                    pass
+                    self.connect_to_server(event.get('payload'))
                 case 'DISCONNECT_SERVER':
-                    pass
+                    self.disconnect_from_server(event.get('payload'))
                 case 'DISCOVER_DEVICES':
-                    pass
+                    self.discover_devices(event.get('payload'))
                 case 'INITIALIZE_DEVICES':
-                    pass
+                    self.update_device_configs(event.get('payload'))
                 case 'CONNECT_DEVICES':
-                    pass
+                    self.connect_devices(event.get('payload'))
                 case 'DISCONNECT_DEVICES':
-                    pass
+                    self.disconnect_devices(event.get('payload'))
                 case 'START_STREAMING':
-                    pass
+                    self.start_streaming(event.get('payload'))
                 case 'STOP_STREAMING':
-                    pass
+                    self.stop_streaming(event.get('payload'))
                 case 'GET_DEVICE_STATUS':
                     pass
                 case 'UPDATE_DEVICE_FIRMWARE':
@@ -126,15 +146,12 @@ class Client(QObject):
                     pass
                 case _:
                     pass
+        return None
 
     ### Server commands
     #Handled
-    def ping_server(self, server_name: str = None) -> bool:
+    def ping_server(self, server_name: str) -> None:
         """Test server connectivity"""
-        if server_name is None:
-            self.log_message.emit('warn', 'No server selected for pinging. Automatically choosing an available server')
-            server_name = list(self.discovered_servers.keys())[0]
-        
         response = self.send_control_command(Command.PING_SERVER)
         
         if response.get('type') == 'success':
