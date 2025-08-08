@@ -103,6 +103,7 @@ class Client(QObject):
                 case 'PING_SERVER':
                     if len(self.discovered_servers) == 0:
                         self.error_occurred.emit("No server has been discovered yet")
+                        return None
                     elif event_data is None:
                         self.log_message.emit('warn', 'No server is specified for pinging. Automatically choosing an available server')
                         server_name = list(self.discovered_servers.keys())[0]
@@ -112,9 +113,8 @@ class Client(QObject):
                             self.log_message.emit('warn', 'No server is specified for pinging. Automatically choosing an available server')
                             server_name = list(self.discovered_servers.keys())[0]
                         elif server_name not in self.discovered_servers:
-                            self.error_occurred.emit("The specified server has not been discovered yet")
+                            self.error_occurred.emit(f"The server {server_name} has not been discovered yet")
                             return None
-        
                     self.ping_server(server_name)
 
                 case 'DISCOVER_SERVERS':
@@ -123,9 +123,30 @@ class Client(QObject):
                     self.discover_servers()
 
                 case 'CONNECT_SERVER':
-                    self.connect_to_server(event.get('payload'))
+                    if len(self.discovered_servers) == 0:
+                        self.error_occurred.emit("No server has been discovered yet")
+                        return None
+                    elif event_data is None:
+                        self.log_message.emit('warn', 'No server is specified for connecting. Automatically choosing an available server')
+                        server_name = list(self.discovered_servers.keys())[0]
+                    else:
+                        server_name = event_data.get('server_name')
+                        if server_name is None:
+                            self.log_message.emit('warn', 'No server is specified for connecting. Automatically choosing an available server')
+                            server_name = list(self.discovered_servers.keys())[0]
+                        elif server_name not in self.discovered_servers:
+                            self.error_occurred.emit(f"The server {server_name} has not been discovered yet")
+                            return None
+                    self.connect_to_server(server_name)
                 case 'DISCONNECT_SERVER':
-                    self.disconnect_from_server(event.get('payload'))
+                    if event_data is None or event_data.get('server_name') is None:
+                        server_name = self.selected_server
+                    else:
+                        server_name = event_data.get('server_name')
+                        if server_name != self.selected_server:
+                            self.error_occurred.emit(f"The server {server_name} hasn't been connected")
+                            return None
+                    self.disconnect_from_server(server_name)
                 case 'DISCOVER_DEVICES':
                     self.discover_devices(event.get('payload'))
                 case 'INITIALIZE_DEVICES':
@@ -162,7 +183,7 @@ class Client(QObject):
             self.log_message.emit("error", "Server ping failed")
             return False
 
-    def discover_servers(self): 
+    def discover_servers(self) -> None: 
         # Scan IP range
         for i in range(1, 255):
             if self.status != ClientStatus.SCANNING:
@@ -198,7 +219,7 @@ class Client(QObject):
         
         self.server_scan_completed.emit(True)
 
-    def connect_to_server(self):
+    def connect_to_server(self, server_name: str) -> None:
         if self.selected_server == "": 
             self.log_message.emit('warn', 'No server selected for connection. Automatically choosing an available server.')
             self.discover_servers()
@@ -240,7 +261,7 @@ class Client(QObject):
             self.log_message.emit("error", f"Server connection failed: {e}")
             self.server_connected.emit(False)
 
-    def disconnect_from_server(self):
+    def disconnect_from_server(self, server_name: str) -> None:
         if self.control_socket:
             try:
                 self.control_socket.close()
