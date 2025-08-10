@@ -21,11 +21,14 @@ import json
 import struct # TODO: Remove by confirming packet structure
 import socket 
 import numpy as np
-from typing import List, Dict
+from typing import List, Tuple, Dict, Any, Optional
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from bioview_common import ClientStatus, get_ip, APP_VERSION, DataSource, Command, SUPPORTED_COMMANDS, Response, MAX_BUFFER_SIZE 
+from bioview_common import (
+    ClientStatus, get_ip, get_app_info, AuthenticationError, ValidationError, SUPPORTED_RESPONSES,
+    DataSource, Command, SUPPORTED_COMMANDS, Response, MAX_BUFFER_SIZE, AUTH_TIMEOUT
+)
 
 class Client(QThread):
     # Server control signals 
@@ -53,9 +56,18 @@ class Client(QThread):
     # Data signals for graphical output
     data_received = pyqtSignal(DataSource, np.ndarray) 
     
-    def __init__(self, data_port=9998, control_port=9999):
+    def __init__(
+        self, 
+        data_port: int = 9998, 
+        control_port: int = 9999,
+        auth_timeout: int = AUTH_TIMEOUT,
+        resp_timeout: int = RESPONSE_TIMEOUT
+    ):
         super().__init__()
-        
+        self.app_info = get_app_info() # used for server handshake
+        self.auth_timeout = auth_timeout
+        self.resp_timeout = resp_timeout
+
         # Client network parameters
         self.address: str = get_ip() 
         self.network_prefix: str = self.address[:self.address.rindex('.')]
@@ -126,7 +138,133 @@ class Client(QThread):
             self.server_scan_progress.emit(progress)
         
         self.server_scan_completed.emit(True)
+    
+    # Authentication check for initial connection to server
+    def authenticate_with_server(
+        self, 
+        server_address: Tuple[str, int], # (address, control port)
+        server_socket: socket.socket,  
+    ) -> Dict[str, Any]:
+        """
+        Perform handshake with server. Returns server info if successful, raises AuthenticationError if failed
+        """
+        server_ip = server_address[0]
         
+        try:
+            server_socket.settimeout(self.auth_timeout)
+            
+            # Step 1: Broadcast client info to server (syn)
+            client_syn = {
+                'type': Command.CONNECT_SERVER.value,
+                'payload': {
+                    "hostname": self.app_info['hostname'], 
+                    "app_name": self.app_info['app_name'], # TODO: Replace with app_token
+                    "app_version": self.app_info['version'],
+                    "timestamp": time.time()
+                }
+            }    
+            
+            client_syn_json = json.dumps(client_syn).encode('utf-8')
+            server_socket.send(client_syn_json)
+            
+            # Step 2: Receive server challenge or connection refusal (ack)
+            response_data = server_socket.recv(4096).decode('utf-8')
+            if not response_data:
+                raise AuthenticationError("No response received from server")
+            
+            try:
+                server_response = json.loads(response_data)
+                server_response_type = server_response.get('type')
+                server_response_payload = server_response.get('payload')
+            except json.JSONDecodeError:
+                raise AuthenticationError("Invalid JSON in server response")
+            
+            # Extract server hostname info
+            server_hostname = server_response_payload.get('server_hostname', server_ip)
+
+            # Check if connection was refused
+            if server_response_type == Response.CONNECTION_REFUSED.value:
+                message = server_response_payload.get('message', 'Connection refused by server')
+                raise AuthenticationError(f"Connection refused by {server_hostname}: {message}")
+            
+            # Authenticate server using challenge 
+            challenge = server_response_payload.get('challenge', None)
+            if not challenge:
+                raise AuthenticationError("Server did not provide authentication token")
+            auth_token = self._get_challenge_response(challenge)
+            client_response = {
+                'type': Command.AUTHENTICATE_CLIENT.value,
+                'payload': {
+                    'token': auth_token,
+                    'timestamp': time.time()
+                }
+            }
+            response_data = json.dumps(client_response).encode('utf-8')
+            server_socket.send(response_data)
+            
+            auth_result_data = server_socket.recv(4096).decode('utf-8')
+            if not auth_result_data:
+                raise AuthenticationError("Unable to authenticate server: No authentication result received")
+            
+            try:
+                auth_result = json.loads(auth_result_data)
+            except json.JSONDecodeError:
+                raise AuthenticationError("Unable to authenticate server: Authentication result malformed.")
+            
+            if auth_result.get('type') != Response.AUTHENTICATION_SUCCESS.value:
+                raise AuthenticationError("Server authentication failed")
+            
+            server_info = auth_result.get('payload').get('server_info', {})
+            
+            # Ensure hostname fallback for display
+            if 'hostname' not in server_info or not server_info['hostname']:
+                server_info['hostname'] = server_ip
+            
+            self.logger.info(f"Successfully authenticated with server: {server_info.get('hostname')} ({server_ip})")
+            return server_info
+            
+        except socket.timeout:
+            raise AuthenticationError("Authentication timeout")
+        except Exception as e:
+            self.logger.error(f"Client authentication error: {e}")
+            raise AuthenticationError(f"Authentication failed: {str(e)}")
+    
+    # Validation for received responses to ensure integrity
+    def _validate_message_format(self, data: Dict[str, Any], expected_fields: list) -> bool:
+        """Validate that message contains required fields and proper format"""
+        if not isinstance(data, dict):
+            return False
+        
+        for field in expected_fields:
+            if field not in data:
+                return False
+        
+        return True
+    
+    def validate_response(self, data: str, timeout: Optional[int] = None) -> Dict[str, Any]:
+        timeout = timeout or self.response_timeout
+        
+        try:
+            message = json.loads(data)
+        except json.JSONDecodeError:
+            raise ValidationError("Invalid JSON format")
+        
+        # Validate message structure
+        required_fields = ['type', 'payload']
+        if not self._validate_message_format(message, required_fields):
+            raise ValidationError("Message missing required fields")
+        
+        # Validate response type
+        response_type = message.get('type')
+        if response_type not in SUPPORTED_RESPONSES:
+            raise ValidationError(f"Unsupported response: {response_type}")
+        
+        # Validate payload is a dictionary
+        if not isinstance(message.get('payload'), dict):
+            raise ValidationError(f"payload must be a dict but got {type(message.get('payload'))} instead")
+        
+        return message
+    
     def connect_to_server(self):
         if self.selected_server == {}: 
             self.log_message.emit('warn', 'No server selected for connection. Automatically choosing an available server.')
