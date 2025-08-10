@@ -7,7 +7,6 @@ from .log_display import LogDisplayPanel
 from .plot_grid import PlotGrid
 from .status_bar import StatusBar
 from .text_dialog import TextDialog
-from .usrp_device_config import UsrpDeviceConfigPanel
 
 __all__ = [
     "AnnotateEventPanel",
@@ -18,6 +17,5 @@ __all__ = [
     "PlotGrid",
     "ServerConnector",
     "StatusBar", 
-    "TextDialog",
-    "UsrpDeviceConfigPanel",
+    "TextDialog"
 ]

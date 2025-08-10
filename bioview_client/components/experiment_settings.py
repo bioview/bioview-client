@@ -24,9 +24,17 @@ class ExperimentSettingsPanel(QGroupBox):
     addChannelRequested = pyqtSignal(object)  # Changed to emit DataSource object
     removeChannelRequested = pyqtSignal(object)  # Changed to emit DataSource object
 
-    def __init__(self, config, parent=None):
+    def __init__(
+        self, 
+        file_name: str,
+        save_dir: str,  
+        parent=None
+    ):
         super().__init__("Experiment Settings", parent)
-        self.config = config
+        
+        self.file_name = file_name
+        self.save_dir = save_dir
+
         self.param_inputs = {}
         self.init_ui()
 
@@ -34,33 +42,29 @@ class ExperimentSettingsPanel(QGroupBox):
         layout = QGridLayout()
         row = 0
 
-        # Create parameter inputs
-        file_name = self.config.get("file_name")
-        save_dir = self.config.get("save_dir")
-
-        # File Name
+        # File Name Text Box
         layout.addWidget(QLabel("File Name"), row, 0)
-        self.file_name = QLineEdit()
-        self.file_name.setText(file_name)
-        self.file_name.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
-        self.file_name.textChanged.connect(
+        self.file_name_textbox = QLineEdit()
+        self.file_name_textbox.setText(self.file_name)
+        self.file_name_textbox.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.file_name_textbox.textChanged.connect(
             lambda value: self.update_param(param_name="file_name", value=value)
         )
-        layout.addWidget(self.file_name, row, 1)
+        layout.addWidget(self.file_name_textbox, row, 1)
         row += 1
 
         # Folder picker
         layout.addWidget(QLabel("Save Path"), row, 0)
 
         picker_layout = QHBoxLayout()
-        self.folder_path = QLineEdit()
-        self.folder_path.setReadOnly(True)  # Make it read-only
-        self.folder_path.setText(save_dir)
+        self.save_path_textbox = QLineEdit()
+        self.save_path_textbox.setReadOnly(True)  # Make it read-only
+        self.save_path_textbox.setText(self.save_dir)
         # Update folder_path as it changes
-        self.folder_path.textChanged.connect(
+        self.save_path_textbox.textChanged.connect(
             lambda value: self.update_param(param_name="save_dir", value=value)
         )
-        picker_layout.addWidget(self.folder_path)
+        picker_layout.addWidget(self.save_path_textbox)
 
         # Button to trigger folder selection dialog
         self.browse_button = QPushButton("  Browse")
@@ -106,13 +110,14 @@ class ExperimentSettingsPanel(QGroupBox):
         # Channel selection
         layout.addWidget(QLabel("Plot Sources"), row, 0)
         self.plot_source = CheckableComboBox()
-        # Assuming available_channels contains DataSource objects
-        for source in self.config.get('available_channels', []):
+        
+        # Assuming available_channels cntains DataSource objects
+        for source in self.data_sources:
             self.plot_source.addItem(source)
+
         self.plot_source.selectionChanged.connect(self.request_channel_update)
 
         layout.addWidget(self.plot_source, row, 1)
-
         self.setLayout(layout)
 
     # Handle theme changes
@@ -152,11 +157,10 @@ class ExperimentSettingsPanel(QGroupBox):
         folder = QFileDialog.getExistingDirectory(self, "Select Folder")
         if folder:
             # If user didn't cancel the dialog
-            self.folder_path.setText(folder)
+            self.save_path_textbox.setText(folder)
 
     def update_param(self, param_name, value):
-        self.config[param_name] = value
-        # TODO: Add callback to propagate this 
+        self.parameterChanged.emit(param_name, value)
 
     def update_button_states(self, device_status):
         if device_status == DeviceStatus.STREAMING: 
@@ -164,12 +168,12 @@ class ExperimentSettingsPanel(QGroupBox):
             self.rows_input.setEnabled(False)
             self.cols_input.setEnabled(False)
             # Do not allow changing save file path mid-streaming to avoid data loss 
-            self.file_name.setEnabled(False)
-            self.folder_path.setEnabled(False)
+            self.file_name_textbox.setEnabled(False)
+            self.save_path_textbox.setEnabled(False)
             self.browse_button.setEnabled(False)
         else:
             self.rows_input.setEnabled(True)
             self.cols_input.setEnabled(True)
-            self.file_name.setEnabled(True)
-            self.folder_path.setEnabled(True)
+            self.file_name_textbox.setEnabled(True)
+            self.save_path_textbox.setEnabled(True)
             self.browse_button.setEnabled(True)

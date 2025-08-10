@@ -3,8 +3,8 @@ BioView Monitor can be launched via CLI, with/without configuration JSONs pre-sp
 In case no valid configuration files are found, the app will prompt the user to provide configuration JSONs.
 Regardless on any configurations, the UI will load with appropriate components/default values
 '''
-
 import sys 
+import queue
 import logging # TODO: Remove 
 from pathlib import Path
 
@@ -22,8 +22,7 @@ from bioview_client.components import (
     LogDisplayPanel,
     PlotGrid,
     StatusBar,
-    TextDialog,
-    UsrpDeviceConfigPanel
+    TextDialog
 )
 from bioview_client.handler import Client
 from bioview_client.constants import DEFAULT_COMMON_CONFIGURATION
@@ -31,13 +30,13 @@ from bioview_client.constants import DEFAULT_COMMON_CONFIGURATION
 class BioViewMonitor(QMainWindow):
     def __init__(
         self,
-        device_config: List[Dict] = None,
-        common_config: Dict = None,
+        device_config: List[Dict] = [],
+        common_config: Dict = {},
     ):
         super().__init__()
         
         # Check for valid configuration files provided and, if None, ask user to add 
-        if common_config is None or device_config is None: 
+        if not common_config or not device_config: 
             dialog = ConfigurationPrompt(self)
             configurations = None 
 
@@ -51,11 +50,13 @@ class BioViewMonitor(QMainWindow):
                 # Generate a default common configuration
                 common_config = DEFAULT_COMMON_CONFIGURATION
 
+        # Pass configurations to client handler to initialize everything
+
         # Store configurations 
         self.common_config = common_config
 
         self.devices = {}
-        if device_config is not None and isinstance(device_config, dict):
+        if device_config and isinstance(device_config, dict):
             for device_id, device_cfg in device_config.items(): 
                 self.devices[device_id] = {
                     'config': device_cfg,
@@ -82,8 +83,8 @@ class BioViewMonitor(QMainWindow):
         ### Common Threads
         self.instructions_thread = None
 
-        ### Data Queues
-        # self.disp_queue = queue.Queue(maxsize=10000)
+        # Display Data Queue
+        self.display_data_queue = queue.Queue(maxsize=10000)
 
         # Enable Logging
         self._connect_logging()
@@ -125,9 +126,8 @@ class BioViewMonitor(QMainWindow):
         self.app_control_panel.stopRequested.connect(self.handle_streaming_stop_requested)
         self.app_control_panel.saveRequested.connect(self.update_save_state)
         self.app_control_panel.instructionsEnabled.connect(self.toggle_instructions)
-        # self.app_control_panel.balanceRequested.connect(self.perform_gain_balancing)
-        # self.app_control_panel.sweepRequested.connect(self.perform_frequency_sweep)
 
+        # TODO: Make settings panel
         experiment_layout = QHBoxLayout()
 
         # Experiment Control Panel
@@ -147,7 +147,7 @@ class BioViewMonitor(QMainWindow):
             self.handle_remove_source
         )
 
-        # USRP Device Config Panel(s)
+        # Device Config Panel(s)
         usrp_cfg = []
         for device_dict in self.devices.values():
             if type(device_dict['config']).__name__ == 'MultiUsrpConfiguration': 

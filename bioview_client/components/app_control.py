@@ -13,8 +13,6 @@ class AppControlPanel(QGroupBox):
     stopRequested = pyqtSignal()
     saveRequested = pyqtSignal(bool)
     instructionsEnabled = pyqtSignal(bool)
-    balanceRequested = pyqtSignal()
-    sweepRequested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__("Control", parent)
@@ -52,24 +50,6 @@ class AppControlPanel(QGroupBox):
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.on_stop_clicked)
         layout.addWidget(self.stop_button)
-
-        # Gain Balance Button
-        self.gain_balance_button = QPushButton("Gain Balance")
-        self.gain_balance_button.setIcon(
-            qta.icon("fa6s.rotate", color=get_qcolor("blue"))
-        )
-        self.gain_balance_button.setEnabled(False)
-        self.gain_balance_button.clicked.connect(self.on_gain_balance_clicked)
-        layout.addWidget(self.gain_balance_button)
-
-        # Frequency Sweep Button
-        self.freq_sweep_button = QPushButton("Frequency Sweep")
-        self.freq_sweep_button.setIcon(
-            qta.icon("fa6s.rotate", color=get_qcolor("blue"))
-        )
-        self.freq_sweep_button.setEnabled(False)
-        self.freq_sweep_button.clicked.connect(self.on_freq_sweep_clicked)
-        layout.addWidget(self.freq_sweep_button)
 
         layout.addStretch()
         self.setLayout(layout)
@@ -129,12 +109,6 @@ class AppControlPanel(QGroupBox):
 
     def on_stop_clicked(self):
         self.stopRequested.emit()
-
-    def on_gain_balance_clicked(self):
-        self.balanceRequested.emit()
-
-    def on_freq_sweep_clicked(self):
-        self.sweepRequested.emit()
 
     def on_save_toggled(self):
         if self.save_checkbox.isChecked():

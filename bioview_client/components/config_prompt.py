@@ -1,5 +1,6 @@
 import json 
 from pathlib import Path
+from typing import List, Dict 
 
 from PyQt6.QtWidgets import (
     QDialog, QGroupBox, QLabel, QVBoxLayout, 
@@ -8,20 +9,28 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt
 
+from bioview_common import Configuration, APP_VERSION
+
 class ConfigurationPrompt(QDialog):
     '''
     Dialog for uploading common and device configuration, loaded whenever the app does not find a valid configuration
     '''
     
-    def __init__(self, parent=None):
+    def __init__(
+        self, 
+        common_config: Dict = {}, 
+        device_configs: List[Dict] = [], 
+        parent=None
+    ):
         super().__init__(parent)
-        self.common_config = {}
-        self.device_configs = []
+        self.common_config = common_config
+        self.device_configs = device_configs 
         self.setup_ui()
+        self.populate_device_list()
         
     def setup_ui(self):
         """Initialize the dialog UI."""
-        self.setWindowTitle("Configuration Setup")
+        self.setWindowTitle(f"Experimental Configuration - BioView Monitor {APP_VERSION}")
         self.setModal(True)
         self.resize(600, 500)
         
@@ -38,7 +47,10 @@ class ConfigurationPrompt(QDialog):
         common_layout = QVBoxLayout(common_group)
         
         common_info_layout = QHBoxLayout()
-        self.common_status_label = QLabel("No common configuration loaded")
+        if self.common_config == {}:
+            self.common_status_label = QLabel("No configuration provided")
+        else: 
+            self.common_status_label = QLabel("Configuration found")
         self.common_status_label.setStyleSheet("color: gray; font-style: italic;")
         common_info_layout.addWidget(self.common_status_label)
         common_info_layout.addStretch()
@@ -115,6 +127,83 @@ class ConfigurationPrompt(QDialog):
         
         layout.addLayout(button_layout)
         
+    def populate_device_list(self):
+        """Populate the device list with existing device configs."""
+        self.device_list.clear()
+        for index, device_config in enumerate(self.device_configs):
+            # Try to get a meaningful name for the device
+            device_name = self.get_device_display_name(device_config, index)
+            
+            item = QListWidgetItem(device_name)
+            item.setData(Qt.ItemDataRole.UserRole, index)
+            self.device_list.addItem(item)
+            
+    def get_device_display_name(self, device_config, index):
+        """Get a display name for the device config."""
+        # Try common fields that might contain a name
+        name_fields = ['name', 'device_name', 'id', 'device_id', 'type', 'device_type']
+        
+        for field in name_fields:
+            if field in device_config and device_config[field]:
+                return str(device_config[field])
+        
+        # Fallback to index-based name
+        return f"Device {index + 1}"
+        
+    def format_device_preview(self, device_config):
+        """Format device configuration for preview, showing only valid fields.
+        
+        Override this method to use your wrapper object for proper formatting.
+        """
+        # Default implementation - you can replace this with your wrapper object logic
+        
+        # Define common valid fields for different device types
+        valid_fields = {
+            'common': ['name', 'type', 'id', 'enabled', 'description'],
+            'sensor': ['sensor_type', 'port', 'baudrate', 'sampling_rate', 'units'],
+            'camera': ['resolution', 'fps', 'exposure', 'gain', 'format'],
+            'actuator': ['actuator_type', 'range', 'precision', 'speed'],
+            'controller': ['protocol', 'address', 'timeout', 'parameters']
+        }
+        
+        # Try to determine device type
+        device_type = device_config.get('type', device_config.get('device_type', 'common'))
+        
+        # Get relevant valid fields
+        relevant_fields = valid_fields.get('common', [])
+        if device_type in valid_fields:
+            relevant_fields.extend(valid_fields[device_type])
+        
+        # Format the preview
+        formatted_lines = []
+        formatted_lines.append(f"Device Type: {device_type}")
+        formatted_lines.append("-" * 30)
+        
+        # Show only valid fields that exist in the config
+        for field in relevant_fields:
+            if field in device_config:
+                value = device_config[field]
+                if isinstance(value, (dict, list)):
+                    value_str = json.dumps(value, indent=2)
+                else:
+                    value_str = str(value)
+                formatted_lines.append(f"{field.replace('_', ' ').title()}: {value_str}")
+        
+        # Show any additional fields that weren't in the valid list
+        other_fields = [k for k in device_config.keys() if k not in relevant_fields]
+        if other_fields:
+            formatted_lines.append("\nOther Fields:")
+            formatted_lines.append("-" * 15)
+            for field in other_fields:
+                value = device_config[field]
+                if isinstance(value, (dict, list)):
+                    value_str = json.dumps(value, indent=2)
+                else:
+                    value_str = str(value)
+                formatted_lines.append(f"{field.replace('_', ' ').title()}: {value_str}")
+        
+        return "\n".join(formatted_lines)
+        
     def upload_common_config(self):
         """Upload common configuration from JSON file."""
         file_path, _ = QFileDialog.getOpenFileName(
@@ -165,22 +254,11 @@ class ConfigurationPrompt(QDialog):
                 with open(file_path, 'r', encoding='utf-8') as f:
                     config_data = json.load(f)
                 
-                device_name = Path(file_path).stem
-                # Check if device name already exists
-                existing_names = [self.device_list.item(i).text() for i in range(self.device_list.count())]
-                if device_name in existing_names:
-                    counter = 1
-                    while f"{device_name}_{counter}" in existing_names:
-                        counter += 1
-                    device_name = f"{device_name}_{counter}"
-                
-                self.device_configs.append({
-                    'name': device_name,
-                    'config': config_data,
-                    'file_path': file_path
-                })
+                # Add the config dict directly to the list
+                self.device_configs.append(config_data)
                 
                 # Add to list widget
+                device_name = self.get_device_display_name(config_data, len(self.device_configs) - 1)
                 item = QListWidgetItem(device_name)
                 item.setData(Qt.ItemDataRole.UserRole, len(self.device_configs) - 1)
                 self.device_list.addItem(item)
@@ -220,7 +298,9 @@ class ConfigurationPrompt(QDialog):
             device_index = current_item.data(Qt.ItemDataRole.UserRole)
             device_config = self.device_configs[device_index]
             
-            preview_text = json.dumps(device_config['config'], indent=2)
+            # Use the formatted preview instead of raw JSON
+            preview_text = self.format_device_preview(device_config)
+            
             # Truncate if too long
             if len(preview_text) > 1000:
                 preview_text = preview_text[:1000] + "\n... (truncated)"
@@ -239,9 +319,6 @@ class ConfigurationPrompt(QDialog):
             result['common'] = self.common_config
             
         if self.device_configs:
-            result['devices'] = {}
-            for device in self.device_configs:
-                device_id = hash((device['name'], device['type']))
-                result['devices'][device_id] = device['config']
+            result['devices'] = self.device_configs  # Return the list directly
                 
         return result
