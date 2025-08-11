@@ -147,7 +147,7 @@ class BioViewMonitor(QMainWindow):
             self.handle_remove_source
         )
 
-        # Device Config Panel(s)
+        # Device Config Panel(s) - TODO: Fix
         usrp_cfg = []
         for device_dict in self.devices.values():
             if type(device_dict['config']).__name__ == 'MultiUsrpConfiguration': 

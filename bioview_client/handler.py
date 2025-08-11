@@ -21,14 +21,16 @@ import json
 import struct # TODO: Remove by confirming packet structure
 import socket 
 import numpy as np
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Dict, Any
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from bioview_common import (
-    ClientStatus, get_ip, get_app_info, AuthenticationError, ValidationError, SUPPORTED_RESPONSES,
-    DataSource, Command, SUPPORTED_COMMANDS, Response, MAX_BUFFER_SIZE, AUTH_TIMEOUT
+    DATA_PORT, CONTROL_PORT, ClientStatus, get_ip, get_app_info, AuthenticationError, SUPPORTED_RESPONSES,
+    DataSource, Command, SUPPORTED_COMMANDS, Response, MAX_BUFFER_SIZE, AUTH_TIMEOUT, RESPONSE_TIMEOUT
 )
+
+from  bioview_client.utils import parse_and_validate_response
 
 class Client(QThread):
     # Server control signals 
@@ -58,8 +60,8 @@ class Client(QThread):
     
     def __init__(
         self, 
-        data_port: int = 9998, 
-        control_port: int = 9999,
+        data_port: int = DATA_PORT, 
+        control_port: int = CONTROL_PORT,
         auth_timeout: int = AUTH_TIMEOUT,
         resp_timeout: int = RESPONSE_TIMEOUT
     ):
@@ -169,101 +171,49 @@ class Client(QThread):
             
             # Step 2: Receive server challenge or connection refusal (ack)
             response_data = server_socket.recv(4096).decode('utf-8')
-            if not response_data:
-                raise AuthenticationError("No response received from server")
-            
-            try:
-                server_response = json.loads(response_data)
-                server_response_type = server_response.get('type')
-                server_response_payload = server_response.get('payload')
-            except json.JSONDecodeError:
-                raise AuthenticationError("Invalid JSON in server response")
+            response_type, response_payload = parse_and_validate_response(response_data)
             
             # Extract server hostname info
-            server_hostname = server_response_payload.get('server_hostname', server_ip)
+            server_hostname = response_payload.get('server_hostname', server_ip)
 
             # Check if connection was refused
-            if server_response_type == Response.CONNECTION_REFUSED.value:
-                message = server_response_payload.get('message', 'Connection refused by server')
+            if response_type == Response.CONNECTION_REFUSED.value:
+                message = response_payload.get('message', 'Connection refused by server')
                 raise AuthenticationError(f"Connection refused by {server_hostname}: {message}")
             
             # Authenticate server using challenge 
-            challenge = server_response_payload.get('challenge', None)
+            challenge = response_payload.get('challenge', None)
             if not challenge:
                 raise AuthenticationError("Server did not provide authentication token")
             auth_token = self._get_challenge_response(challenge)
-            client_response = {
+            client_response_dict = {
                 'type': Command.AUTHENTICATE_CLIENT.value,
                 'payload': {
                     'token': auth_token,
                     'timestamp': time.time()
                 }
             }
-            response_data = json.dumps(client_response).encode('utf-8')
-            server_socket.send(response_data)
+            client_response = json.dumps(client_response_dict).encode('utf-8')
+            server_socket.send(client_response)
             
             auth_result_data = server_socket.recv(4096).decode('utf-8')
-            if not auth_result_data:
-                raise AuthenticationError("Unable to authenticate server: No authentication result received")
+            auth_result_type, auth_result_payload = parse_and_validate_response(auth_result_data, Response.AUTHENTICATION_SUCCESS.value)
             
-            try:
-                auth_result = json.loads(auth_result_data)
-            except json.JSONDecodeError:
-                raise AuthenticationError("Unable to authenticate server: Authentication result malformed.")
-            
-            if auth_result.get('type') != Response.AUTHENTICATION_SUCCESS.value:
-                raise AuthenticationError("Server authentication failed")
-            
-            server_info = auth_result.get('payload').get('server_info', {})
+            server_info = auth_result_payload.get('server_info', {})
             
             # Ensure hostname fallback for display
             if 'hostname' not in server_info or not server_info['hostname']:
                 server_info['hostname'] = server_ip
             
-            self.logger.info(f"Successfully authenticated with server: {server_info.get('hostname')} ({server_ip})")
+            self.log_message.emit("info", f"Successfully authenticated with server: {server_info.get('hostname')} ({server_ip})")
             return server_info
             
         except socket.timeout:
+            self.log_message.emit("error", f"Client authentication error: {e}")
             raise AuthenticationError("Authentication timeout")
         except Exception as e:
-            self.logger.error(f"Client authentication error: {e}")
+            self.log_message.emit("error", f"Client authentication error: {e}")
             raise AuthenticationError(f"Authentication failed: {str(e)}")
-    
-    # Validation for received responses to ensure integrity
-    def _validate_message_format(self, data: Dict[str, Any], expected_fields: list) -> bool:
-        """Validate that message contains required fields and proper format"""
-        if not isinstance(data, dict):
-            return False
-        
-        for field in expected_fields:
-            if field not in data:
-                return False
-        
-        return True
-    
-    def validate_response(self, data: str, timeout: Optional[int] = None) -> Dict[str, Any]:
-        timeout = timeout or self.response_timeout
-        
-        try:
-            message = json.loads(data)
-        except json.JSONDecodeError:
-            raise ValidationError("Invalid JSON format")
-        
-        # Validate message structure
-        required_fields = ['type', 'payload']
-        if not self._validate_message_format(message, required_fields):
-            raise ValidationError("Message missing required fields")
-        
-        # Validate response type
-        response_type = message.get('type')
-        if response_type not in SUPPORTED_RESPONSES:
-            raise ValidationError(f"Unsupported response: {response_type}")
-        
-        # Validate payload is a dictionary
-        if not isinstance(message.get('payload'), dict):
-            raise ValidationError(f"payload must be a dict but got {type(message.get('payload'))} instead")
-        
-        return message
     
     def connect_to_server(self):
         if self.selected_server == {}: 
