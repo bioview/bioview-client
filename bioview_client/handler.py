@@ -19,7 +19,6 @@ This can be modified for remote operation.
 import contextlib
 import json
 import socket
-import struct  # TODO: Remove by confirming packet structure
 import time
 from typing import Any, Dict, List, Tuple
 
@@ -91,12 +90,13 @@ class Client(QThread):
         self.status: ClientStatus = ClientStatus.DEFAULT
 
         # Servers
-        self.discovered_servers: Dict[str, str] = {} # (server_name: IP)
-        self.selected_server: str =  "" # server_name
+        self.discovered_servers: Dict[str, str] = {} # (server_id, IP)
+        self.connected_server: str =  "" # server_id
         self.server_number: int = 1 # Just a temporary initialization constant
         
         # Devices
-        self.connected_devices: List[str] = [] # each item is a device id
+        self.discovered_devices: Dict[str, str] = {} # (device_id, server_id)
+        self.connected_devices: Dict[str, str] = {} # (device_id, server_id)
         self.streaming_active: bool = False
 
         # Ports 
@@ -127,16 +127,16 @@ class Client(QThread):
                         return None
                     elif event_data is None:
                         self.log_message.emit('warn', 'No server is specified for pinging. Automatically choosing an available server')
-                        server_name = list(self.discovered_servers.keys())[0]
+                        server_id = list(self.discovered_servers.keys())[0]
                     else:
-                        server_name = event_data.get('server_name')
-                        if server_name is None:
+                        server_id = event_data.get('server_id')
+                        if server_id is None:
                             self.log_message.emit('warn', 'No server is specified for pinging. Automatically choosing an available server')
-                            server_name = list(self.discovered_servers.keys())[0]
-                        elif server_name not in self.discovered_servers:
-                            self.error_occurred.emit(f"The server {server_name} has not been discovered yet")
+                            server_id = list(self.discovered_servers.keys())[0]
+                        elif server_id not in self.discovered_servers:
+                            self.error_occurred.emit(f"The server {server_id} has not been discovered yet")
                             return None
-                    self.ping_server(server_name)
+                    self.ping_server(server_id)
 
                 case 'DISCOVER_SERVERS':
                     if event_data is not None or event_data is not {}:
@@ -149,50 +149,114 @@ class Client(QThread):
                         return None
                     elif event_data is None:
                         self.log_message.emit('warn', 'No server is specified for connecting. Automatically choosing an available server')
-                        server_name = list(self.discovered_servers.keys())[0]
+                        server_id = list(self.discovered_servers.keys())[0]
                     else:
-                        server_name = event_data.get('server_name')
-                        if server_name is None:
+                        server_id = event_data.get('server_id')
+                        if server_id is None:
                             self.log_message.emit('warn', 'No server is specified for connecting. Automatically choosing an available server')
-                            server_name = list(self.discovered_servers.keys())[0]
-                        elif server_name not in self.discovered_servers:
-                            self.error_occurred.emit(f"The server {server_name} has not been discovered yet")
+                            server_id = list(self.discovered_servers.keys())[0]
+                        elif server_id not in self.discovered_servers:
+                            self.error_occurred.emit(f"The server {server_id} has not been discovered yet")
                             return None
-                    self.connect_to_server(server_name)
+                    self.connect_to_server(server_id)
+                
                 case 'DISCONNECT_SERVER':
-                    if event_data is None or event_data.get('server_name') is None:
-                        server_name = self.selected_server
+                    if event_data is None or event_data.get('server_id') is None:
+                        server_id = self.connected_server
                     else:
-                        server_name = event_data.get('server_name')
-                        if server_name != self.selected_server:
-                            self.error_occurred.emit(f"The server {server_name} hasn't been connected")
+                        server_id = event_data.get('server_id')
+                        if server_id != self.connected_server:
+                            self.error_occurred.emit(f"The server {server_id} hasn't been connected")
                             return None
-                    self.disconnect_from_server(server_name)
+                    self.disconnect_from_server(server_id)
+                
                 case 'DISCOVER_DEVICES':
-                    self.discover_devices(event.get('payload'))
+                    if event_data is None or event_data.get('server_id') is None:
+                        self.log_message.emit('warn', 'No server is specified for discovering devices. Automatically choosing an available server')
+                        server_id = list(self.discovered_servers.keys())[0]
+                    else:
+                        server_id = event_data.get('server_id')
+                        if server_id not in self.discovered_servers:
+                            self.error_occurred.emit(f"The server {server_id} has not been discovered yet")
+                            return None
+                    self.discover_devices(server_id)
+                
                 case 'INITIALIZE_DEVICES':
+                    if event_data is None or event_data.get('device_ids') is None:
+                        self.error_occurred.emit('At least one device id must be mentioned for initialization')
+                        return None
+                    else:
+                        device_ids = event_data.get('device_ids')
+                        false_devices = []
+                        for device_id in device_ids:
+                            # TODO: FIX
+                            pass
+                        req_servers = {self.discovered_devices.get(idx) for idx in device_ids}
+                        
                     self.update_device_configs(event.get('payload'))
+                
                 case 'CONNECT_DEVICES':
-                    self.connect_devices(event.get('payload'))
+                    if event_data is None or event_data.get('device_ids') is None:
+                        self.error_occurred.emit('At least one device id must be mentioned for connecting')
+                        return None
+                    else:
+                        device_ids = event_data.get('device_ids')
+                        false_devices = []
+                        for device_id in device_ids:
+                            if device_id not in self.discovered_devices:
+                                false_devices.append(device_id)
+                                del(device_ids[device_id])
+                        if len(false_devices) == 1:
+                            self.error_occurred.emit(f"The device {false_devices[0]} can't be found")
+                        elif len(false_devices) > 1:
+                            self.error_occurred.emit("The devices " + ",".join(false_devices) + " can't be found")
+                        if len(device_ids) == 0:
+                            self.error_occurred.emit('At least one correct device id must be mentioned for connecting')
+                            return None 
+                    self.connect_devices(device_ids)
+                
                 case 'DISCONNECT_DEVICES':
-                    self.disconnect_devices(event.get('payload'))
+                    if event_data is None or event_data.get('device_ids') is None:
+                        self.error_occurred.emit('At least one device id must be mentioned for disconnecting')
+                        return None
+                    else:
+                        device_ids = event_data.get('device_ids')
+                        false_devices = []
+                        for device_id in device_ids:
+                            if device_id not in self.discovered_devices:
+                                false_devices.append(device_id)
+                                del(device_ids[device_id])
+                        if len(false_devices) == 1:
+                            self.error_occurred.emit(f"The device {false_devices[0]} can't be found")
+                        elif len(false_devices) > 1:
+                            self.error_occurred.emit("The devices " + ",".join(false_devices) + " can't be found")
+                        if len(device_ids) == 0:
+                            self.error_occurred.emit('At least one correct device id must be mentioned for disconnecting')
+                            return None 
+                    self.disconnect_devices(device_ids)
+                
                 case 'START_STREAMING':
                     self.start_streaming(event.get('payload'))
+                
                 case 'STOP_STREAMING':
                     self.stop_streaming(event.get('payload'))
+                
                 case 'GET_DEVICE_STATUS':
                     pass
+                
                 case 'UPDATE_DEVICE_FIRMWARE':
                     pass
+                
                 case 'UPDATE_RUNNING_PARAMETER':
                     pass
+                
                 case _:
                     pass
         return None
 
     ### Server commands
     #Handled
-    def ping_server(self, server_name: str) -> None:
+    def ping_server(self, server_id: str) -> None:
         """Test server connectivity"""
         response = self.send_control_command(Command.PING_SERVER)
         
@@ -216,7 +280,7 @@ class Client(QThread):
             try:
                 # Quick connection test
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(5.0)  # 5sec timeout
+                sock.settimeout(1.0)  # 1sec timeout
                 
                 # NOTE: This may be potentially vulnerable. However, since this is being done over a local network itself, the risks may be low. 
                 # TODO: Confirm security with someone who deals with a networking stack. 
@@ -226,8 +290,8 @@ class Client(QThread):
 
                 if result == 0:
                     # Server found
-                    server_name = self.generate_server_name()
-                    self.server_found.emit(server_name, target_ip, self.data_port, self.control_port)
+                    server_id = self.generate_server_id()
+                    self.server_found.emit(server_id, target_ip, self.data_port, self.control_port)
                 
                 sock.close()
 
@@ -323,61 +387,31 @@ class Client(QThread):
             self.log_message.emit("error", f"Client authentication error: {e}")
             raise AuthenticationError(f"Authentication failed: {str(e)}") from None
 
-    def connect_to_server(self):
-        if self.selected_server == {}:
-            self.log_message.emit(
-                "warn",
-                "No server selected. Automatically connecting to an available server.",
-            )
-            self.discover_servers()
-            if len(self.discovered_servers) == 0:
-                self.log_message.emit("error", "No valid servers available.")
-            else:
-                self.selected_server = self.discovered_servers[0]
-                self.log_message.emit(
-                    "info", f"Connecting to server: {self.selected_server}"
-                )
-    
-    def connect_to_server(self, server_name: str) -> None:
-        if self.selected_server == "": 
-            self.log_message.emit('warn', 'No server selected for connection. Automatically choosing an available server.')
-            self.discover_servers()
-            if len(self.discovered_servers.keys()) == 0: 
-                self.log_message.emit('error', 'No valid servers available.')
-            else: 
-                self.selected_server = list(self.discovered_servers)[0]
-                self.log_message.emit('info', f'Connecting to server: {self.selected_server}')
-
+    def connect_to_server(self, server_id: str) -> None:
         try:
             # Connect to control server - close pre-existing connections
-            if self.control_socket:
-                self.control_socket.close()
+            if self.connected_server != server_id:
+                self.disconnect_from_server(self.connected_server)
+            
+                self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.control_socket.connect((server_id, self.control_port))
+                self.control_socket.settimeout(5.0)
+                self.control_connected = True
+                self.log_message.emit("debug", f"Connected to {server_id} control port")
+                
+                self.data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.data_socket.connect((server_id, self.data_port))
+                self.data_socket.settimeout(5.0)
+                self.data_connected = True
+                self.log_message.emit("debug", f"Connected to {server_id} data port")
 
-            self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.control_socket.connect((self.discovered_servers[self.selected_server], self.control_port))
-            self.control_socket.settimeout(5.0)
-            self.control_connected = True
-
-            self.log_message.emit("debug", "Connected to control server")
-
-            # Connect to data server - close pre-existing connections
-            if self.data_socket:
-                self.data_socket.close()
-
-            self.data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.data_socket.connect((self.discovered_servers[self.selected_server], self.data_port))
-            self.data_socket.settimeout(5.0)
-            self.data_connected = True
-
-            self.log_message.emit("debug", "Connected to data server")
-
-            # Emit status
-            self.status = ClientStatus.SERVER_CONNECTED
-            self.server_connected.emit(True)
+                # Emit status 
+                self.status = ClientStatus.SERVER_CONNECTED
+                self.server_connected.emit(True)
 
         except Exception as e:
             self.status = ClientStatus.DEFAULT
-            self.log_message.emit("error", f"Server connection failed: {e}")
+            self.log_message.emit("error", f"Server connection failed with error: {e}")
             self.server_connected.emit(False)
 
     def disconnect_from_server(self, server_name: str) -> None:
@@ -396,7 +430,7 @@ class Client(QThread):
         self.status = ClientStatus.SERVER_DISCONNECTED
         self.server_disconnected.emit(True)
         self.log_message.emit("info", "Disconnected from server")
-        self.selected_server = ""
+        self.connected_server = ""
     
     ########## Device Commands ########## 
     
@@ -626,7 +660,7 @@ class Client(QThread):
 
         return devices_status 
 
-    def generate_server_name(self):
+    def generate_server_id(self):
         self.server_number += 1
         return f'Server{self.server_number - 1}'
 
