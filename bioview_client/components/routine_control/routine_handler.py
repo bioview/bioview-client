@@ -21,10 +21,10 @@ class RoutineControl():
     pass 
 
 class InstructionHandler(QThread):
-    logEvent = pyqtSignal(str, str)
-    textUpdate = pyqtSignal(str)  # Signal to update instruction text
-    showDialog = pyqtSignal()  # Signal to show the dialog
-    hideDialog = pyqtSignal()  # Signal to hide the dialog
+    log_event = pyqtSignal(str, str)
+    text_update = pyqtSignal(str)  # Signal to update instruction text
+    show_dialog = pyqtSignal()  # Signal to show the dialog
+    hide_dialog = pyqtSignal()  # Signal to hide the dialog
 
     def __init__(
         self, 
@@ -38,7 +38,7 @@ class InstructionHandler(QThread):
         # TODO: Preferably, let this be done in a pop-up UI for convenience
         
         if instruction_type not in AVAILABLE_INSTRUCTIONS.keys():
-            self.logEvent.emit("error", f"Invalid instruction specified: {instruction_type}")
+            self.log_event.emit("error", f"Invalid instruction specified: {instruction_type}")
             return 
 
         self.instruction_type = instruction_type
@@ -53,7 +53,7 @@ class InstructionHandler(QThread):
 
     def run(self):
         if self.instruction_handler is None:
-            self.logEvent.emit("warning", "No instruction handler available")
+            self.log_event.emit("warning", "No instruction handler available")
             return
 
         self.running = True
@@ -63,7 +63,7 @@ class InstructionHandler(QThread):
             self.instruction_handler.pre_run()
 
         if self.instruction_type == "text":
-            self.showDialog.emit()
+            self.show_dialog.emit()
 
         while self.running:
             should_stop = self.instruction_handler.run()
@@ -80,4 +80,4 @@ class InstructionHandler(QThread):
 
         # Hide text dialog
         if self.instruction_type == "text":
-            self.hideDialog.emit()
+            self.hide_dialog.emit()

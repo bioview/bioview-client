@@ -8,11 +8,11 @@ from bioview_client.constants import get_qcolor
 
 class AppControlPanel(QGroupBox):
     # Define signals to emit changes to connection status
-    connectionInitiated = pyqtSignal()
-    startRequested = pyqtSignal()
-    stopRequested = pyqtSignal()
-    saveRequested = pyqtSignal(bool)
-    instructionsEnabled = pyqtSignal(bool)
+    connect_devices = pyqtSignal()
+    start_streaming = pyqtSignal()
+    stop_streaming = pyqtSignal()
+    enable_data_saving = pyqtSignal(bool)
+    enable_instructions = pyqtSignal(bool)
 
     def __init__(self, parent=None):
         super().__init__("Control", parent)
@@ -102,22 +102,22 @@ class AppControlPanel(QGroupBox):
             pass 
 
     def on_connect_clicked(self):
-        self.connectionInitiated.emit()
+        self.connect_devices.emit()
 
     def on_start_clicked(self):
-        self.startRequested.emit()
+        self.start_streaming.emit()
 
     def on_stop_clicked(self):
-        self.stopRequested.emit()
+        self.stop_streaming.emit()
 
     def on_save_toggled(self):
         if self.save_checkbox.isChecked():
-            self.saveRequested.emit(True)
+            self.enable_data_saving.emit(True)
         else:
-            self.saveRequested.emit(False)
+            self.enable_data_saving.emit(False)
 
     def on_instructions_toggled(self):
         if self.instructions_checkbox.isChecked():
-            self.instructionsEnabled.emit(True)
+            self.enable_instructions.emit(True)
         else:
-            self.instructionsEnabled.emit(False)
+            self.enable_instructions.emit(False)

@@ -147,7 +147,7 @@ class PlotManager:
 
 
 class PlotGrid(QWidget):
-    logEvent = pyqtSignal(str, str)
+    log_event = pyqtSignal(str, str)
 
     def __init__(self, config, parent=None):
         super().__init__(parent)
@@ -235,7 +235,7 @@ class PlotGrid(QWidget):
 
     def add_source(self, source):
         if source in self.selected_channels.keys():
-            self.logEvent.emit(
+            self.log_event.emit(
                 "debug", "Unable to add channel as it is already being plotted"
             )
             return True
@@ -246,7 +246,7 @@ class PlotGrid(QWidget):
             # Pop
             row, col = self.available_slots.pop(0)
         except IndexError:
-            self.logEvent.emit(
+            self.log_event.emit(
                 "warning",
                 "All graph slots full. Update layout or remove an existing trace.",
             )
@@ -262,7 +262,7 @@ class PlotGrid(QWidget):
 
     def remove_source(self, channel):
         if channel not in self.selected_channels.keys():
-            self.logEvent.emit(
+            self.log_event.emit(
                 "debug", "Unable to remove channel as it is not being plotted"
             )
             return
@@ -308,12 +308,12 @@ class PlotGrid(QWidget):
             max_queue = max(max_queue, queue_size)
 
         if max_queue > 100:  # Threshold for concern
-            self.logEvent.emit(
+            self.log_event.emit(
                 "debug",
                 f"Plot queues getting large - max: {max_queue}, total: {total_queued}. Consider reducing data rate or increasing processing.",
             )
         elif total_queued > 0:
-            self.logEvent.emit(
+            self.log_event.emit(
                 "debug", f"Active plot queues - max: {max_queue}, total: {total_queued}"
             )
 

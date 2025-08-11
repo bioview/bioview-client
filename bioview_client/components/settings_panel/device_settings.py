@@ -4,8 +4,8 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from bioview_common import Configuration 
 
 class DeviceSettingsPanel(QGroupBox):
-    modifyUSRP = pyqtSignal(str, object)
-    logEvent = pyqtSignal(str, str)
+    update_device_param = pyqtSignal(str, object)
+    log_event = pyqtSignal(str, str)
 
     def __init__(
         self, 
@@ -113,12 +113,12 @@ class DeviceSettingsPanel(QGroupBox):
         try:
             self.device_configuration.set_param(param, updated_value)
             
-            self.logEvent.emit(
+            self.log_event.emit(
                 "debug",
                 f"{self.device_name}: Updated {param} to {value} successfully",
             )
         except Exception as e:
-            self.logEvent.emit(
+            self.log_event.emit(
                 "error", f"{self.device_name}: Updating {param} failed"
             )
 

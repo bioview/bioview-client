@@ -7,7 +7,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QEvent
 from bioview_client.constants import get_qcolor
 
 class AnnotateEventPanel(QGroupBox):
-    logEvent = pyqtSignal(str, str)
+    log_event = pyqtSignal(str, str)
 
     def __init__(self, log_path, parent=None):
         super().__init__("Mark Events", parent)
@@ -49,7 +49,7 @@ class AnnotateEventPanel(QGroupBox):
         try:
             annotation = self.annotation_box.toPlainText()
             if not annotation.strip():  # Check if the text is empty or just whitespace
-                self.logEvent.emit("debug", "No text to append")
+                self.log_event.emit("debug", "No text to append")
 
             with open(self.log_path, "a") as f:
                 f.write(
@@ -58,4 +58,4 @@ class AnnotateEventPanel(QGroupBox):
 
             self.annotation_box.clear()
         except Exception as e:
-            self.logEvent.emit("error", f"An error occurred: {e}")
+            self.log_event.emit("error", f"An error occurred: {e}")

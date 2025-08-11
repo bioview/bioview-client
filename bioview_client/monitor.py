@@ -18,7 +18,6 @@ from bioview_client.components import (
     AnnotateEventPanel,
     AppControlPanel,
     ConfigurationPrompt,
-    ExperimentSettingsPanel,
     LogDisplayPanel,
     PlotGrid,
     StatusBar,
@@ -326,11 +325,11 @@ class BioViewMonitor(QMainWindow):
     
      
 if __name__ == "__main__":
-    # import qdarktheme
+    import qdarktheme # Provide consistent styling across all OSes
 
-    # qdarktheme.enable_hi_dpi()
+    qdarktheme.enable_hi_dpi()
     app = QApplication(sys.argv)
-    # qdarktheme.setup_theme(theme = 'auto')
+    qdarktheme.setup_theme(theme = 'auto')
 
     # Create and show main window
     window = BioViewMonitor()
