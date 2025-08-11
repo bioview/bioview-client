@@ -33,7 +33,7 @@ class DeviceSettingsPanel(QGroupBox):
             get_list = lambda x: x if isinstance(x, (list, tuple)) else [x]
             value = get_list(param_dict["value"])
 
-            multiplier = param_dict["multiplier "]
+            multiplier = param_dict["multiplier"]
 
             # (optional) load parameter range
             # (optional) specify parameter step 
@@ -71,10 +71,13 @@ class DeviceSettingsPanel(QGroupBox):
                     val_layout.addWidget(widget)
             elif widget_type == 'slider':
                 # Make slider(s)
-                for idx, val in enumerate(value): 
-                    display_val = (
-                       val / multiplier if isinstance(val, (int, float)) else val
-                    )
+                for idx, val in enumerate(value):
+                    display_val = val
+                    # Use appropriate operation depending on type
+                    if isinstance(val, (int, float)):
+                        display_val = (
+                            val / multiplier if isinstance(val, float) else val // multiplier
+                        )
                     widget = QSlider(Qt.Orientation.Horizontal, self)
                     if range: 
                         widget.setMinimum(range[0])
@@ -93,9 +96,10 @@ class DeviceSettingsPanel(QGroupBox):
 
                     val_layout.addWidget(widget)
             else: 
-                return 
+                return
             
-            layout.addLayout(QLabel(label_text), row, 1)
+            layout.addLayout(val_layout, row, 1)
+            row += 1
 
         self.setLayout(layout)
 

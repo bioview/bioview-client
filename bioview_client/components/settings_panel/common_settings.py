@@ -112,8 +112,8 @@ class CommonSettingsPanel(QGroupBox):
         self.plot_source = CheckableComboBox()
         
         # Assuming available_channels cntains DataSource objects
-        for source in self.data_sources:
-            self.plot_source.addItem(source)
+        # for source in self.data_sources:
+        #     self.plot_source.addItem(source)
 
         self.plot_source.selectionChanged.connect(self.request_channel_update)
 

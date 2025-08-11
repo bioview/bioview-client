@@ -29,6 +29,7 @@ COLOR_SCHEME = {
     "blue": {"dark": (64, 156, 255), "light": (0, 122, 255)},
     "indigo": {"dark": (125, 122, 255), "light": (88, 86, 214)},
     "purple": {"dark": (191, 90, 242), "light": (173, 68, 171)},
+    "mainBg": {"dark": (50, 50, 50), "light": (200, 200, 200)}
 }
 
 def get_qcolor(name):

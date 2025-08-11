@@ -18,13 +18,14 @@ from bioview_client.components import (
     AnnotateEventPanel,
     AppControlPanel,
     ConfigurationPrompt,
+    SettingsPanel,
     LogDisplayPanel,
     PlotGrid,
     StatusBar,
     TextDialog
 )
 from bioview_client.handler import Client
-from bioview_client.constants import DEFAULT_COMMON_CONFIGURATION
+from bioview_client.constants import DEFAULT_COMMON_CONFIGURATION, get_color_tuple
 
 class BioViewMonitor(QMainWindow):
     def __init__(
@@ -126,12 +127,9 @@ class BioViewMonitor(QMainWindow):
         self.app_control_panel.saveRequested.connect(self.update_save_state)
         self.app_control_panel.instructionsEnabled.connect(self.toggle_instructions)
 
-        # TODO: Make settings panel
+        # Create settings panel
         experiment_layout = QHBoxLayout()
 
-        # Experiment Control Panel
-        self.experiment_settings_panel = ExperimentSettingsPanel(self.common_config)
-        experiment_layout.addWidget(self.experiment_settings_panel, stretch=1)
         # Connect handlers
         self.experiment_settings_panel.timeWindowChanged.connect(
             self.handle_time_window_change
@@ -157,7 +155,10 @@ class BioViewMonitor(QMainWindow):
             self.usrp_config_panel[idx] = UsrpDeviceConfigPanel(cfg)
             experiment_layout.addWidget(self.usrp_config_panel[idx], stretch=1)
 
-        controls_layout.addLayout(experiment_layout, stretch=1)
+        # controls_layout.addLayout(experiment_layout, stretch=1)
+        expTabLayout = QHBoxLayout()
+        expTabLayout.addWidget(SettingsPanel("results.txt", ".", None))
+        controls_layout.addLayout(expTabLayout, stretch=1)
         top_layout.addLayout(controls_layout, stretch=3)
 
         # Metadata Panels
@@ -178,14 +179,14 @@ class BioViewMonitor(QMainWindow):
         # Plot Grid
         self.plot_grid = PlotGrid(self.common_config)
         main_layout.addWidget(self.plot_grid)
-
+        
         central_widget.setLayout(main_layout)
 
         # Status Bar
-        self.setStatusBar(StatusBar(self))
+        # self.setStatusBar(StatusBar(self))
 
     def _connect_logging(self):
-        self.plot_grid.logEvent.connect(self.log_display_panel.log_message)
+        self.plot_grid.log_event.connect(self.log_display_panel.log_message)
         for _, panel in enumerate(self.usrp_config_panel):
             panel.logEvent.connect(self.log_display_panel.log_message)
         
@@ -238,6 +239,10 @@ class BioViewMonitor(QMainWindow):
             self.common_config.set_param("display_sources", sel_channels)
             # Change state of UI
             self.experiment_settings_panel.update_source("remove", source)
+    
+    def handle_ui_mode_change(self, newMode):
+        self.setStyleSheet("background-color: rgb" + str(get_color_tuple("mainBg")))
+        print(newMode)
     
     # State update handlers 
     def on_server_connected(self):
