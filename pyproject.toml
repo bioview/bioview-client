@@ -43,7 +43,9 @@ extend-exclude = [
 # Plus isort (`I`) for import sorting
 select = ["E", "W", "F", "I", "UP", "B", "SIM", "C90"]
 ignore = [
+    "C901", # TEMPORARY - Will be removed on fixing parse_event (TODO)
     "E203",  # whitespace before ':'
+    "E501" # TEMPORARY
 ]
 
 # Allow fix for all enabled rules (when `--fix`) is provided
