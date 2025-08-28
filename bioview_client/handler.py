@@ -36,6 +36,7 @@ from bioview_common import (
     Command,
     Configuration,
     DataSource,
+    DeviceStatus,
     Response,
     get_app_info,
     get_ip,
@@ -107,6 +108,17 @@ class Client(QThread):
 
         # Client state
         self.status = ClientStatus.DEFAULT
+
+        # Device state
+        self.device_config = device_config
+
+        self.device_status = {}
+        if device_config and isinstance(device_config, dict):
+            for device_id, device_cfg in device_config.items():
+                self.device_status[device_id] = {
+                    "config": device_cfg,
+                    "state": DeviceStatus.DISCONNECTED,
+                }
 
     ### Server commands
     def ping_server(self):
@@ -485,6 +497,11 @@ class Client(QThread):
             return False
 
     def update_params(self, config):
+        pass
+
+    ### Helpers
+    def update_device_state(self, device_id) -> bool:
+        """Helper function to keep track of device states internally"""
         pass
 
 

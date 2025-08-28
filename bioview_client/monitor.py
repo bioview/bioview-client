@@ -62,13 +62,8 @@ class BioViewMonitor(QMainWindow):
         self.common_config = common_config
         self.device_config = device_config
 
+        # Store device names and states - since that's all the UI needs
         self.devices = {}
-        if device_config and isinstance(device_config, dict):
-            for device_id, device_cfg in device_config.items():
-                self.devices[device_id] = {
-                    "config": device_cfg,
-                    "state": DeviceStatus.DISCONNECTED,
-                }
 
         # Keep track for display sources
         if not self.common_config.get_param("display_sources", None):
@@ -92,7 +87,7 @@ class BioViewMonitor(QMainWindow):
         self._init_ui()
         # Client is setup with handlers passed along
         self._setup_client()
-        # Connect UI calls
+        # Connect UI calls - including logging
         self._connect_signals()
 
         ### Common Threads
@@ -100,9 +95,6 @@ class BioViewMonitor(QMainWindow):
 
         # Display Data Queue
         self.display_data_queue = queue.Queue(maxsize=10000)
-
-        # Enable Logging
-        # self._connect_display()
 
     def _init_ui(self):
         # Define main wndow
@@ -134,39 +126,16 @@ class BioViewMonitor(QMainWindow):
 
         # TODO: Make settings panel
         # experiment_layout = QHBoxLayout()
-
-        # Experiment Control Panel
-        # self.experiment_settings_panel = ExperimentSettingsPanel(self.common_config)
-        # experiment_layout.addWidget(self.experiment_settings_panel, stretch=1)
-        # # Connect handlers
-        # self.experiment_settings_panel.timeWindowChanged.connect(
-        #     self.handle_time_window_change
-        # )
-        # self.experiment_settings_panel.gridLayoutChanged.connect(
-        #     self.handle_grid_layout_change
-        # )
-        # self.experiment_settings_panel.addChannelRequested.connect(
-        #     self.handle_add_source
-        # )
-        # self.experiment_settings_panel.removeChannelRequested.connect(
-        #     self.handle_remove_source
-        # )
-
         # # Device Config Panel(s) - TODO: Fix
         # usrp_cfg = []
         # for device_dict in self.devices.values():
         #     if type(device_dict['config']).__name__ == 'MultiUsrpConfiguration':
         #         usrp_cfg = device_dict["config"].get_individual_configs()
 
-        # self.usrp_config_panel = [None] * len(usrp_cfg)
-        # for idx, cfg in enumerate(usrp_cfg):
-        #     self.usrp_config_panel[idx] = UsrpDeviceConfigPanel(cfg)
-        #     experiment_layout.addWidget(self.usrp_config_panel[idx], stretch=1)
+        self.settings_panel = SettingsPanel(self.common_config, self.device_config)
+        controls_layout.addWidget(self.settings_panel, stretch=3)
 
-        # controls_layout.addLayout(experiment_layout, stretch=1)
-        # top_layout.addLayout(controls_layout, stretch=3)
-        settings_panel = SettingsPanel(self.common_config, self.device_config)
-        top_layout.addWidget(settings_panel, stretch=3)
+        top_layout.addLayout(controls_layout, stretch=3)
 
         # Metadata Panels
         self.meta_panels = QVBoxLayout()
@@ -241,6 +210,20 @@ class BioViewMonitor(QMainWindow):
         self.command_bar.enable_instructions.connect(self.toggle_instructions)
 
         # Settings Panel
+        if getattr(self.settings_panel, "display_duration_changed", None):
+            self.settings_panel.display_duration_changed.connect(
+                self.handle_time_window_change
+            )
+        if getattr(self.settings_panel, "grid_layout_changed", None):
+            self.settings_panel.grid_layout_changed.connect(
+                self.handle_grid_layout_change
+            )
+        if getattr(self.settings_panel, "add_data_source", None):
+            self.settings_panel.add_data_source.connect(self.handle_add_source)
+        if getattr(self.settings_panel, "remove_data_source", None):
+            self.settings_panel.remove_data_source.connect(self.handle_remove_source)
+
+        self.settings_panel.log_event.connect(self.log_display_panel.log_message)
 
         # Annotate Event Panel
 
@@ -251,9 +234,6 @@ class BioViewMonitor(QMainWindow):
         self.status_bar.network_scan_requested.connect(
             self.client_worker.discover_servers
         )
-
-        # for _, panel in enumerate(self.usrp_config_panel):
-        #     panel.log_event.connect(self.log_display_panel.log_message)
 
     def closeEvent(self, event):
         """Handle application close"""

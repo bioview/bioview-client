@@ -1,6 +1,7 @@
 from typing import Dict
 
 from bioview_common.datatypes import Configuration
+from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import QTabWidget
 
 from .common_settings import CommonSettingsPanel
@@ -8,22 +9,42 @@ from .device_settings import DeviceSettingsPanel
 
 
 class SettingsPanel(QTabWidget):
+    log_event = pyqtSignal(str, str)
+
     def __init__(
         self,
         common_config: Configuration = None,
         device_config: Dict[str, Configuration] = None,
     ):
         super().__init__()
+
         # Add common panel if applicable
+        self.common_settings_panel = None
+
         if common_config is not None:
             self.common_settings_panel = CommonSettingsPanel(common_config)
-            # Create panel for common settings
-            self.addTab(self.common_settings_panel, "Settings")
+            self.addTab(self.common_settings_panel, "Settings")  # Add to UI
+
+            # Connect signals
+            # self.common_settings_panel.parameter_changed.connect()
+            self.common_settings_panel.log_event.connect(self.send_to_log)
+            self.display_duration_changed = (
+                self.common_settings_panel.display_duration_changed
+            )
+            self.grid_layout_changed = self.common_settings_panel.grid_layout_changed
+            self.add_data_source = self.common_settings_panel.add_data_source
+            self.remove_data_source = self.common_settings_panel.remove_data_source
 
         # Create panels for connected devices
+        self.device_settings_panel = {}
         if device_config is not None:
             for device_group_id, device_group_config in device_config.items():
-                self.addTab(DeviceSettingsPanel(device_group_config), device_group_id)
+                dev_panel = DeviceSettingsPanel(device_group_config)
+                self.device_settings_panel[device_group_id] = dev_panel
+                self.addTab(dev_panel, device_group_id)
+
+                # TODO: Connect signals for update_param
+                dev_panel.log_event.connect(self.send_to_log)
 
         # Add styling
         self.setTabPosition(QTabWidget.TabPosition.South)
@@ -49,6 +70,9 @@ class SettingsPanel(QTabWidget):
         )
 
         # TODO: assign devices to specific groups
+
+    def send_to_log(self):
+        pass
 
     def get_sample_config(self):
         return {
