@@ -19,7 +19,6 @@ This can be modified for remote operation.
 import contextlib
 import json
 import socket
-import struct  # TODO: Remove by confirming packet structure
 import time
 from typing import Any, Dict, List, Tuple
 
@@ -86,32 +85,232 @@ class Client(QThread):
         self.address: str = get_ip()
         self.network_prefix: str = self.address[: self.address.rindex(".")]
 
+        # Client parameters
+        self.running: bool = False
+        self.status: ClientStatus = ClientStatus.DEFAULT
+
         # Servers
-        self.discovered_servers: List[Dict] = []
-        self.selected_server: Dict = {}  # (hostname: IP)
+        self.discovered_servers: Dict[str, str] = {}  # (server_id, IP)
+        self.connected_server: str = ""  # server_id
+        self.server_number: int = 1  # Just a temporary initialization constant
+
+        # Devices
+        self.discovered_devices: Dict[str, str] = {}  # (device_id, server_id)
+        self.connected_devices: Dict[str, str] = {}  # (device_id, server_id)
+        self.streaming_active: bool = False
 
         # Ports
         self.data_port: int = data_port
         self.control_port: int = control_port
 
         # Threads
-        self.data_thread = None
-        self.control_thread = None
+        # self.data_thread = None
+        # self.control_thread = None
 
         # Sockets
-        self.data_socket = None
-        self.control_socket = None
+        self.data_socket: socket.socket = None
+        self.control_socket: socket.socket = None
 
-        # Client state
-        self.status = ClientStatus.DEFAULT
+    def parse_event(self, event: Dict = None) -> None:
+        if event.get("type") is None:
+            self.error_occurred.emit("Error occurred becuase no command was specified")
+        elif event.get("type") not in SUPPORTED_COMMANDS:
+            self.error_occurred.emit(
+                "Error occurred because the command specified is currently not supported by the application"
+            )
+        else:
+            event_type = event.get("type")
+            event_data = event.get("payload")
+            match event_type:
+                case "PING_SERVER":
+                    if len(self.discovered_servers) == 0:
+                        self.error_occurred.emit("No server has been discovered yet")
+                        return None
+                    elif event_data is None:
+                        self.log_message.emit(
+                            "warn",
+                            "No server is specified for pinging. Automatically choosing an available server",
+                        )
+                        server_id = list(self.discovered_servers.keys())[0]
+                    else:
+                        server_id = event_data.get("server_id")
+                        if server_id is None:
+                            self.log_message.emit(
+                                "warn",
+                                "No server is specified for pinging. Automatically choosing an available server",
+                            )
+                            server_id = list(self.discovered_servers.keys())[0]
+                        elif server_id not in self.discovered_servers:
+                            self.error_occurred.emit(
+                                f"The server {server_id} has not been discovered yet"
+                            )
+                            return None
+                    self.ping_server(server_id)
+
+                case "DISCOVER_SERVERS":
+                    if event_data is not None or event_data is not {}:
+                        self.log_message.emit(
+                            "No need to send any payload data for discovering servers"
+                        )
+                    self.discover_servers()
+
+                case "CONNECT_SERVER":
+                    if len(self.discovered_servers) == 0:
+                        self.error_occurred.emit("No server has been discovered yet")
+                        return None
+                    elif event_data is None:
+                        self.log_message.emit(
+                            "warn",
+                            "No server is specified for connecting. Automatically choosing an available server",
+                        )
+                        server_id = list(self.discovered_servers.keys())[0]
+                    else:
+                        server_id = event_data.get("server_id")
+                        if server_id is None:
+                            self.log_message.emit(
+                                "warn",
+                                "No server is specified for connecting. Automatically choosing an available server",
+                            )
+                            server_id = list(self.discovered_servers.keys())[0]
+                        elif server_id not in self.discovered_servers:
+                            self.error_occurred.emit(
+                                f"The server {server_id} has not been discovered yet"
+                            )
+                            return None
+                    self.connect_to_server(server_id)
+
+                case "DISCONNECT_SERVER":
+                    if event_data is None or event_data.get("server_id") is None:
+                        server_id = self.connected_server
+                    else:
+                        server_id = event_data.get("server_id")
+                        if server_id != self.connected_server:
+                            self.error_occurred.emit(
+                                f"The server {server_id} hasn't been connected"
+                            )
+                            return None
+                    self.disconnect_from_server(server_id)
+
+                case "DISCOVER_DEVICES":
+                    if event_data is None or event_data.get("server_id") is None:
+                        self.log_message.emit(
+                            "warn",
+                            "No server is specified for discovering devices. Automatically choosing an available server",
+                        )
+                        server_id = list(self.discovered_servers.keys())[0]
+                    else:
+                        server_id = event_data.get("server_id")
+                        if server_id not in self.discovered_servers:
+                            self.error_occurred.emit(
+                                f"The server {server_id} has not been discovered yet"
+                            )
+                            return None
+                    self.discover_devices(server_id)
+
+                case "INITIALIZE_DEVICES":
+                    if event_data is None or event_data.get("device_ids") is None:
+                        self.error_occurred.emit(
+                            "At least one device id must be mentioned for initialization"
+                        )
+                        return None
+                    else:
+                        device_ids = event_data.get("device_ids")
+                        false_devices = []
+                        # for device_id in device_ids:
+                        #     # TODO: FIX
+                        # req_servers = {
+                        #     self.discovered_devices.get(idx) for idx in device_ids
+                        # }
+
+                    self.update_device_configs(event.get("payload"))
+
+                case "CONNECT_DEVICES":
+                    if event_data is None or event_data.get("device_ids") is None:
+                        self.error_occurred.emit(
+                            "At least one device id must be mentioned for connecting"
+                        )
+                        return None
+                    else:
+                        device_ids = event_data.get("device_ids")
+                        false_devices = []
+                        for device_id in device_ids:
+                            if device_id not in self.discovered_devices:
+                                false_devices.append(device_id)
+                                del device_ids[device_id]
+                        if len(false_devices) == 1:
+                            self.error_occurred.emit(
+                                f"The device {false_devices[0]} can't be found"
+                            )
+                        elif len(false_devices) > 1:
+                            self.error_occurred.emit(
+                                "The devices "
+                                + ",".join(false_devices)
+                                + " can't be found"
+                            )
+                        if len(device_ids) == 0:
+                            self.error_occurred.emit(
+                                "At least one correct device id must be mentioned for connecting"
+                            )
+                            return None
+                    self.connect_devices(device_ids)
+
+                case "DISCONNECT_DEVICES":
+                    if event_data is None or event_data.get("device_ids") is None:
+                        self.error_occurred.emit(
+                            "At least one device id must be mentioned for disconnecting"
+                        )
+                        return None
+                    else:
+                        device_ids = event_data.get("device_ids")
+                        false_devices = []
+                        for device_id in device_ids:
+                            if device_id not in self.discovered_devices:
+                                false_devices.append(device_id)
+                                del device_ids[device_id]
+                        if len(false_devices) == 1:
+                            self.error_occurred.emit(
+                                f"The device {false_devices[0]} can't be found"
+                            )
+                        elif len(false_devices) > 1:
+                            self.error_occurred.emit(
+                                "The devices "
+                                + ",".join(false_devices)
+                                + " can't be found"
+                            )
+                        if len(device_ids) == 0:
+                            self.error_occurred.emit(
+                                "At least one correct device id must be mentioned for disconnecting"
+                            )
+                            return None
+                    self.disconnect_devices(device_ids)
+
+                case "START_STREAMING":
+                    self.start_streaming(event.get("payload"))
+
+                case "STOP_STREAMING":
+                    self.stop_streaming(event.get("payload"))
+
+                case "GET_DEVICE_STATUS":
+                    pass
+
+                case "UPDATE_DEVICE_FIRMWARE":
+                    pass
+
+                case "UPDATE_RUNNING_PARAMETER":
+                    pass
+
+                case _:
+                    pass
+        return None
 
     ### Server commands
-    def ping_server(self):
+    # Handled
+    def ping_server(self, server_id: str) -> None:
         """Test server connectivity"""
-        response, response_code = self.send_control_command(Command.PING_SERVER)
+        response = self.send_control_command(Command.PING_SERVER)
 
-        if response_code == "success":
-            server_info = response.get("server_info", {})
+        if response.get("type") == "success":
+            server_info = response.get("payload").get("server_info", {})
             self.log_message.emit(
                 "info",
                 f"Server ping successful - {server_info.get('server_type', 'unknown')}",
@@ -121,7 +320,7 @@ class Client(QThread):
             self.log_message.emit("error", "Server ping failed")
             return False
 
-    def discover_servers(self):
+    def discover_servers(self) -> None:
         # Scan IP range
         for i in range(1, 255):
             if self.status != ClientStatus.SCANNING:
@@ -133,14 +332,20 @@ class Client(QThread):
             try:
                 # Quick connection test
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(0.1)  # 100ms timeout
+                sock.settimeout(1.0)  # 1sec timeout
+
+                # NOTE: This may be potentially vulnerable. However, since this is being done over a local network itself, the risks may be low.
+                # TODO: Confirm security with someone who deals with a networking stack.
 
                 # We will only try connecting to control ports
                 result = sock.connect_ex((target_ip, self.control_port))
 
                 if result == 0:
                     # Server found
-                    self.server_found.emit(target_ip, self.data_port, self.control_port)
+                    server_id = self.generate_server_id()
+                    self.server_found.emit(
+                        server_id, target_ip, self.data_port, self.control_port
+                    )
 
                 sock.close()
 
@@ -236,56 +441,34 @@ class Client(QThread):
             self.log_message.emit("error", f"Client authentication error: {e}")
             raise AuthenticationError(f"Authentication failed: {str(e)}") from None
 
-    def connect_to_server(self):
-        if self.selected_server == {}:
-            self.log_message.emit(
-                "warn",
-                "No server selected. Automatically connecting to an available server.",
-            )
-            self.discover_servers()
-            if len(self.discovered_servers) == 0:
-                self.log_message.emit("error", "No valid servers available.")
-            else:
-                self.selected_server = self.discovered_servers[0]
-                self.log_message.emit(
-                    "info", f"Connecting to server: {self.selected_server}"
-                )
-
+    def connect_to_server(self, server_id: str) -> None:
         try:
             # Connect to control server - close pre-existing connections
-            if self.control_socket:
-                self.control_socket.close()
+            if self.connected_server != server_id:
+                self.disconnect_from_server(self.connected_server)
 
-            self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.control_socket.settimeout(5.0)
-            self.control_socket.connect(
-                (self.selected_server["address"], self.control_port)
-            )
-            self.control_connected = True
+                self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.control_socket.connect((server_id, self.control_port))
+                self.control_socket.settimeout(5.0)
+                self.control_connected = True
+                self.log_message.emit("debug", f"Connected to {server_id} control port")
 
-            self.log_message.emit("debug", "Connected to control server")
+                self.data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.data_socket.connect((server_id, self.data_port))
+                self.data_socket.settimeout(5.0)
+                self.data_connected = True
+                self.log_message.emit("debug", f"Connected to {server_id} data port")
 
-            # Connect to data server - close pre-existing connections
-            if self.data_socket:
-                self.data_socket.close()
-
-            self.data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.data_socket.settimeout(5.0)
-            self.data_socket.connect((self.selected_server["address"], self.data_port))
-            self.data_connected = True
-
-            self.log_message.emit("debug", "Connected to data server")
-
-            # Emit status
-            self.status = ClientStatus.SERVER_CONNECTED
-            self.server_connected.emit(True)
+                # Emit status
+                self.status = ClientStatus.SERVER_CONNECTED
+                self.server_connected.emit(True)
 
         except Exception as e:
             self.status = ClientStatus.DEFAULT
-            self.log_message.emit("error", f"Server connection failed: {e}")
+            self.log_message.emit("error", f"Server connection failed with error: {e}")
             self.server_connected.emit(False)
 
-    def disconnect_from_server(self):
+    def disconnect_from_server(self, server_name: str) -> None:
         if self.control_socket:
             with contextlib.suppress(Exception):
                 self.control_socket.close()
@@ -301,20 +484,30 @@ class Client(QThread):
         self.status = ClientStatus.SERVER_DISCONNECTED
         self.server_disconnected.emit(True)
         self.log_message.emit("info", "Disconnected from server")
+        self.connected_server = ""
 
-    ### Device Commands
+    ########## Device Commands ##########
 
+    '''
     def start_client(self):
         """Start the client worker"""
         self.running = True
         self.start()
+    '''
 
     def stop_client(self):
         """Stop the client worker"""
         self.running = False
         self.disconnect_from_server()
-        self.quit()
-        self.wait()
+        # self.quit()
+        # self.wait()
+
+    """
+    def run(self):
+        # Once server is connected, start sending commands and listening for data.
+        self.log_message.emit("info", "Starting client handler...")
+        self.running = True
+        while self.running:
 
     def run(self):
         # Once server is connected, start sending commands and listening for data.
@@ -334,19 +527,25 @@ class Client(QThread):
                 self.connect_data()
 
             time.sleep(0.1)
-
+    """
     ### General functions
-    def send_control_command(self, command_type, params=None):
+
+    def send_control_command(self, command_type: str, params: Dict = None):
         """Send control command to server"""
         if not self.control_connected:
             self.error_occurred.emit("Not connected to control server")
+            self.disconnect_from_server()
             return None
 
         if command_type not in SUPPORTED_COMMANDS:
             self.error_occurred.emit("Invalid command sent")
+            self.disconnect_from_server()
             return None
 
-        command = {"type": command_type.value, "params": params or {}}
+        command = {
+            "type": command_type.value,
+            "params": {} if params is None else params,
+        }
 
         try:
             command_data = json.dumps(command).encode("utf-8")
@@ -359,7 +558,7 @@ class Client(QThread):
 
         except Exception as e:
             self.error_occurred.emit(f"Control communication error: {e}")
-            self.disconnect_from_server()
+            # self.disconnect_from_server()
             return None
 
     def discover_devices(self):
@@ -378,114 +577,152 @@ class Client(QThread):
             self.error_occurred.emit(f"Device discovery failed: {error_msg}")
             return []
 
-    def connect_device(self, device_id=None):
-        """Connect to device"""
+    def connect_devices(self, device_ids: List = None):
+        """Connect to devices"""
         self.log_message.emit("info", "Connecting...")
-        response = self.send_control_command(Command.CONNECT, {"id": device_id})
+        devices_status = []
+        for device_id in device_ids:
+            response = self.send_control_command(Command.CONNECT, {"id": device_id})
 
-        if response and response.get("type") == Response.SUCCESS.value:
-            self.log_message.emit("info", "Device connected successfully")
-            self.device_connected.emit(device_id)
-            return True
-        else:
-            error_msg = (
-                response.get("message", "Unknown error") if response else "No response"
-            )
-            self.error_occurred.emit(f"Device connection failed: {error_msg}")
-            self.device_connection_failed.emit(device_id)
-            return False
+            if response and response.get("type") == "success":
+                self.log_message.emit(
+                    "info", f"Device {device_id} connected successfully"
+                )
+                self.device_connected.emit(device_id)
+                devices_status.append(True)
+                self.connect_devices.append(device_id)
+            else:
+                error_msg = (
+                    response.get("message", "Unknown error")
+                    if response
+                    else "No response"
+                )
+                self.error_occurred.emit(f"Device connection failed: {error_msg}")
+                self.device_connection_failed.emit(device_id)
+                devices_status.append(False)
 
-    def disconnect_device(self):
+        return devices_status
+
+    def disconnect_devices(self, device_ids: List = None):
         """Disconnect from device"""
         self.log_message.emit("info", "Disconnecting device...")
-
-        # Stop streaming first
+        devices_status = []
         if self.streaming_active:
-            self.stop_streaming()
+            self.stop_streaming(device_ids)
+        for device_id in device_ids:
+            response = self.send_control_command(Command.DISCONNECT, {"id": device_id})
 
-        response = self.send_control_command(Command.DISCONNECT)
+            if response and response.get("type") == "success":
+                self.log_message.emit("info", "Device disconnected")
+                self.device_disconnected.emit(device_id)
+                devices_status.append(True)
+            else:
+                error_msg = (
+                    response.get("message", "Unknown error")
+                    if response
+                    else "No response"
+                )
+                self.error_occurred.emit(f"Disconnect failed: {error_msg}")
+                devices_status.append(False)
 
-        if response and response.get("type") == "success":
-            self.log_message.emit("info", "Device disconnected")
-            self.device_disconnected.emit()
-            return True
-        else:
-            error_msg = (
-                response.get("message", "Unknown error") if response else "No response"
-            )
-            self.error_occurred.emit(f"Disconnect failed: {error_msg}")
-            return False
+        return devices_status
 
-    def start_streaming(self):
+    def start_streaming(self, device_ids: List = None):
         """Start real-time data streaming"""
         self.log_message.emit("info", "Starting data streaming...")
-        response = self.send_control_command(Command.START)
+        devices_status = []
+        for device_id in device_ids:
+            response = self.send_control_command(Command.START, {"id": device_id})
 
-        if response and response.get("type") == "success":
-            self.streaming_active = True
-            self.log_message.emit("info", "Data streaming started")
-            self.streaming_started.emit()
+            if response and response.get("type") == "success":
+                self.streaming_active = True
+                self.log_message.emit("info", "Data streaming started")
+                self.streaming_started.emit()
 
-            # Connect to data server
-            if not self.data_connected:
-                self.connect_data()
-
-            return True
+                # Connect to data server
+                ############################# Need to clarify this ############################################
+                # if not self.data_connected:
+                #    self.connect_data()
+            devices_status.append(True)
         else:
             error_msg = (
                 response.get("message", "Unknown error") if response else "No response"
             )
             self.error_occurred.emit(f"Failed to start streaming: {error_msg}")
-            return False
+            devices_status.append(False)
 
-    def stop_streaming(self):
+        return devices_status
+
+    def stop_streaming(self, device_ids: List = None):
         """Stop data streaming"""
         self.log_message.emit("info", "Stopping data streaming...")
 
         self.streaming_active = False
-
+        devices_status = []
         # Disconnect data socket
-        if self.data_socket:
-            with contextlib.suppress(Exception):
-                self.data_socket.close()
+        # if self.data_socket:
+        #     try:
+        #         self.data_socket.close()
+        #     except:
+        #         pass
+        #     self.data_socket = None
+        #     self.data_connected = False
+        for _ in device_ids:
+            response = self.send_control_command(Command.STOP)
 
-            self.data_socket = None
-            self.data_connected = False
+            if response and response.get("type") == "success":
+                self.log_message.emit("info", "Data streaming stopped")
+                self.streaming_stopped.emit()
+                devices_status.append(True)
+            else:
+                error_msg = (
+                    response.get("message", "Unknown error")
+                    if response
+                    else "No response"
+                )
+                self.error_occurred.emit(f"Failed to stop streaming: {error_msg}")
+                devices_status.append(False)
 
-        response = self.send_control_command(Command.STOP)
+        return devices_status
 
-        if response and response.get("type") == "success":
-            self.log_message.emit("info", "Data streaming stopped")
-            self.streaming_stopped.emit()
-            return True
-        else:
-            error_msg = (
-                response.get("message", "Unknown error") if response else "No response"
-            )
-            self.error_occurred.emit(f"Failed to stop streaming: {error_msg}")
-            return False
-
-    def configure_device(self, device_id, config):
+    def update_device_configs(
+        self, device_ids: List = None, device_configs: List = None
+    ):
         """Configure device parameters"""
-        self.log_message.emit("info", "Configuring device: {device_id}")
-        response = self.send_control_command(
-            Command.CONFIGURE, {"id": device_id, "config": config}
-        )
+        assert len(device_ids) == len(
+            device_configs
+        ), "Number of devices and configs doesn't match"
 
-        if response and response.get("type") == "success":
-            self.log_message.emit("info", "Device configured successfully")
-            return True
-        else:
-            error_msg = (
-                response.get("message", "Unknown error") if response else "No response"
+        devices_status = []
+
+        for idx in range(len(device_ids)):
+            self.log_message.emit("info", f"Configuring device: {device_ids[idx]}")
+            response = self.send_control_command(
+                Command.CONFIGURE, {"id": device_ids[idx], "config": device_configs[idx]}
             )
-            self.error_occurred.emit(f"Configuration failed: {error_msg}")
-            return False
 
-    def update_params(self, config):
-        pass
+            if response and response.get("type") == "success":
+                self.log_message.emit(
+                    "info", f"Device {device_ids[idx]} configured successfully"
+                )
+                devices_status.append(True)
+            else:
+                error_msg = (
+                    response.get("message", "Unknown error")
+                    if response
+                    else "No response"
+                )
+                self.error_occurred.emit(f"Configuration failed: {error_msg}")
+                devices_status.append(False)
+
+        return devices_status
+
+    def generate_server_id(self):
+        self.server_number += 1
+        return f"Server{self.server_number - 1}"
 
 
+'''
 class DataStreamer(QThread):
     log_message = pyqtSignal(str, str)
     data_received = pyqtSignal(np.ndarray)
@@ -567,3 +804,7 @@ class DataStreamer(QThread):
 
     def stop(self):
         self.running = False
+'''
+
+if __name__ == "__main__":
+    client_handler = Client()
