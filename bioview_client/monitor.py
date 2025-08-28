@@ -44,23 +44,23 @@ class BioViewMonitor(QMainWindow):
 
         # Check for valid configuration files provided and, if None, ask user to add
         if not common_config or not device_config:
-            dialog = ConfigurationPrompt(self)
+            dialog = ConfigurationPrompt()
             configurations = None
 
             if dialog.exec() == QDialog.DialogCode.Accepted:
                 configurations = dialog.get_configurations()
 
             if configurations:
-                common_config = configurations["common"]
-                device_config = configurations["device"]
+                common_config = configurations.get("common", None)
+                device_config = configurations.get("devicez", None)
             else:
                 # Generate a default common configuration
                 common_config = DEFAULT_COMMON_CONFIGURATION
-
-        # Pass configurations to client handler to initialize everything
+                device_config = {}
 
         # Store configurations
         self.common_config = common_config
+        self.device_config = device_config
 
         self.devices = {}
         if device_config and isinstance(device_config, dict):
@@ -70,22 +70,30 @@ class BioViewMonitor(QMainWindow):
                     "state": DeviceStatus.DISCONNECTED,
                 }
 
-        self.common_config["available_channels"] = []
+        # Keep track for display sources
+        if not self.common_config.get_param("display_sources", None):
+            self.common_config.set_param("display_sources", [])
 
         self.saving_status = False
 
         # Track instruction
         self.instruction_dialog = None
-        if "instruction_type" in self.common_config:
-            self.enable_instructions = False
-            if self.common_config["instruction_type"] == "text":
-                self.instruction_dialog = TextDialog()
-        else:
-            self.enable_instructions = True
+        self.enable_instructions = self.common_config.get_param(
+            "enable_instructions", False
+        )
+
+        if (
+            self.enable_instructions
+            and self.common_config.get_param("instruction_type", "audio") == "text"
+        ):
+            self.instruction_dialog = TextDialog()
 
         # Set up UI
-        self.init_ui()
-        self.setup_client()
+        self._init_ui()
+        # Client is setup with handlers passed along
+        self._setup_client()
+        # Connect UI calls
+        self._connect_signals()
 
         ### Common Threads
         self.instructions_thread = None
@@ -94,10 +102,9 @@ class BioViewMonitor(QMainWindow):
         self.display_data_queue = queue.Queue(maxsize=10000)
 
         # Enable Logging
-        self._connect_logging()
         # self._connect_display()
 
-    def init_ui(self):
+    def _init_ui(self):
         # Define main wndow
         self.setWindowTitle("BioView Data Monitor")
         iconDir = Path(__file__).resolve().parent.parent / "docs" / "assets" / "icon.png"
@@ -122,15 +129,8 @@ class BioViewMonitor(QMainWindow):
         controls_layout = QVBoxLayout()
 
         # Connect/Start/Stop/Balance Signal Buttons
-        self.app_control_panel = AppControlPanel()
-        controls_layout.addWidget(self.app_control_panel, stretch=1)
-
-        # Connect signal handlers
-        # self.app_control_panel.connectionInitiated.connect(self.handle_connection_requested)
-        # self.app_control_panel.startRequested.connect(self.handle_streaming_start_requested)
-        # self.app_control_panel.stopRequested.connect(self.handle_streaming_stop_requested)
-        # self.app_control_panel.saveRequested.connect(self.update_save_state)
-        # self.app_control_panel.instructionsEnabled.connect(self.toggle_instructions)
+        self.command_bar = AppControlPanel()
+        controls_layout.addWidget(self.command_bar, stretch=1)
 
         # TODO: Make settings panel
         # experiment_layout = QHBoxLayout()
@@ -165,7 +165,7 @@ class BioViewMonitor(QMainWindow):
 
         # controls_layout.addLayout(experiment_layout, stretch=1)
         # top_layout.addLayout(controls_layout, stretch=3)
-        settings_panel = SettingsPanel("something", "E:")
+        settings_panel = SettingsPanel(self.common_config, self.device_config)
         top_layout.addWidget(settings_panel, stretch=3)
 
         # Metadata Panels
@@ -190,33 +190,70 @@ class BioViewMonitor(QMainWindow):
         central_widget.setLayout(main_layout)
 
         # Status Bar
-        self.setStatusBar(StatusBar(self))
+        self.status_bar = StatusBar(self)
+        self.setStatusBar(self.status_bar)
 
-    def _connect_logging(self):
-        self.plot_grid.log_event.connect(self.log_display_panel.log_message)
-        # for _, panel in enumerate(self.usrp_config_panel):
-        #     panel.log_event.connect(self.log_display_panel.log_message)
-
-    def setup_client(self):
+    def _setup_client(self):
         """Connect to client"""
-        self.client_worker = Client()
+        self.client_worker = Client(
+            common_config=self.common_config, device_config=self.device_config
+        )
 
-        # Connect signals
+        # Server control signals
+        self.client_worker.server_scan_completed.connect(self.on_server_scan_completed)
         self.client_worker.server_connected.connect(self.on_server_connected)
         self.client_worker.server_disconnected.connect(self.on_server_disconnected)
+
+        # Server info signals
+        self.client_worker.server_scan_progress.connect(self.update_server_scan_progress)
+
+        # Device control signals
+        self.client_worker.device_connected.connect(self.on_device_connected)
+        self.client_worker.device_disconnected.connect(self.on_device_disconnected)
+        self.client_worker.streaming_started.connect(self.on_streaming_started)
+        self.client_worker.streaming_stopped.connect(self.on_streaming_stopped)
+
+        # Device info signals
+
+        # General info signals
         self.client_worker.error_occurred.connect(
             lambda msg: self.log_display_panel.log_message("error", msg)
         )
         self.client_worker.log_message.connect(self.log_display_panel.log_message)
 
-        # self.client_worker.streaming_started.connect(self.on_streaming_started)
-        # self.client_worker.streaming_stopped.connect(self.on_streaming_stopped)
-        # self.client_worker.device_connected.connect(self.handle_device_connected)
-        # self.client_worker.device_connection_failed.connect(self.handle_device_connection_failed)
-        # self.client_worker.device_disconnected.connect(self.handle_device_disconnected)
+        # Data signals
 
         # Start client
         self.client_worker.start_client()
+
+    def _connect_signals(self):
+        """
+        Connect signals from all UI components to respective calls in client worker
+        """
+        if self.client_worker is None:
+            self._setup_client()
+
+        # App Bar
+        self.command_bar.connect_devices.connect(self.on_device_connection_requested)
+        self.command_bar.start_streaming.connect(self.client_worker.start_streaming)
+        self.command_bar.stop_streaming.connect(self.client_worker.stop_streaming)
+        self.command_bar.enable_data_saving.connect(self.update_save_state)
+        self.command_bar.enable_instructions.connect(self.toggle_instructions)
+
+        # Settings Panel
+
+        # Annotate Event Panel
+
+        # Plot Grid
+        self.plot_grid.log_event.connect(self.log_display_panel.log_message)
+
+        # Status Bar
+        self.status_bar.network_scan_requested.connect(
+            self.client_worker.discover_servers
+        )
+
+        # for _, panel in enumerate(self.usrp_config_panel):
+        #     panel.log_event.connect(self.log_display_panel.log_message)
 
     def closeEvent(self, event):
         """Handle application close"""
@@ -249,79 +286,12 @@ class BioViewMonitor(QMainWindow):
             # Change state of UI
             self.experiment_settings_panel.update_source("remove", source)
 
-    # State update handlers
-    def on_server_connected(self):
-        """Handle server connection"""
-        self.device_status_panel.update_server_status(True)
-        self.log_display_panel.log_message("info", "Connected to server")
-
-        # Auto-ping
-        if self.client_worker:
-            self.client_worker.ping_server()
-
-    def on_server_disconnected(self):
-        """Handle server disconnection"""
-        self.device_status_panel.update_server_status(False)
-        self.log_display_panel.log_message("warning", "Disconnected from server")
-
-    def handle_connection_requested(self):
+    # Status Bar helper functions
+    def on_device_connection_requested(self):
         if self.client_worker:
             for device_id in self.devices:
-                self.device_status_panel.update_device_state(
-                    device_id, DeviceStatus.CONNECTING
-                )
+                self.status_bar.update_device_state(device_id, DeviceStatus.CONNECTING)
                 self.client_worker.connect_device(device_id=device_id)
-
-    def handle_device_connected(self, device_id):
-        if device_id is not None:
-            self.devices[device_id]["state"] = DeviceStatus.CONNECTED
-            self.device_status_panel.update_device_state(
-                device_id, DeviceStatus.CONNECTED
-            )
-        else:
-            # In this case all devices were requested for connection
-            for device_id in self.devices:
-                self.devices[device_id]["state"] = DeviceStatus.CONNECTED
-                self.device_status_panel.update_device_state(
-                    device_id, DeviceStatus.CONNECTED
-                )
-
-        # Check if all are connected and if so, disable UI buttons
-        self.update_buttons()
-
-    def handle_device_connection_failed(self, device_id):
-        if device_id is not None:
-            self.devices[device_id]["state"] = DeviceStatus.DISCONNECTED
-            self.device_status_panel.update_device_state(
-                device_id, DeviceStatus.DISCONNECTED
-            )
-        else:
-            # In this case all devices were requested for connection
-            for device_id in self.devices:
-                self.devices[device_id]["state"] = DeviceStatus.DISCONNECTED
-                self.device_status_panel.update_device_state(
-                    device_id, DeviceStatus.DISCONNECTED
-                )
-
-        self.update_buttons()
-
-    def handle_device_disconnected(self):
-        # Disconnect devices
-        for device_id in self.devices:
-            self.devices[device_id]["state"] = DeviceStatus.DISCONNECTED
-            self.device_status_panel.update_device_state(
-                device_id, DeviceStatus.DISCONNECTED
-            )
-
-        self.update_buttons()
-
-    def handle_streaming_start_requested(self):
-        if self.client_worker:
-            self.client_worker.start_streaming()
-
-    def handle_streaming_stop_requested(self):
-        if self.client_worker:
-            self.client_worker.stop_streaming()
 
     def update_save_state(self):
         self.saving_status = True
@@ -333,6 +303,56 @@ class BioViewMonitor(QMainWindow):
         if self.instruction_dialog is not None:
             self.instruction_dialog.toggle_ui(self.enable_instructions)
 
+    # Client worker helper functions
+    def on_server_scan_completed(self):
+        pass
+
+    def on_server_connected(self):
+        """Handle server connection"""
+        self.status.update_server_status(True)
+        self.log_display_panel.log_message("info", "Connected to server")
+
+        # Auto-ping
+        if self.client_worker:
+            self.client_worker.ping_server()
+
+        # TODO: Populate display sources by querying server
+
+    def on_server_disconnected(self):
+        """Handle server disconnection"""
+        self.status_bar.update_server_connection_status(False)
+        self.log_display_panel.log_message("warning", "Disconnected from server")
+
+    def update_server_scan_progress(self):
+        pass
+
+    def on_device_connected(self, device_id):
+        if device_id is not None:
+            self.devices[device_id]["state"] = DeviceStatus.CONNECTED
+            self.status_bar.update_device_state(device_id, DeviceStatus.CONNECTED)
+        else:
+            # In this case all devices were requested for connection
+            for device_id in self.devices:
+                self.devices[device_id]["state"] = DeviceStatus.CONNECTED
+                self.status_bar.update_device_state(device_id, DeviceStatus.CONNECTED)
+
+        # Check if all are connected and if so, disable UI buttons
+        self.update_buttons()
+
+    def on_device_disconnected(self):
+        # Disconnect devices
+        for device_id in self.devices:
+            self.devices[device_id]["state"] = DeviceStatus.DISCONNECTED
+            self.status_bar.update_device_state(device_id, DeviceStatus.DISCONNECTED)
+
+        self.update_buttons()
+
+    def on_streaming_started(self):
+        pass
+
+    def on_streaming_stopped(self):
+        pass
+
     def update_buttons(self):
         connected = True
         for device_dict in self.devices.values():
@@ -341,9 +361,9 @@ class BioViewMonitor(QMainWindow):
                 break
 
         if connected:
-            self.app_control_panel.update_button_states(DeviceStatus.CONNECTED)
+            self.command_bar.update_button_states(DeviceStatus.CONNECTED)
         else:
-            self.app_control_panel.update_button_states(DeviceStatus.DISCONNECTED)
+            self.command_bar.update_button_states(DeviceStatus.DISCONNECTED)
 
 
 if __name__ == "__main__":

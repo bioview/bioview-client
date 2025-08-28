@@ -34,6 +34,7 @@ from bioview_common import (
     AuthenticationError,
     ClientStatus,
     Command,
+    Configuration,
     DataSource,
     Response,
     get_app_info,
@@ -72,6 +73,8 @@ class Client(QThread):
 
     def __init__(
         self,
+        common_config: Configuration = None,
+        device_config: List[Dict] = None,
         data_port: int = DATA_PORT,
         control_port: int = CONTROL_PORT,
         auth_timeout: int = AUTH_TIMEOUT,
@@ -303,7 +306,6 @@ class Client(QThread):
         self.log_message.emit("info", "Disconnected from server")
 
     ### Device Commands
-
     def start_client(self):
         """Start the client worker"""
         self.running = True

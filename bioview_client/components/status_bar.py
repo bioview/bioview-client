@@ -19,10 +19,10 @@ class ServerConnector(QWidget):
     Server connection state is emitted back to the main app for further co-ordination.
     """
 
-    data_received = pyqtSignal(dict)
+    network_scan_requested = pyqtSignal()
+
     connection_status_changed = pyqtSignal(str)
     status_message = pyqtSignal(str)
-    scan_progress = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -89,6 +89,10 @@ class ServerConnector(QWidget):
         # Ask handler to start scanning
         self.network_scan_requested.emit()
 
+    def update_network_scan_progress(self, progress):
+        # TODO: Implement a progress bar to let user know how it is going.
+        pass
+
     def on_server_found(self, hostname, ip, data_port, control_port):
         # This may happen during a scan so we do not update any text.
         self.server_dropdown.addItem(hostname)
@@ -97,10 +101,6 @@ class ServerConnector(QWidget):
             "data_port": data_port,
             "control_port": control_port,
         }
-
-    def update_scan_progress(self, progress):
-        """Emit scan progress to main app for status"""
-        self.scan_progress.emit(progress)
 
     def on_scan_complete(self):
         """Handle scan completion"""
@@ -313,6 +313,8 @@ class DeviceStatusPanel(QWidget):
 
 
 class StatusBar(QStatusBar):
+    network_scan_requested = pyqtSignal()
+
     def __init__(self, parent=...):
         super().__init__(parent)
 
@@ -320,14 +322,22 @@ class StatusBar(QStatusBar):
         container = QWidget()
         layout = QHBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(ServerConnector(), alignment=Qt.AlignmentFlag.AlignLeft)
+        self.server_connector = ServerConnector()
+        layout.addWidget(self.server_connector, alignment=Qt.AlignmentFlag.AlignLeft)
         layout.addStretch()
-        layout.addWidget(
-            DeviceStatusPanel(devices={}), alignment=Qt.AlignmentFlag.AlignRight
-        )
+
+        self.device_status_panel = DeviceStatusPanel(devices={})
+        layout.addWidget(self.device_status_panel, alignment=Qt.AlignmentFlag.AlignRight)
         container.setLayout(layout)
 
         self.addPermanentWidget(container, stretch=1)
 
-    def show_info(self):
-        self.label.setText("Button clicked!")
+        self._forward_signals()
+
+    def _forward_signals(self):
+        self.network_scan_requested = self.server_connector.network_scan_requested
+        self.update_server_connection_status = (
+            self.server_connector.update_connection_status
+        )
+
+        self.update_device_state = self.device_status_panel.update_device_state

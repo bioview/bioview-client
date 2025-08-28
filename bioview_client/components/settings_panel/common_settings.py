@@ -1,5 +1,5 @@
 import qtawesome as qta
-from bioview_common import DataSource, DeviceStatus
+from bioview_common import Configuration, DataSource, DeviceStatus
 from PyQt6.QtCore import QEvent, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QFileDialog,
@@ -24,11 +24,11 @@ class CommonSettingsPanel(QGroupBox):
     add_data_source = pyqtSignal(DataSource)
     remove_data_source = pyqtSignal(DataSource)
 
-    def __init__(self, file_name: str, save_dir: str, parent=None):
+    def __init__(self, config: Configuration, parent=None):
         super().__init__("Experiment Settings", parent)
 
-        self.file_name = file_name
-        self.save_dir = save_dir
+        self.file_name = config.get_param("file_name", "")
+        self.save_dir = config.get_param("save_dir", "")
 
         self.param_inputs = {}
         self.init_ui()
