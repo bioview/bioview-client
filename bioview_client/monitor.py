@@ -1,77 +1,84 @@
-'''
-BioView Monitor can be launched via CLI, with/without configuration JSONs pre-specified. They may also be launched using GUI without any specified configuration. 
+"""
+BioView Monitor can be launched via CLI, with/without configuration JSONs pre-specified. They may also be launched using GUI without any specified configuration.
 In case no valid configuration files are found, the app will prompt the user to provide configuration JSONs.
 Regardless on any configurations, the UI will load with appropriate components/default values
-'''
-import sys 
+"""
+import logging  # TODO: Remove
 import queue
-import logging # TODO: Remove 
+import sys
 from pathlib import Path
+from typing import Dict, List
 
+from bioview_common import DataSource, DeviceStatus
 from PyQt6.QtGui import QGuiApplication, QIcon
-from PyQt6.QtWidgets import QApplication, QHBoxLayout, QMainWindow, QVBoxLayout, QWidget, QDialog
-
-from typing import List, Dict
-from bioview_common import DeviceStatus, DataSource
+from PyQt6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QHBoxLayout,
+    QMainWindow,
+    QVBoxLayout,
+    QWidget,
+)
 
 from bioview_client.components import (
     AnnotateEventPanel,
     AppControlPanel,
     ConfigurationPrompt,
-    SettingsPanel,
     LogDisplayPanel,
     PlotGrid,
+    SettingsPanel,
     StatusBar,
-    TextDialog
+    TextDialog,
 )
+from bioview_client.constants import DEFAULT_COMMON_CONFIGURATION
 from bioview_client.handler import Client
-from bioview_client.constants import DEFAULT_COMMON_CONFIGURATION, get_color_tuple
+
 
 class BioViewMonitor(QMainWindow):
     def __init__(
         self,
-        device_config: List[Dict] = [],
-        common_config: Dict = {},
+        device_config: List[Dict] = None,
+        common_config: Dict = None,
     ):
         super().__init__()
-        
-        # Check for valid configuration files provided and, if None, ask user to add 
-        if not common_config or not device_config: 
+
+        # Check for valid configuration files provided and, if None, ask user to add
+        if not common_config or not device_config:
             dialog = ConfigurationPrompt(self)
-            configurations = None 
+            configurations = None
 
             if dialog.exec() == QDialog.DialogCode.Accepted:
                 configurations = dialog.get_configurations()
-            
-            if configurations: 
-                common_config = configurations['common']
-                device_config = configurations['device']
-            else: 
+
+            if configurations:
+                common_config = configurations["common"]
+                device_config = configurations["device"]
+            else:
                 # Generate a default common configuration
                 common_config = DEFAULT_COMMON_CONFIGURATION
 
         # Pass configurations to client handler to initialize everything
 
-        # Store configurations 
+        # Store configurations
         self.common_config = common_config
 
         self.devices = {}
         if device_config and isinstance(device_config, dict):
-            for device_id, device_cfg in device_config.items(): 
+            for device_id, device_cfg in device_config.items():
                 self.devices[device_id] = {
-                    'config': device_cfg,
-                    'state': DeviceStatus.DISCONNECTED
+                    "config": device_cfg,
+                    "state": DeviceStatus.DISCONNECTED,
                 }
 
-        self.common_config['available_channels'] = []
+        self.common_config["available_channels"] = []
 
         self.saving_status = False
 
         # Track instruction
         self.instruction_dialog = None
-        if 'instruction_type' in self.common_config.keys():
+        if "instruction_type" in self.common_config:
             self.enable_instructions = False
-            if self.common_config['instruction_type'] == 'text': 
+            if self.common_config["instruction_type"] == "text":
                 self.instruction_dialog = TextDialog()
         else:
             self.enable_instructions = True
@@ -79,7 +86,7 @@ class BioViewMonitor(QMainWindow):
         # Set up UI
         self.init_ui()
         self.setup_client()
-        
+
         ### Common Threads
         self.instructions_thread = None
 
@@ -89,13 +96,11 @@ class BioViewMonitor(QMainWindow):
         # Enable Logging
         self._connect_logging()
         # self._connect_display()
-    
+
     def init_ui(self):
         # Define main wndow
         self.setWindowTitle("BioView Data Monitor")
-        iconDir = (
-            Path(__file__).resolve().parent.parent / "docs" / "assets" / "icon.png"
-        )
+        iconDir = Path(__file__).resolve().parent.parent / "docs" / "assets" / "icon.png"
 
         self.setWindowIcon(QIcon(str(iconDir)))
         screen = QGuiApplication.primaryScreen().geometry()
@@ -121,45 +126,47 @@ class BioViewMonitor(QMainWindow):
         controls_layout.addWidget(self.app_control_panel, stretch=1)
 
         # Connect signal handlers
-        self.app_control_panel.connectionInitiated.connect(self.handle_connection_requested)
-        self.app_control_panel.startRequested.connect(self.handle_streaming_start_requested)
-        self.app_control_panel.stopRequested.connect(self.handle_streaming_stop_requested)
-        self.app_control_panel.saveRequested.connect(self.update_save_state)
-        self.app_control_panel.instructionsEnabled.connect(self.toggle_instructions)
+        # self.app_control_panel.connectionInitiated.connect(self.handle_connection_requested)
+        # self.app_control_panel.startRequested.connect(self.handle_streaming_start_requested)
+        # self.app_control_panel.stopRequested.connect(self.handle_streaming_stop_requested)
+        # self.app_control_panel.saveRequested.connect(self.update_save_state)
+        # self.app_control_panel.instructionsEnabled.connect(self.toggle_instructions)
 
-        # Create settings panel
-        experiment_layout = QHBoxLayout()
+        # TODO: Make settings panel
+        # experiment_layout = QHBoxLayout()
 
-        # Connect handlers
-        self.experiment_settings_panel.timeWindowChanged.connect(
-            self.handle_time_window_change
-        )
-        self.experiment_settings_panel.gridLayoutChanged.connect(
-            self.handle_grid_layout_change
-        )
-        self.experiment_settings_panel.addChannelRequested.connect(
-            self.handle_add_source
-        )
-        self.experiment_settings_panel.removeChannelRequested.connect(
-            self.handle_remove_source
-        )
+        # Experiment Control Panel
+        # self.experiment_settings_panel = ExperimentSettingsPanel(self.common_config)
+        # experiment_layout.addWidget(self.experiment_settings_panel, stretch=1)
+        # # Connect handlers
+        # self.experiment_settings_panel.timeWindowChanged.connect(
+        #     self.handle_time_window_change
+        # )
+        # self.experiment_settings_panel.gridLayoutChanged.connect(
+        #     self.handle_grid_layout_change
+        # )
+        # self.experiment_settings_panel.addChannelRequested.connect(
+        #     self.handle_add_source
+        # )
+        # self.experiment_settings_panel.removeChannelRequested.connect(
+        #     self.handle_remove_source
+        # )
 
-        # Device Config Panel(s) - TODO: Fix
-        usrp_cfg = []
-        for device_dict in self.devices.values():
-            if type(device_dict['config']).__name__ == 'MultiUsrpConfiguration': 
-                usrp_cfg = device_dict["config"].get_individual_configs()
+        # # Device Config Panel(s) - TODO: Fix
+        # usrp_cfg = []
+        # for device_dict in self.devices.values():
+        #     if type(device_dict['config']).__name__ == 'MultiUsrpConfiguration':
+        #         usrp_cfg = device_dict["config"].get_individual_configs()
 
-        self.usrp_config_panel = [None] * len(usrp_cfg)
-        for idx, cfg in enumerate(usrp_cfg):
-            self.usrp_config_panel[idx] = UsrpDeviceConfigPanel(cfg)
-            experiment_layout.addWidget(self.usrp_config_panel[idx], stretch=1)
+        # self.usrp_config_panel = [None] * len(usrp_cfg)
+        # for idx, cfg in enumerate(usrp_cfg):
+        #     self.usrp_config_panel[idx] = UsrpDeviceConfigPanel(cfg)
+        #     experiment_layout.addWidget(self.usrp_config_panel[idx], stretch=1)
 
         # controls_layout.addLayout(experiment_layout, stretch=1)
-        expTabLayout = QHBoxLayout()
-        expTabLayout.addWidget(SettingsPanel("results.txt", ".", None))
-        controls_layout.addLayout(expTabLayout, stretch=1)
-        top_layout.addLayout(controls_layout, stretch=3)
+        # top_layout.addLayout(controls_layout, stretch=3)
+        settings_panel = SettingsPanel("something", "E:")
+        top_layout.addWidget(settings_panel, stretch=3)
 
         # Metadata Panels
         self.meta_panels = QVBoxLayout()
@@ -179,42 +186,44 @@ class BioViewMonitor(QMainWindow):
         # Plot Grid
         self.plot_grid = PlotGrid(self.common_config)
         main_layout.addWidget(self.plot_grid)
-        
+
         central_widget.setLayout(main_layout)
 
         # Status Bar
-        # self.setStatusBar(StatusBar(self))
+        self.setStatusBar(StatusBar(self))
 
     def _connect_logging(self):
         self.plot_grid.log_event.connect(self.log_display_panel.log_message)
-        for _, panel in enumerate(self.usrp_config_panel):
-            panel.logEvent.connect(self.log_display_panel.log_message)
-        
+        # for _, panel in enumerate(self.usrp_config_panel):
+        #     panel.log_event.connect(self.log_display_panel.log_message)
+
     def setup_client(self):
         """Connect to client"""
         self.client_worker = Client()
-        
+
         # Connect signals
         self.client_worker.server_connected.connect(self.on_server_connected)
         self.client_worker.server_disconnected.connect(self.on_server_disconnected)
-        self.client_worker.error_occurred.connect(lambda msg: self.log_display_panel.log_message("error", msg))
+        self.client_worker.error_occurred.connect(
+            lambda msg: self.log_display_panel.log_message("error", msg)
+        )
         self.client_worker.log_message.connect(self.log_display_panel.log_message)
-        
+
         # self.client_worker.streaming_started.connect(self.on_streaming_started)
         # self.client_worker.streaming_stopped.connect(self.on_streaming_stopped)
-        self.client_worker.device_connected.connect(self.handle_device_connected)
-        self.client_worker.device_connection_failed.connect(self.handle_device_connection_failed)
-        self.client_worker.device_disconnected.connect(self.handle_device_disconnected)
-    
+        # self.client_worker.device_connected.connect(self.handle_device_connected)
+        # self.client_worker.device_connection_failed.connect(self.handle_device_connection_failed)
+        # self.client_worker.device_disconnected.connect(self.handle_device_disconnected)
+
         # Start client
         self.client_worker.start_client()
-        
+
     def closeEvent(self, event):
         """Handle application close"""
         if self.client_worker:
             self.client_worker.stop_client()
         event.accept()
-    
+
     # Handlers for UI updates
     def handle_time_window_change(self, seconds):
         self.plot_grid.set_display_time(seconds)
@@ -239,105 +248,113 @@ class BioViewMonitor(QMainWindow):
             self.common_config.set_param("display_sources", sel_channels)
             # Change state of UI
             self.experiment_settings_panel.update_source("remove", source)
-    
-    def handle_ui_mode_change(self, newMode):
-        self.setStyleSheet("background-color: rgb" + str(get_color_tuple("mainBg")))
-        print(newMode)
-    
-    # State update handlers 
+
+    # State update handlers
     def on_server_connected(self):
         """Handle server connection"""
         self.device_status_panel.update_server_status(True)
         self.log_display_panel.log_message("info", "Connected to server")
-        
+
         # Auto-ping
         if self.client_worker:
             self.client_worker.ping_server()
-    
+
     def on_server_disconnected(self):
         """Handle server disconnection"""
         self.device_status_panel.update_server_status(False)
         self.log_display_panel.log_message("warning", "Disconnected from server")
-        
-    def handle_connection_requested(self): 
-        if self.client_worker: 
-            for device_id in self.devices.keys(): 
-                self.device_status_panel.update_device_state(device_id, DeviceStatus.CONNECTING)
+
+    def handle_connection_requested(self):
+        if self.client_worker:
+            for device_id in self.devices:
+                self.device_status_panel.update_device_state(
+                    device_id, DeviceStatus.CONNECTING
+                )
                 self.client_worker.connect_device(device_id=device_id)
-    
-    def handle_device_connected(self, device_id):         
+
+    def handle_device_connected(self, device_id):
         if device_id is not None:
-            self.devices[device_id]['state'] = DeviceStatus.CONNECTED
-            self.device_status_panel.update_device_state(device_id, DeviceStatus.CONNECTED)
+            self.devices[device_id]["state"] = DeviceStatus.CONNECTED
+            self.device_status_panel.update_device_state(
+                device_id, DeviceStatus.CONNECTED
+            )
         else:
-            # In this case all devices were requested for connection 
-            for device_id in self.devices.keys():
-                self.devices[device_id]['state'] = DeviceStatus.CONNECTED
-                self.device_status_panel.update_device_state(device_id, DeviceStatus.CONNECTED)
-        
-        # Check if all are connected and if so, disable UI buttons 
+            # In this case all devices were requested for connection
+            for device_id in self.devices:
+                self.devices[device_id]["state"] = DeviceStatus.CONNECTED
+                self.device_status_panel.update_device_state(
+                    device_id, DeviceStatus.CONNECTED
+                )
+
+        # Check if all are connected and if so, disable UI buttons
         self.update_buttons()
-        
-    def handle_device_connection_failed(self, device_id): 
+
+    def handle_device_connection_failed(self, device_id):
         if device_id is not None:
-            self.devices[device_id]['state'] = DeviceStatus.DISCONNECTED
-            self.device_status_panel.update_device_state(device_id, DeviceStatus.DISCONNECTED)
+            self.devices[device_id]["state"] = DeviceStatus.DISCONNECTED
+            self.device_status_panel.update_device_state(
+                device_id, DeviceStatus.DISCONNECTED
+            )
         else:
-            # In this case all devices were requested for connection 
-            for device_id in self.devices.keys():
-                self.devices[device_id]['state'] = DeviceStatus.DISCONNECTED
-                self.device_status_panel.update_device_state(device_id, DeviceStatus.DISCONNECTED)
-          
+            # In this case all devices were requested for connection
+            for device_id in self.devices:
+                self.devices[device_id]["state"] = DeviceStatus.DISCONNECTED
+                self.device_status_panel.update_device_state(
+                    device_id, DeviceStatus.DISCONNECTED
+                )
+
         self.update_buttons()
-      
-    def handle_device_disconnected(self): 
+
+    def handle_device_disconnected(self):
         # Disconnect devices
-        for device_id in self.devices.keys(): 
-            self.devices[device_id]['state'] = DeviceStatus.DISCONNECTED
-            self.device_status_panel.update_device_state(device_id, DeviceStatus.DISCONNECTED)
-      
+        for device_id in self.devices:
+            self.devices[device_id]["state"] = DeviceStatus.DISCONNECTED
+            self.device_status_panel.update_device_state(
+                device_id, DeviceStatus.DISCONNECTED
+            )
+
         self.update_buttons()
-       
-    def handle_streaming_start_requested(self): 
-        if self.client_worker: 
+
+    def handle_streaming_start_requested(self):
+        if self.client_worker:
             self.client_worker.start_streaming()
-    
-    def handle_streaming_stop_requested(self): 
-        if self.client_worker: 
+
+    def handle_streaming_stop_requested(self):
+        if self.client_worker:
             self.client_worker.stop_streaming()
-     
+
     def update_save_state(self):
-        self.saving_status = True  
-        if self.client_worker: 
-            pass 
-    
+        self.saving_status = True
+        if self.client_worker:
+            pass
+
     def toggle_instructions(self, flag):
         self.enable_instructions = flag
         if self.instruction_dialog is not None:
             self.instruction_dialog.toggle_ui(self.enable_instructions)
-    
-    def update_buttons(self): 
-        connected = True 
-        for device_dict in self.devices.values(): 
-            if device_dict['state'] == DeviceStatus.DISCONNECTED: 
-                connected = False 
-                break 
-        
-        if connected: 
+
+    def update_buttons(self):
+        connected = True
+        for device_dict in self.devices.values():
+            if device_dict["state"] == DeviceStatus.DISCONNECTED:
+                connected = False
+                break
+
+        if connected:
             self.app_control_panel.update_button_states(DeviceStatus.CONNECTED)
-        else: 
+        else:
             self.app_control_panel.update_button_states(DeviceStatus.DISCONNECTED)
-    
-     
+
+
 if __name__ == "__main__":
-    import qdarktheme # Provide consistent styling across all OSes
+    import qdarktheme  # Provide consistent styling across all OSes
 
     qdarktheme.enable_hi_dpi()
     app = QApplication(sys.argv)
-    qdarktheme.setup_theme(theme = 'auto')
+    qdarktheme.setup_theme(theme="auto")
 
     # Create and show main window
     window = BioViewMonitor()
     window.show()
-    
+
     sys.exit(app.exec())

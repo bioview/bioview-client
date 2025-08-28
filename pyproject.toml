@@ -44,6 +44,7 @@ extend-exclude = [
 select = ["E", "W", "F", "I", "UP", "B", "SIM", "C90"]
 ignore = [
     "E203",  # whitespace before ':'
+    "E501"   # TEMPORARY: Needs removal (TODO). Only included to deal with long inline commented code.
 ]
 
 # Allow fix for all enabled rules (when `--fix`) is provided
