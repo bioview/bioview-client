@@ -35,6 +35,9 @@ class SettingsPanel(QTabWidget):
             self.add_data_source = self.common_settings_panel.add_data_source
             self.remove_data_source = self.common_settings_panel.remove_data_source
 
+            # Connect functions
+            self.update_source = self.common_settings_panel.update_source
+
         # Create panels for connected devices
         self.device_settings_panel = {}
         if device_config is not None:

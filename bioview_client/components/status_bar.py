@@ -1,4 +1,5 @@
 import socket
+from typing import Dict, List
 
 from bioview_common import DeviceStatus
 from PyQt6.QtCore import QEvent, Qt, pyqtSignal
@@ -7,10 +8,14 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
     QLabel,
+    QProgressBar,
     QPushButton,
     QStatusBar,
     QWidget,
 )
+
+
+# TODO: Find better way of dealing with emit_status
 
 
 class ServerConnector(QWidget):
@@ -20,28 +25,26 @@ class ServerConnector(QWidget):
     """
 
     network_scan_requested = pyqtSignal()
-
-    connection_status_changed = pyqtSignal(str)
-    status_message = pyqtSignal(str)
+    server_connection_requested = pyqtSignal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
+
         # Track servers
-        # TODO: Localhost should always be attempted. Check if a bioview-server is available. This should be in handler.
-        self.selected_server = "localhost"
-        self.available_servers = {}
+        self.selected_server = {}
+        self.discovered_servers = []
 
         # Setup UI
         self.init_ui()
 
         # Show local network info
         self.local_ip, self.network_ip, self.hostname = self.get_local_network_info()
-        if self.local_ip:
-            self.emit_status(
-                f"Local IP: {self.local_ip} | Network: {self.network_ip} | Hostname: {self.hostname}"
-            )
-        else:
-            self.emit_status("Ready - Enter server address or scan network")
+        # if self.local_ip:
+        #     self.emit_status(
+        #         f"Local IP: {self.local_ip} | Network: {self.network_ip} | Hostname: {self.hostname}"
+        #     )
+        # else:
+        #     self.emit_status("Ready - Enter server address or scan network")
 
     def init_ui(self):
         """Setup the user interface"""
@@ -56,9 +59,8 @@ class ServerConnector(QWidget):
         # Server dropdown (populated by scan)
         self.server_dropdown = QComboBox()
 
-        self.server_dropdown.addItem(self.selected_server)
         self.server_dropdown.setEnabled(False)
-        self.server_dropdown.currentTextChanged.connect(self.on_server_selected)
+        self.server_dropdown.currentIndexChanged.connect(self.on_server_selected)
         control_layout.addWidget(self.server_dropdown)
 
         # Connect button
@@ -73,6 +75,18 @@ class ServerConnector(QWidget):
         self.disconnect_btn.setEnabled(False)
         control_layout.addWidget(self.disconnect_btn)
 
+        # Progress bar
+        self.scan_progress_bar = QProgressBar()
+        self.scan_progress_bar.setTextVisible(False)
+        self.scan_progress_bar.setFixedHeight(16)
+        self.scan_progress_bar.setRange(0, 100)
+        self.scan_progress_bar.setValue(0)
+
+        control_layout.addWidget(self.scan_progress_bar)
+
+        self.connection_label = QLabel("Status: Disconnected")
+        control_layout.addWidget(self.connection_label)
+
         self.setLayout(control_layout)
 
     def scan_network(self):
@@ -81,80 +95,59 @@ class ServerConnector(QWidget):
         self.connect_btn.setEnabled(False)
         self.disconnect_btn.setEnabled(False)
 
-        self.available_servers = {}
-
         self.server_dropdown.clear()
         self.server_dropdown.setEnabled(False)
 
         # Ask handler to start scanning
         self.network_scan_requested.emit()
 
-    def update_network_scan_progress(self, progress):
-        # TODO: Implement a progress bar to let user know how it is going.
-        pass
+    def update_scan_progress(self, progress):
+        self.scan_progress_bar.setValue(progress)
 
-    def on_server_found(self, hostname, ip, data_port, control_port):
-        # This may happen during a scan so we do not update any text.
-        self.server_dropdown.addItem(hostname)
-        self.available_servers[hostname] = {
-            "ip": ip,
-            "data_port": data_port,
-            "control_port": control_port,
-        }
-
-    def on_scan_complete(self):
-        """Handle scan completion"""
+    def on_scan_complete(self, discovered_servers: List[Dict] = None):
+        """On completion of network scan, handler passes along list of discovered servers"""
         self.scan_btn.setEnabled(True)
 
-        if self.server_dropdown.count() == 0:
-            self.server_dropdown.addItem("No servers available")
+        if discovered_servers is None or len(discovered_servers) == 0:
             self.server_dropdown.setEnabled(False)
-            self.emit_status(
-                "Scan complete: No servers found. Confirm that local server is running."
-            )
+            # self.emit_status(
+            #     "Scan complete: No servers found. Confirm that local server is running."
+            # )
         else:
+            self.discovered_servers = discovered_servers
+
+            for server in discovered_servers:
+                self.server_dropdown.addItem(server["hostname"])
+
             self.connect_btn.setEnabled(True)
             self.disconnect_btn.setEnabled(False)
-            self.emit_status("Scan complete: Select servers from dropdown.")
 
-    def on_server_selected(self, server_name):
-        """Handle server selection from dropdown"""
-        self.selected_server = str(server_name)
+            # self.emit_status("Scan complete: Select servers from dropdown.")
+
+    def on_server_selected(self, server_index):
+        print(server_index, len(self.discovered_servers))
+        if server_index < len(self.discovered_servers):
+            self.selected_server = self.discovered_servers[server_index]
 
     def connect_to_server(self):
-        """Connect to the data server"""
-        # Parse server input
-        server_name = self.selected_server  # This will now just be hostname
-        if not server_name:
-            self.emit_status("Invalid server selected.")
+        """Ask handler to connect to server"""
+        if self.selected_server:
+            self.server_connection_requested(self.selected_server)
+        else:
+            # self.status ("Invalid server selected.")
             return
-
-        try:
-            server_dict = self.available_servers[server_name]
-            host = server_dict["ip"]
-            data_port = server_dict["data_port"]
-            control_port = server_dict["control_port"]
-
-        except ValueError:
-            self.emit_status("Invalid server address format")
-            return
-
-        # Initialize connection
-        self.data_receiver.set_server_address(host, data_port, control_port)
-        self.data_receiver.start_receiving()
 
         # Update UI
         self.connect_btn.setEnabled(False)  # re-enable on failed connection
         self.disconnect_btn.setEnabled(False)  # re-enable on successful connection
 
-        self.emit_status(f"Connecting to {server_name}")
+        # self.emit_status(f"Connecting...")
 
     def disconnect_from_server(self):
         """Disconnect from the data server"""
-        self.data_receiver.stop_receiving()
         self.connect_btn.setEnabled(True)
         self.disconnect_btn.setEnabled(False)
-        self.emit_status("Disconnected")
+        # self.emit_status("Disconnected")
 
     def get_local_network_info(self):
         """Get local network information for display"""
@@ -185,18 +178,6 @@ class ServerConnector(QWidget):
             self.connection_label.setStyleSheet("color: red")
         else:
             self.connection_label.setStyleSheet("color: orange")
-
-        # Emit signal for parent application
-        self.connection_status_changed.emit(status)
-
-    def on_data_received(self, data):
-        """Handle received physiological data"""
-        # Forward data to parent application
-        self.data_received.emit(data)
-
-    def emit_status(self, message):
-        """Emit status message for parent application"""
-        self.status_message.emit(message)
 
     def closeEvent(self, event):
         """Handle widget close"""
@@ -332,7 +313,9 @@ class StatusBar(QStatusBar):
 
         self.addPermanentWidget(container, stretch=1)
 
+        # Forward signals and callbacks from components
         self._forward_signals()
+        self._forward_callbacks()
 
     def _forward_signals(self):
         self.network_scan_requested = self.server_connector.network_scan_requested
@@ -341,3 +324,7 @@ class StatusBar(QStatusBar):
         )
 
         self.update_device_state = self.device_status_panel.update_device_state
+
+    def _forward_callbacks(self):
+        self.on_scan_complete = self.server_connector.on_scan_complete
+        self.update_scan_progress = self.server_connector.update_scan_progress

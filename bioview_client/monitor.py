@@ -125,8 +125,6 @@ class BioViewMonitor(QMainWindow):
         controls_layout.addWidget(self.command_bar, stretch=1)
 
         # TODO: Make settings panel
-        # experiment_layout = QHBoxLayout()
-        # # Device Config Panel(s) - TODO: Fix
         # usrp_cfg = []
         # for device_dict in self.devices.values():
         #     if type(device_dict['config']).__name__ == 'MultiUsrpConfiguration':
@@ -169,12 +167,16 @@ class BioViewMonitor(QMainWindow):
         )
 
         # Server control signals
-        self.client_worker.server_scan_completed.connect(self.on_server_scan_completed)
+        self.client_worker.server_scan_completed.connect(
+            self.status_bar.on_scan_complete
+        )
         self.client_worker.server_connected.connect(self.on_server_connected)
         self.client_worker.server_disconnected.connect(self.on_server_disconnected)
 
         # Server info signals
-        self.client_worker.server_scan_progress.connect(self.update_server_scan_progress)
+        self.client_worker.server_scan_progress.connect(
+            self.status_bar.update_scan_progress
+        )
 
         # Device control signals
         self.client_worker.device_connected.connect(self.on_device_connected)
@@ -219,9 +221,9 @@ class BioViewMonitor(QMainWindow):
                 self.handle_grid_layout_change
             )
         if getattr(self.settings_panel, "add_data_source", None):
-            self.settings_panel.add_data_source.connect(self.handle_add_source)
+            self.settings_panel.add_data_source.connect(self.add_plot_source)
         if getattr(self.settings_panel, "remove_data_source", None):
-            self.settings_panel.remove_data_source.connect(self.handle_remove_source)
+            self.settings_panel.remove_data_source.connect(self.remove_plot_source)
 
         self.settings_panel.log_event.connect(self.log_display_panel.log_message)
 
@@ -248,25 +250,27 @@ class BioViewMonitor(QMainWindow):
     def handle_grid_layout_change(self, rows, cols):
         self.plot_grid.update_grid(rows, cols)
 
-    def handle_add_source(self, source: DataSource):
+    def populate_plot_grid_sources(self, sources):
+        # TODO: Callback from handler
+        pass
+
+    def add_plot_source(self, source: DataSource):
+        """
+        Connects a new data source to a PlotGrid object
+        """
         if self.plot_grid.add_source(source):
-            # Update a
-            sel_channels = self.common_config.get_param("display_sources")
-            sel_channels.append(source)
-            self.common_config.set_param("display_sources", list(set(sel_channels)))
-            # Change state of UI
-            self.experiment_settings_panel.update_source("add", source)
+            # If source can be successfully shown, mark it as selected in the panel
+            self.settings_panel.update_source("add", source)
 
-    def handle_remove_source(self, source: DataSource):
+    def remove_plot_source(self, source: DataSource):
+        """
+        Removes an existing data source from a PlotGrid object
+        """
         if self.plot_grid.remove_source(source):
-            # Update config
-            sel_channels = self.common_config.get_param("display_sources")
-            sel_channels.remove(source)
-            self.common_config.set_param("display_sources", sel_channels)
-            # Change state of UI
-            self.experiment_settings_panel.update_source("remove", source)
+            # If source can be successfully removed, deselect in the panel
+            self.settings_panel.update_source("remove", source)
 
-    # Status Bar helper functions
+    # Command Bar helper functions
     def on_device_connection_requested(self):
         if self.client_worker:
             for device_id in self.devices:
@@ -284,9 +288,6 @@ class BioViewMonitor(QMainWindow):
             self.instruction_dialog.toggle_ui(self.enable_instructions)
 
     # Client worker helper functions
-    def on_server_scan_completed(self):
-        pass
-
     def on_server_connected(self):
         """Handle server connection"""
         self.status.update_server_status(True)
@@ -302,9 +303,6 @@ class BioViewMonitor(QMainWindow):
         """Handle server disconnection"""
         self.status_bar.update_server_connection_status(False)
         self.log_display_panel.log_message("warning", "Disconnected from server")
-
-    def update_server_scan_progress(self):
-        pass
 
     def on_device_connected(self, device_id):
         if device_id is not None:

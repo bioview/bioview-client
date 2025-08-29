@@ -19,7 +19,7 @@ This can be modified for remote operation.
 import contextlib
 import json
 import socket
-import struct  # TODO: Remove by confirming packet structure
+import struct
 import time
 from typing import Any, Dict, List, Tuple
 
@@ -41,14 +41,41 @@ from bioview_common import (
     get_app_info,
     get_ip,
 )
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import QObject, QRunnable, QThread, QThreadPool, pyqtSignal, pyqtSlot
 
 from bioview_client.utils import parse_and_validate_response
 
 
+class ScanWorkerSignals(QObject):
+    result = pyqtSignal(bool)  # True if server found, False otherwise
+
+
+class ScanWorker(QRunnable):
+    def __init__(self, ip, control_port, timeout=0.5):
+        super().__init__()
+        self.ip = ip
+        self.control_port = control_port
+        self.timeout = timeout
+        self.signals = ScanWorkerSignals()
+        self._running = True
+
+    @pyqtSlot()
+    def run(self):
+        if not self._running:
+            return
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self.timeout)
+            found = sock.connect_ex((self.ip, self.control_port)) == 0
+            sock.close()
+            self.signals.result.emit(found)
+        except Exception:
+            self.signals.result.emit(False)
+
+
 class Client(QThread):
     # Server control signals
-    server_scan_completed = pyqtSignal()
+    server_scan_completed = pyqtSignal(list)
     server_connected = pyqtSignal(bool)
     server_disconnected = pyqtSignal(bool)
 
@@ -82,36 +109,29 @@ class Client(QThread):
         resp_timeout: int = RESPONSE_TIMEOUT,
     ):
         super().__init__()
-        self.app_info = get_app_info()  # used for server handshake
+        self.app_info = get_app_info()
         self.auth_timeout = auth_timeout
         self.resp_timeout = resp_timeout
 
-        # Client network parameters
         self.address: str = get_ip()
         self.network_prefix: str = self.address[: self.address.rindex(".")]
 
-        # Servers
         self.discovered_servers: List[Dict] = []
-        self.selected_server: Dict = {}  # (hostname: IP)
+        self.selected_server: Dict = {}
 
-        # Ports
         self.data_port: int = data_port
         self.control_port: int = control_port
 
-        # Threads
         self.data_thread = None
         self.control_thread = None
 
-        # Sockets
         self.data_socket = None
         self.control_socket = None
 
-        # Client state
         self.status = ClientStatus.DEFAULT
+        self.data_connected = False
 
-        # Device state
         self.device_config = device_config
-
         self.device_status = {}
         if device_config and isinstance(device_config, dict):
             for device_id, device_cfg in device_config.items():
@@ -119,6 +139,25 @@ class Client(QThread):
                     "config": device_cfg,
                     "state": DeviceStatus.DISCONNECTED,
                 }
+
+        # Thread pool for scanning
+        self.thread_pool = QThreadPool()
+        self.thread_pool.setMaxThreadCount(20)
+        self._cancel_scan = False
+
+    # Thread handling
+    def run(self):
+        self.log_message.emit("info", "Starting client handler...")
+        while self.running:
+            if self.status != ClientStatus.SERVER_CONNECTED:
+                if self.connect_control():
+                    self.server_connected.emit()
+                else:
+                    time.sleep(2)
+                    continue
+            if self.status == ClientStatus.STREAMING and not self.data_connected:
+                self.connect_data()
+            time.sleep(0.1)
 
     ### Server commands
     def ping_server(self):
@@ -136,37 +175,51 @@ class Client(QThread):
             self.log_message.emit("error", "Server ping failed")
             return False
 
+    ### Server scan using QThreadPool
     def discover_servers(self):
-        # Scan IP range
+        """Parallel server scanning using QThreadPool"""
+        self.status = ClientStatus.SCANNING
+        self._cancel_scan = False
+        self.discovered_servers = []
+
+        total_ips = 254
+        self._completed_scans = 0
+        self._last_update_time = time.time()
+
+        def handle_result(found):
+            if self._cancel_scan:
+                return
+            self._completed_scans += 1
+
+            # Only emit progress every 100ms or at the end
+            now = time.time()
+            if now - self._last_update_time >= 0.1 or self._completed_scans == total_ips:
+                progress = int((self._completed_scans / total_ips) * 100)
+                self.server_scan_progress.emit(progress)
+                self._last_update_time = now
+
+            # Collect servers if found
+            if found:
+                # Store discovered servers
+                self.discovered_servers.append()
+
+            if self._completed_scans == total_ips:
+                self.status = ClientStatus.DEFAULT
+                print(self.discovered_servers)
+                self.server_scan_completed.emit(self.discovered_servers)
+
         for i in range(1, 255):
-            if self.status != ClientStatus.SCANNING:
+            if self._cancel_scan:
                 break
-
             target_ip = f"{self.network_prefix}.{i}"
+            worker = ScanWorker(target_ip, self.control_port)
+            worker.signals.result.connect(handle_result)
+            self.thread_pool.start(worker)
 
-            # TODO: Add message logging to text box
-            try:
-                # Quick connection test
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(0.1)  # 100ms timeout
-
-                # We will only try connecting to control ports
-                result = sock.connect_ex((target_ip, self.control_port))
-
-                if result == 0:
-                    # Server found
-                    self.server_found.emit(target_ip, self.data_port, self.control_port)
-
-                sock.close()
-
-            except Exception:
-                pass
-
-            # Update progress
-            progress = int((i / 254) * 100)
-            self.server_scan_progress.emit(progress)
-
-        self.server_scan_completed.emit(True)
+    def cancel_scan(self):
+        """Cancel ongoing scan"""
+        self._cancel_scan = True
+        self.thread_pool.clear()
 
     # Authentication check for initial connection to server
     def authenticate_with_server(
@@ -318,36 +371,6 @@ class Client(QThread):
         self.log_message.emit("info", "Disconnected from server")
 
     ### Device Commands
-    def start_client(self):
-        """Start the client worker"""
-        self.running = True
-        self.start()
-
-    def stop_client(self):
-        """Stop the client worker"""
-        self.running = False
-        self.disconnect_from_server()
-        self.quit()
-        self.wait()
-
-    def run(self):
-        # Once server is connected, start sending commands and listening for data.
-        self.log_message.emit("info", "Starting client handler...")
-
-        while self.running:
-            if self.status != ClientStatus.SERVER_CONNECTED:
-                # Try to maintain control connection
-                if self.connect_control():
-                    self.server_connected.emit()
-                else:
-                    time.sleep(2)
-                    continue
-
-            # If streaming is active, maintain data connection
-            if self.streaming_active and not self.data_connected:
-                self.connect_data()
-
-            time.sleep(0.1)
 
     ### General functions
     def send_control_command(self, command_type, params=None):
@@ -379,7 +402,7 @@ class Client(QThread):
     def discover_devices(self):
         """Discover devices"""
         self.log_message.emit("info", "Discovering devices...")
-        response = self.send_control_command(Command.DISCOVER)
+        response = self.send_control_command(Command.DISCOVER_DEVICES)
 
         if response and response.get("type") == "success":
             devices = response.get("devices", [])
@@ -414,7 +437,7 @@ class Client(QThread):
         self.log_message.emit("info", "Disconnecting device...")
 
         # Stop streaming first
-        if self.streaming_active:
+        if self.status == ClientStatus.STREAMING:
             self.stop_streaming()
 
         response = self.send_control_command(Command.DISCONNECT)
@@ -436,7 +459,8 @@ class Client(QThread):
         response = self.send_control_command(Command.START)
 
         if response and response.get("type") == "success":
-            self.streaming_active = True
+            self.status = ClientStatus.STREAMING
+
             self.log_message.emit("info", "Data streaming started")
             self.streaming_started.emit()
 
@@ -456,7 +480,7 @@ class Client(QThread):
         """Stop data streaming"""
         self.log_message.emit("info", "Stopping data streaming...")
 
-        self.streaming_active = False
+        self.status = ClientStatus.SERVER_CONNECTED
 
         # Disconnect data socket
         if self.data_socket:
@@ -499,7 +523,23 @@ class Client(QThread):
     def update_params(self, config):
         pass
 
+    # Client function for PyQt loops
+    def start_client(self):
+        """Start the client worker"""
+        self.running = True
+        self.start()
+
+    def stop_client(self):
+        """Stop the client worker"""
+        self.running = False
+        self.disconnect_from_server()
+        self.quit()
+        self.wait()
+
     ### Helpers
+    def get_display_sources(self):
+        pass
+
     def update_device_state(self, device_id) -> bool:
         """Helper function to keep track of device states internally"""
         pass
@@ -539,9 +579,9 @@ class DataStreamer(QThread):
                     self.data_received.emit(data)
 
             except Exception as e:
-                if self.streaming_active:
+                if self.status == ClientStatus.STREAMING:
                     self.log_message.emit("error", f"Data receiving error: {e}")
-                break
+                return
 
         self.log_message.emit("info", "Data receiving thread stopped")
 
