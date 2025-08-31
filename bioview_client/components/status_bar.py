@@ -107,12 +107,10 @@ class ServerConnector(QWidget):
     def on_scan_complete(self, discovered_servers: List[Dict] = None):
         """On completion of network scan, handler passes along list of discovered servers"""
         self.scan_btn.setEnabled(True)
+        self.server_dropdown.setEnabled(True)
 
         if discovered_servers is None or len(discovered_servers) == 0:
             self.server_dropdown.setEnabled(False)
-            # self.emit_status(
-            #     "Scan complete: No servers found. Confirm that local server is running."
-            # )
         else:
             self.discovered_servers = discovered_servers
 
@@ -122,17 +120,15 @@ class ServerConnector(QWidget):
             self.connect_btn.setEnabled(True)
             self.disconnect_btn.setEnabled(False)
 
-            # self.emit_status("Scan complete: Select servers from dropdown.")
-
     def on_server_selected(self, server_index):
-        print(server_index, len(self.discovered_servers))
         if server_index < len(self.discovered_servers):
             self.selected_server = self.discovered_servers[server_index]
 
     def connect_to_server(self):
         """Ask handler to connect to server"""
         if self.selected_server:
-            self.server_connection_requested(self.selected_server)
+            # Use .emit to emit a PyQt signal (don't call the signal like a function)
+            self.server_connection_requested.emit(self.selected_server)
         else:
             # self.status ("Invalid server selected.")
             return
@@ -319,6 +315,10 @@ class StatusBar(QStatusBar):
 
     def _forward_signals(self):
         self.network_scan_requested = self.server_connector.network_scan_requested
+        # Expose server connection request signal for external wiring
+        self.server_connection_requested = (
+            self.server_connector.server_connection_requested
+        )
         self.update_server_connection_status = (
             self.server_connector.update_connection_status
         )

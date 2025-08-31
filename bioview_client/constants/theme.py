@@ -1,9 +1,12 @@
+import logging
 from typing import Dict, Tuple
 
 import darkdetect
+from bioview_common import DeviceStatus
 from PyQt6.QtGui import QColor
 
-from bioview_common import DeviceStatus 
+
+logger = logging.getLogger(__name__)
 
 # Ref: Cbrewer diverging color scheme (deprecated)
 PLOT_COLORS = {
@@ -29,15 +32,17 @@ COLOR_SCHEME = {
     "blue": {"dark": (64, 156, 255), "light": (0, 122, 255)},
     "indigo": {"dark": (125, 122, 255), "light": (88, 86, 214)},
     "purple": {"dark": (191, 90, 242), "light": (173, 68, 171)},
-    "mainBg": {"dark": (50, 50, 50), "light": (200, 200, 200)}
+    "mainBg": {"dark": (50, 50, 50), "light": (200, 200, 200)},
 }
+
 
 def get_qcolor(name):
     return QColor(*get_color_tuple(name))
 
+
 def get_color_tuple(name):
-    if name not in COLOR_SCHEME.keys():
-        print("Invalid color choice. Defaulting to blue")
+    if name not in COLOR_SCHEME:
+        logger.warning("Invalid color choice %s. Defaulting to blue", name)
         name = "blue"
 
     if darkdetect.isDark():
@@ -45,13 +50,15 @@ def get_color_tuple(name):
     else:
         return COLOR_SCHEME[name]["light"]
 
+
 def get_color_by_idx(idx=0):
     idx = idx % len(COLOR_SCHEME)
     return get_color_tuple(list(COLOR_SCHEME.keys())[idx])
+
 
 CONNECTION_STATE_COLORS: Dict[DeviceStatus, Tuple] = {
     DeviceStatus.DISCONNECTED: get_qcolor("red"),
     DeviceStatus.CONNECTING: get_qcolor("yellow"),
     DeviceStatus.STREAMING: get_qcolor("blue"),
-    DeviceStatus.CONNECTED: get_qcolor("green")
+    DeviceStatus.CONNECTED: get_qcolor("green"),
 }

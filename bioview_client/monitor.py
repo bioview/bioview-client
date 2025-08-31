@@ -236,6 +236,20 @@ class BioViewMonitor(QMainWindow):
         self.status_bar.network_scan_requested.connect(
             self.client_worker.discover_servers
         )
+        # Forward UI server connect requests to the client worker
+        if getattr(self.status_bar, "server_connection_requested", None):
+            self.status_bar.server_connection_requested.connect(
+                self._handle_server_connection_request
+            )
+
+    def _handle_server_connection_request(self, server_info: dict):
+        """Handle server connect requests from the UI"""
+        if not server_info:
+            return
+        # Set selected server on client worker and ask it to connect
+        if self.client_worker:
+            self.client_worker.selected_server = server_info
+            self.client_worker.connect_to_server()
 
     def closeEvent(self, event):
         """Handle application close"""
@@ -288,14 +302,18 @@ class BioViewMonitor(QMainWindow):
             self.instruction_dialog.toggle_ui(self.enable_instructions)
 
     # Client worker helper functions
-    def on_server_connected(self):
+    def on_server_connected(self, connected=True):
         """Handle server connection"""
-        self.status.update_server_status(True)
-        self.log_display_panel.log_message("info", "Connected to server")
-
-        # Auto-ping
-        if self.client_worker:
-            self.client_worker.ping_server()
+        # connected is a boolean emitted by client_worker.server_connected
+        if connected:
+            self.status_bar.update_server_connection_status("Connected")
+            self.log_display_panel.log_message("info", "Connected to server")
+            # Auto-ping
+            if self.client_worker:
+                self.client_worker.ping_server()
+        else:
+            self.status_bar.update_server_connection_status("Disconnected")
+            self.log_display_panel.log_message("warning", "Failed to connect to server")
 
         # TODO: Populate display sources by querying server
 

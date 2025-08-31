@@ -47,7 +47,8 @@ from bioview_client.utils import parse_and_validate_response
 
 
 class ScanWorkerSignals(QObject):
-    result = pyqtSignal(bool)  # True if server found, False otherwise
+    # Emit a server info dict when a BioView server is discovered, or None otherwise
+    result = pyqtSignal(object)
 
 
 class ScanWorker(QRunnable):
@@ -66,11 +67,39 @@ class ScanWorker(QRunnable):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(self.timeout)
-            found = sock.connect_ex((self.ip, self.control_port)) == 0
-            sock.close()
-            self.signals.result.emit(found)
+            # Try to establish a TCP connection first
+            sock.connect((self.ip, self.control_port))
+
+            # Send a lightweight ping to let a BioView server respond with its info
+            try:
+                ping = json.dumps(
+                    {"type": Command.PING_SERVER.value, "payload": {}}
+                ).encode("utf-8")
+                sock.send(ping)
+                data = sock.recv(4096).decode("utf-8")
+                server_info = None
+                try:
+                    resp = json.loads(data)
+                    payload = resp.get("payload", {}) if isinstance(resp, dict) else {}
+                    if isinstance(payload, dict) and "server_info" in payload:
+                        server_info = payload.get("server_info") or {}
+                except Exception:
+                    server_info = None
+
+                # Normalize returned server info
+                if server_info is None:
+                    server_info = {"hostname": self.ip}
+                server_info["address"] = self.ip
+
+                sock.close()
+                self.signals.result.emit(server_info)
+            except Exception:
+                # If ping fails but TCP connect succeeded, still report address so UI can show reachable hosts
+                sock.close()
+                self.signals.result.emit({"address": self.ip, "hostname": self.ip})
         except Exception:
-            self.signals.result.emit(False)
+            # Couldn't connect at all
+            self.signals.result.emit(None)
 
 
 class Client(QThread):
@@ -127,6 +156,8 @@ class Client(QThread):
 
         self.data_socket = None
         self.control_socket = None
+        self.control_connected = False
+        self.authenticated = False
 
         self.status = ClientStatus.DEFAULT
         self.data_connected = False
@@ -151,28 +182,94 @@ class Client(QThread):
         while self.running:
             if self.status != ClientStatus.SERVER_CONNECTED:
                 if self.connect_control():
-                    self.server_connected.emit()
+                    # note: control socket connected but not necessarily authenticated
+                    self.server_connected.emit(True)
                 else:
                     time.sleep(2)
                     continue
             if self.status == ClientStatus.STREAMING and not self.data_connected:
-                self.connect_data()
+                # Only connect data socket if authenticated with control channel
+                if self.authenticated:
+                    self.connect_data()
+                else:
+                    time.sleep(0.1)
+                    continue
             time.sleep(0.1)
 
     ### Server commands
     def ping_server(self):
         """Test server connectivity"""
-        response, response_code = self.send_control_command(Command.PING_SERVER)
+        response = self.send_control_command(Command.PING_SERVER)
 
-        if response_code == "success":
-            server_info = response.get("server_info", {})
+        if response and response.get("type") == Response.INFO.value:
+            payload = response.get("payload", {})
+            server_info = (
+                payload.get("server_info", {}) if isinstance(payload, dict) else {}
+            )
             self.log_message.emit(
                 "info",
-                f"Server ping successful - {server_info.get('server_type', 'unknown')}",
+                f"Server ping successful - {server_info.get('hostname', 'unknown')}",
             )
             return True
         else:
             self.log_message.emit("error", "Server ping failed")
+            return False
+
+    def connect_control(self) -> bool:
+        """Attempt to establish control and data socket connections to the selected server.
+
+        Returns True if control connection established, False otherwise.
+        """
+        try:
+            # If we already have a control socket and it's flagged connected, return True
+            if self.control_connected and self.control_socket:
+                return True
+
+            # Ensure selected_server exists
+            if not self.selected_server:
+                return False
+
+            # Connect control socket
+            if self.control_socket:
+                with contextlib.suppress(Exception):
+                    self.control_socket.close()
+
+            self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.control_socket.settimeout(5.0)
+            self.control_socket.connect(
+                (self.selected_server["address"], self.control_port)
+            )
+            self.control_connected = True
+            self.log_message.emit("debug", "Connected control socket")
+            self.status = ClientStatus.SERVER_CONNECTED
+            return True
+        except Exception as e:
+            self.log_message.emit("error", f"Control connection failed: {e}")
+            self.control_connected = False
+            return False
+
+    def connect_data(self) -> bool:
+        """Attempt to connect the data socket to the server's data port."""
+        try:
+            if self.data_connected and self.data_socket:
+                return True
+
+            if not self.selected_server:
+                return False
+
+            if self.data_socket:
+                with contextlib.suppress(Exception):
+                    self.data_socket.close()
+
+            self.data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.data_socket.settimeout(5.0)
+            self.data_socket.connect((self.selected_server["address"], self.data_port))
+            self.data_connected = True
+            self.log_message.emit("debug", "Connected data socket")
+            return True
+        except Exception as e:
+            self.log_message.emit("error", f"Data connection failed: {e}")
+            self.data_connected = False
             return False
 
     ### Server scan using QThreadPool
@@ -198,14 +295,20 @@ class Client(QThread):
                 self.server_scan_progress.emit(progress)
                 self._last_update_time = now
 
-            # Collect servers if found
-            if found:
-                # Store discovered servers
-                self.discovered_servers.append()
+            # Collect servers if found (ScanWorker emits a dict or None)
+            # Ensure we received a dict
+            if found and isinstance(found, dict):
+                # Avoid duplicates
+                addr = found.get("address")
+                if addr and not any(
+                    s.get("address") == addr for s in self.discovered_servers
+                ):
+                    self.discovered_servers.append(found)
 
             if self._completed_scans == total_ips:
                 self.status = ClientStatus.DEFAULT
-                print(self.discovered_servers)
+                # discovery results updated
+
                 self.server_scan_completed.emit(self.discovered_servers)
 
         for i in range(1, 255):
@@ -241,21 +344,17 @@ class Client(QThread):
                 "type": Command.CONNECT_SERVER.value,
                 "payload": {
                     "hostname": self.app_info["hostname"],
-                    "app_name": self.app_info[
-                        "app_name"
-                    ],  # TODO: Replace with app_token
-                    "app_version": self.app_info["version"],
+                    "app_name": self.app_info["app_name"],
+                    "app_version": self.app_info["app_version"],
                     "timestamp": time.time(),
                 },
             }
 
-            client_syn_json = json.dumps(client_syn).encode("utf-8")
-            server_socket.send(client_syn_json)
+            server_socket.send(json.dumps(client_syn).encode("utf-8"))
 
             # Step 2: Receive server challenge or connection refusal (ack)
-            response_data = server_socket.recv(4096).decode("utf-8")
-            response_type, response_payload = parse_and_validate_response(
-                response_data, Response.SERVER_CHALLENGE.value
+            response_type, response_payload = self._recv_and_validate_response(
+                server_socket, expected_type=Response.SERVER_CHALLENGE.value
             )
 
             # Extract server hostname info
@@ -269,40 +368,115 @@ class Client(QThread):
                 )
 
             # Authenticate server using challenge
-            challenge = response_payload.get("challenge", None)
+            challenge = response_payload.get("challenge")
             if not challenge:
                 raise AuthenticationError("Server did not provide authentication token")
+
             auth_token = self._get_challenge_response(challenge)
             client_response_dict = {
                 "type": Command.AUTHENTICATE_CLIENT.value,
                 "payload": {"token": auth_token, "timestamp": time.time()},
             }
-            client_response = json.dumps(client_response_dict).encode("utf-8")
-            server_socket.send(client_response)
+            server_socket.send(json.dumps(client_response_dict).encode("utf-8"))
 
-            auth_result_data = server_socket.recv(4096).decode("utf-8")
-            auth_result_type, auth_result_payload = parse_and_validate_response(
-                auth_result_data, Response.AUTHENTICATION_SUCCESS.value
+            auth_result_type, auth_result_payload = self._recv_and_validate_response(
+                server_socket, expected_type=None
             )
+
+            # normalize auth_result_type for expected success/failure
+            auth_type_norm = (
+                auth_result_type.lower()
+                if isinstance(auth_result_type, str)
+                else str(auth_result_type).lower()
+            )
+            if auth_type_norm not in {
+                Response.AUTHENTICATION_SUCCESS.value.lower(),
+                Response.AUTHENTICATION_FAILURE.value.lower(),
+            }:
+                raise AuthenticationError(
+                    f"Unexpected auth response type: {auth_result_type}"
+                )
 
             server_info = auth_result_payload.get("server_info", {})
+            sanitized = self._sanitize_server_info(server_info, server_ip)
 
-            # Ensure hostname fallback for display
-            if "hostname" not in server_info or not server_info["hostname"]:
-                server_info["hostname"] = server_ip
-
+            self.authenticated = True
             self.log_message.emit(
-                "info",
-                f"Successfully connected to {server_info.get('hostname')}",
+                "info", f"Successfully connected to {sanitized.get('hostname')}"
             )
-            return server_info
+            return sanitized
 
         except socket.timeout:
             self.log_message.emit("error", "Authentication timeout")
             raise AuthenticationError("Authentication timeout") from None
+        except AuthenticationError:
+            raise
         except Exception as e:
             self.log_message.emit("error", f"Client authentication error: {e}")
             raise AuthenticationError(f"Authentication failed: {str(e)}") from None
+
+    def _get_challenge_response(self, challenge: str) -> str:
+        """Compute the response token for a given challenge.
+
+        Uses SHA-256 over the canonical string "{challenge}:{app_version}" where
+        app_version is taken from the client app info (or falls back to APP_VERSION).
+        """
+        try:
+            # Prefer the packaged app version from app_info
+            app_version = None
+            try:
+                app_version = self.app_info.get("app_version")
+            except Exception:
+                app_version = None
+
+            if not app_version:
+                # import here to avoid circular imports at module load
+                from bioview_common import APP_VERSION
+
+                app_version = str(APP_VERSION)
+
+            import hashlib
+
+            m = hashlib.sha256()
+            m.update(f"{challenge}:{app_version}".encode())
+            return m.hexdigest()
+        except Exception:
+            # As a fallback, return an empty token to force auth failure rather than crash
+            return ""
+
+    def _recv_and_validate_response(
+        self, server_socket: socket.socket, expected_type=None
+    ):
+        """Receive raw data from server socket and validate it using network helper.
+
+        Converts parsing/validation errors into AuthenticationError for callers.
+        Returns (response_type, response_payload).
+        """
+        try:
+            raw = server_socket.recv(4096).decode("utf-8")
+        except Exception as e:
+            raise AuthenticationError(f"Failed to receive response: {e}") from e
+
+        try:
+            return parse_and_validate_response(raw, response_type=expected_type)
+        except Exception as e:
+            # Map any parsing/validation error to AuthenticationError for caller clarity
+            raise AuthenticationError(f"Invalid response from server: {e}") from e
+
+    def _sanitize_server_info(self, server_info: dict, fallback_ip: str) -> dict:
+        """Ensure server_info dict contains JSON-serializable primitives and hostname fallback."""
+        sanitized = {}
+        for k, v in (server_info or {}).items():
+            try:
+                json.dumps({k: v})
+                sanitized[k] = v
+            except Exception:
+                sanitized[k] = str(v)
+
+        if "hostname" not in sanitized or not sanitized.get("hostname"):
+            sanitized["hostname"] = fallback_ip
+
+        return sanitized
 
     def connect_to_server(self):
         if self.selected_server == {}:
@@ -313,6 +487,8 @@ class Client(QThread):
             self.discover_servers()
             if len(self.discovered_servers) == 0:
                 self.log_message.emit("error", "No valid servers available.")
+                self.server_connected.emit(False)
+                return
             else:
                 self.selected_server = self.discovered_servers[0]
                 self.log_message.emit(
@@ -329,9 +505,18 @@ class Client(QThread):
             self.control_socket.connect(
                 (self.selected_server["address"], self.control_port)
             )
-            self.control_connected = True
 
-            self.log_message.emit("debug", "Connected to control server")
+            # Perform authentication handshake over the connected control socket
+            server_info = self.authenticate_with_server(
+                (self.selected_server["address"], self.control_port), self.control_socket
+            )
+
+            # Update selected_server with returned server_info
+            if server_info:
+                self.selected_server.update(server_info)
+
+            self.control_connected = True
+            self.log_message.emit("debug", "Authenticated with control server")
 
             # Connect to data server - close pre-existing connections
             if self.data_socket:
@@ -348,6 +533,10 @@ class Client(QThread):
             self.status = ClientStatus.SERVER_CONNECTED
             self.server_connected.emit(True)
 
+        except AuthenticationError as e:
+            self.status = ClientStatus.DEFAULT
+            self.log_message.emit("error", f"Authentication failed: {e}")
+            self.server_connected.emit(False)
         except Exception as e:
             self.status = ClientStatus.DEFAULT
             self.log_message.emit("error", f"Server connection failed: {e}")
@@ -379,11 +568,38 @@ class Client(QThread):
             self.error_occurred.emit("Not connected to control server")
             return None
 
-        if command_type not in SUPPORTED_COMMANDS:
+        # Normalize supported commands to their string values (handles enums or raw values)
+        # Build a tolerant set of supported command string representations
+        supported_cmd_values = set()
+        try:
+            for c in SUPPORTED_COMMANDS:
+                # Attempt common attributes
+                if hasattr(c, "value") and isinstance(c.value, str):
+                    supported_cmd_values.add(c.value)
+                    supported_cmd_values.add(c.value.lower())
+                if hasattr(c, "name") and isinstance(c.name, str):
+                    supported_cmd_values.add(c.name)
+                    supported_cmd_values.add(c.name.lower())
+                # Fallback to string form
+                supported_cmd_values.add(str(c))
+                supported_cmd_values.add(str(c).lower())
+        except Exception:
+            supported_cmd_values.add(str(SUPPORTED_COMMANDS))
+
+        # Normalize incoming command_type
+        if hasattr(command_type, "value") and isinstance(command_type.value, str):
+            cmd_value = command_type.value
+        elif hasattr(command_type, "name") and isinstance(command_type.name, str):
+            cmd_value = command_type.name
+        else:
+            cmd_value = str(command_type)
+
+        if cmd_value not in supported_cmd_values and cmd_value.lower() not in {
+            s.lower() for s in supported_cmd_values
+        }:
             self.error_occurred.emit("Invalid command sent")
             return None
-
-        command = {"type": command_type.value, "params": params or {}}
+        command = {"type": command_type.value, "payload": params or {}}
 
         try:
             command_data = json.dumps(command).encode("utf-8")
@@ -454,20 +670,34 @@ class Client(QThread):
             return False
 
     def start_streaming(self):
-        """Start real-time data streaming"""
+        """Start real-time data streaming (device-level streaming).
+
+        Sends a START command over the control channel and updates client state.
+        The background run loop will attempt to connect the data socket if needed.
+        """
         self.log_message.emit("info", "Starting data streaming...")
         response = self.send_control_command(Command.START)
 
-        if response and response.get("type") == "success":
+        if response and response.get("type") == Response.SUCCESS.value:
+            # Enter streaming state; data socket will be connected by run() or here
             self.status = ClientStatus.STREAMING
-
             self.log_message.emit("info", "Data streaming started")
-            self.streaming_started.emit()
+            try:
+                # Try to ensure data connection immediately
+                if not self.data_connected:
+                    if not self.data_socket:
+                        self.data_socket = socket.socket(
+                            socket.AF_INET, socket.SOCK_STREAM
+                        )
+                        self.data_socket.settimeout(5.0)
+                        self.data_socket.connect(
+                            (self.selected_server.get("address"), self.data_port)
+                        )
+                    self.data_connected = True
+            except Exception as e:
+                self.log_message.emit("error", f"Data connection failed: {e}")
 
-            # Connect to data server
-            if not self.data_connected:
-                self.connect_data()
-
+            self.streaming_started.emit(True)
             return True
         else:
             error_msg = (
@@ -477,24 +707,24 @@ class Client(QThread):
             return False
 
     def stop_streaming(self):
-        """Stop data streaming"""
+        """Stop data streaming from device(s)."""
         self.log_message.emit("info", "Stopping data streaming...")
-
-        self.status = ClientStatus.SERVER_CONNECTED
-
-        # Disconnect data socket
-        if self.data_socket:
-            with contextlib.suppress(Exception):
-                self.data_socket.close()
-
-            self.data_socket = None
-            self.data_connected = False
 
         response = self.send_control_command(Command.STOP)
 
-        if response and response.get("type") == "success":
+        # Close/cleanup data socket regardless of control response
+        if self.data_socket:
+            with contextlib.suppress(Exception):
+                self.data_socket.close()
+            self.data_socket = None
+            self.data_connected = False
+
+        # Update status back to connected server
+        self.status = ClientStatus.SERVER_CONNECTED
+
+        if response and response.get("type") == Response.SUCCESS.value:
             self.log_message.emit("info", "Data streaming stopped")
-            self.streaming_stopped.emit()
+            self.streaming_stopped.emit(True)
             return True
         else:
             error_msg = (

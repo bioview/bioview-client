@@ -353,7 +353,13 @@ class ConfigurationPrompt(QDialog):
         result = {}
 
         if self.common_config:
-            print(type(self.common_config), self.common_config)
+            try:
+                import logging
+
+                logger = logging.getLogger(__name__)
+                logger.debug("common_config type: %s", type(self.common_config))
+            except Exception:
+                pass
             result["common"] = Configuration.from_dict(self.common_config)
 
         if self.device_configs:
