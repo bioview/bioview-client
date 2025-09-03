@@ -20,6 +20,7 @@ import contextlib
 import json
 import socket
 import struct
+import threading
 import time
 from typing import Any, Dict, List, Tuple
 
@@ -49,6 +50,11 @@ from bioview_client.utils import parse_and_validate_response
 class ScanWorkerSignals(QObject):
     # Emit a server info dict when a BioView server is discovered, or None otherwise
     result = pyqtSignal(object)
+
+
+class DeviceDiscoverSignals(QObject):
+    # Emit a list of devices when discovery completes
+    finished = pyqtSignal(dict)
 
 
 class ScanWorker(QRunnable):
@@ -102,6 +108,37 @@ class ScanWorker(QRunnable):
             self.signals.result.emit(None)
 
 
+class DeviceDiscoverWorker(QRunnable):
+    """Background worker to request device discovery without blocking the UI."""
+
+    def __init__(self, client_ref):
+        super().__init__()
+        self.client_ref = client_ref
+        self.signals = DeviceDiscoverSignals()
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            devices = {}
+            # Device discovery can be slow on server side; use a longer timeout and
+            # do not disconnect the control socket on timeout so the client remains connected.
+            response = self.client_ref.send_control_command(
+                Command.DISCOVER_DEVICES, timeout=30.0, disconnect_on_error=False
+            )
+            if response and response.get("type") == "success":
+                # Server responses use the structure {"type": str, "payload": { ... }}
+                payload = (
+                    response.get("payload", {}) if isinstance(response, dict) else {}
+                )
+                # payload['devices'] is expected to be a dict mapping backend->list
+                devices = payload.get("devices", {})
+            # emit list (possibly empty)
+            self.signals.finished.emit(devices)
+        except Exception:
+            # On error, emit empty list
+            self.signals.finished.emit({})
+
+
 class Client(QThread):
     # Server control signals
     server_scan_completed = pyqtSignal(list)
@@ -120,6 +157,8 @@ class Client(QThread):
 
     # Device info signals
     devices_discovered = pyqtSignal(dict)
+    device_discovery_started = pyqtSignal()
+    device_discovery_finished = pyqtSignal(list)
 
     # General info signals
     error_occurred = pyqtSignal(str)
@@ -176,6 +215,13 @@ class Client(QThread):
         self.thread_pool.setMaxThreadCount(20)
         self._cancel_scan = False
 
+        # Device discovery state
+        self._discovering_devices = False
+
+        # Lock to serialize control (and related socket) operations to avoid races
+        # between send/recv and close operations from different threads.
+        self._control_lock = threading.Lock()
+
     # Thread handling
     def run(self):
         self.log_message.emit("info", "Starting client handler...")
@@ -229,16 +275,17 @@ class Client(QThread):
             if not self.selected_server:
                 return False
 
-            # Connect control socket
-            if self.control_socket:
-                with contextlib.suppress(Exception):
-                    self.control_socket.close()
+            # Connect control socket (serialize with lock to avoid races)
+            with self._control_lock:
+                if self.control_socket:
+                    with contextlib.suppress(Exception):
+                        self.control_socket.close()
 
-            self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.control_socket.settimeout(5.0)
-            self.control_socket.connect(
-                (self.selected_server["address"], self.control_port)
-            )
+                self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.control_socket.settimeout(5.0)
+                self.control_socket.connect(
+                    (self.selected_server["address"], self.control_port)
+                )
             self.control_connected = True
             self.log_message.emit("debug", "Connected control socket")
             self.status = ClientStatus.SERVER_CONNECTED
@@ -496,15 +543,17 @@ class Client(QThread):
                 )
 
         try:
-            # Connect to control server - close pre-existing connections
-            if self.control_socket:
-                self.control_socket.close()
+            # Connect to control server - close pre-existing connections (guard close/connect)
+            with self._control_lock:
+                if self.control_socket:
+                    with contextlib.suppress(Exception):
+                        self.control_socket.close()
 
-            self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.control_socket.settimeout(5.0)
-            self.control_socket.connect(
-                (self.selected_server["address"], self.control_port)
-            )
+                self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.control_socket.settimeout(5.0)
+                self.control_socket.connect(
+                    (self.selected_server["address"], self.control_port)
+                )
 
             # Perform authentication handshake over the connected control socket
             server_info = self.authenticate_with_server(
@@ -518,9 +567,10 @@ class Client(QThread):
             self.control_connected = True
             self.log_message.emit("debug", "Authenticated with control server")
 
-            # Connect to data server - close pre-existing connections
+            # Connect to data server - close pre-existing connections (guard close)
             if self.data_socket:
-                self.data_socket.close()
+                with contextlib.suppress(Exception):
+                    self.data_socket.close()
 
             self.data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.data_socket.settimeout(5.0)
@@ -543,50 +593,50 @@ class Client(QThread):
             self.server_connected.emit(False)
 
     def disconnect_from_server(self):
-        if self.control_socket:
-            with contextlib.suppress(Exception):
-                self.control_socket.close()
+        # Acquire lock while closing control socket to avoid closing under concurrent send/recv
+        with self._control_lock:
+            if self.control_socket:
+                with contextlib.suppress(Exception):
+                    self.control_socket.close()
+                self.control_socket = None
 
-            self.control_socket = None
+            if self.data_socket:
+                with contextlib.suppress(Exception):
+                    self.data_socket.close()
+                self.data_socket = None
 
-        if self.data_socket:
-            with contextlib.suppress(Exception):
-                self.data_socket.close()
-
-            self.data_socket = None
+            self.control_connected = False
+            self.data_connected = False
 
         self.status = ClientStatus.SERVER_DISCONNECTED
-        self.server_disconnected.emit(True)
+        try:
+            self.server_disconnected.emit(True)
+        except Exception:
+            self.server_disconnected.emit()
         self.log_message.emit("info", "Disconnected from server")
 
     ### Device Commands
 
     ### General functions
-    def send_control_command(self, command_type, params=None):
-        """Send control command to server"""
-        if not self.control_connected:
-            self.error_occurred.emit("Not connected to control server")
-            return None
-
-        # Normalize supported commands to their string values (handles enums or raw values)
-        # Build a tolerant set of supported command string representations
-        supported_cmd_values = set()
+    def _build_supported_cmd_values(self) -> set:
+        """Return a tolerant set of supported command string representations."""
+        values = set()
         try:
             for c in SUPPORTED_COMMANDS:
-                # Attempt common attributes
                 if hasattr(c, "value") and isinstance(c.value, str):
-                    supported_cmd_values.add(c.value)
-                    supported_cmd_values.add(c.value.lower())
+                    values.add(c.value)
+                    values.add(c.value.lower())
                 if hasattr(c, "name") and isinstance(c.name, str):
-                    supported_cmd_values.add(c.name)
-                    supported_cmd_values.add(c.name.lower())
-                # Fallback to string form
-                supported_cmd_values.add(str(c))
-                supported_cmd_values.add(str(c).lower())
+                    values.add(c.name)
+                    values.add(c.name.lower())
+                values.add(str(c))
+                values.add(str(c).lower())
         except Exception:
-            supported_cmd_values.add(str(SUPPORTED_COMMANDS))
+            values.add(str(SUPPORTED_COMMANDS))
+        return values
 
-        # Normalize incoming command_type
+    def _normalize_command_type(self, command_type) -> tuple:
+        """Return (cmd_value, json_type) for incoming command_type."""
         if hasattr(command_type, "value") and isinstance(command_type.value, str):
             cmd_value = command_type.value
         elif hasattr(command_type, "name") and isinstance(command_type.name, str):
@@ -594,45 +644,132 @@ class Client(QThread):
         else:
             cmd_value = str(command_type)
 
+        # json_type: what we put in the outgoing JSON (prefer .value when available)
+        json_type = (
+            command_type.value if hasattr(command_type, "value") else str(command_type)
+        )
+        return cmd_value, json_type
+
+    def _send_and_receive(self, command_data: bytes, timeout: float = None) -> bytes:
+        """Send command_data and receive response under the control lock.
+
+        This helper temporarily sets socket timeout if requested and restores it.
+        """
+        with self._control_lock:
+            prev_timeout = None
+            try:
+                if timeout is not None and self.control_socket is not None:
+                    prev_timeout = self.control_socket.gettimeout()
+                    self.control_socket.settimeout(timeout)
+
+                self.control_socket.send(command_data)
+                response_data = self.control_socket.recv(MAX_BUFFER_SIZE)
+            finally:
+                try:
+                    if timeout is not None and self.control_socket is not None:
+                        self.control_socket.settimeout(prev_timeout)
+                except Exception:
+                    pass
+        return response_data
+
+    def send_control_command(
+        self,
+        command_type,
+        params=None,
+        timeout: float = None,
+        disconnect_on_error: bool = True,
+    ):
+        """Send control command to server"""
+        if not self.control_connected:
+            self.error_occurred.emit("Not connected to control server")
+            return None
+
+        supported_cmd_values = self._build_supported_cmd_values()
+        cmd_value, json_type = self._normalize_command_type(command_type)
+
         if cmd_value not in supported_cmd_values and cmd_value.lower() not in {
             s.lower() for s in supported_cmd_values
         }:
             self.error_occurred.emit("Invalid command sent")
             return None
-        command = {"type": command_type.value, "payload": params or {}}
+
+        command = {"type": json_type, "payload": params or {}}
 
         try:
             command_data = json.dumps(command).encode("utf-8")
-            self.control_socket.send(command_data)
+            response_data = self._send_and_receive(command_data, timeout=timeout)
 
-            response_data = self.control_socket.recv(MAX_BUFFER_SIZE)
-            response = json.loads(response_data.decode("utf-8"))
+            if not response_data:
+                return None
+            return json.loads(response_data.decode("utf-8"))
 
-            return response
-
+        except socket.timeout as e:
+            # For long-running ops like discovery, caller may opt to not disconnect on timeout
+            self.error_occurred.emit(f"Control communication error: {e}")
+            if disconnect_on_error:
+                with contextlib.suppress(Exception):
+                    self.disconnect_from_server()
+            return None
         except Exception as e:
             self.error_occurred.emit(f"Control communication error: {e}")
-            self.disconnect_from_server()
+            # Ensure we close sockets safely (unless caller disabled it)
+            if disconnect_on_error:
+                with contextlib.suppress(Exception):
+                    self.disconnect_from_server()
             return None
 
     def discover_devices(self):
-        """Discover devices"""
-        self.log_message.emit("info", "Discovering devices...")
-        response = self.send_control_command(Command.DISCOVER_DEVICES)
+        """Start device discovery in background and return immediately."""
+        # Avoid starting another discovery while one is active
+        if self._discovering_devices:
+            self.log_message.emit("warn", "Device discovery already in progress")
+            return
 
-        if response and response.get("type") == "success":
-            devices = response.get("devices", [])
-            self.log_message.emit("info", f"Found {len(devices)} devices")
-            return devices
-        else:
-            error_msg = (
-                response.get("message", "Unknown error") if response else "No response"
-            )
-            self.error_occurred.emit(f"Device discovery failed: {error_msg}")
-            return []
+        self.log_message.emit("info", "Discovering devices...")
+        self._discovering_devices = True
+        self.device_discovery_started.emit()
+
+        worker = DeviceDiscoverWorker(self)
+
+        def _on_finished(discovered):
+            try:
+                # discovered is expected to be a dict: {device_group_id: [device_dicts]}
+                raw_devices = discovered if isinstance(discovered, dict) else {}
+                # Log raw discovered devices for debugging in UI
+                self.log_message.emit("debug", f"Discovered raw devices: {raw_devices}")
+
+                # Build a devices_map containing only configured device groups
+                devices_map = {}
+                if isinstance(self.device_config, dict):
+                    configured_groups = list(self.device_config.keys())
+                elif isinstance(self.device_config, list):
+                    configured_groups = list(self.device_config)
+                else:
+                    configured_groups = []
+
+                for group in configured_groups:
+                    devices_map[group] = raw_devices.get(group, [])
+
+                # Emit the filtered map for the UI status panel, and raw results for debugging
+                self.devices_discovered.emit(devices_map)
+                self.device_discovery_finished.emit(raw_devices)
+                self.log_message.emit(
+                    "info",
+                    f"Found {sum(len(v) for v in raw_devices.values()) if raw_devices else 0} devices",
+                )
+            finally:
+                self._discovering_devices = False
+
+        worker.signals.finished.connect(_on_finished)
+        self.thread_pool.start(worker)
 
     def connect_device(self, device_id=None):
         """Connect to device"""
+        if getattr(self, "_discovering_devices", False):
+            self.error_occurred.emit(
+                "Cannot connect to device while device discovery is in progress"
+            )
+            return False
         self.log_message.emit("info", "Connecting...")
         response = self.send_control_command(Command.CONNECT, {"id": device_id})
 
@@ -641,9 +778,13 @@ class Client(QThread):
             self.device_connected.emit(device_id)
             return True
         else:
-            error_msg = (
-                response.get("message", "Unknown error") if response else "No response"
-            )
+            if response and isinstance(response, dict):
+                payload = (
+                    response.get("payload", {}) if isinstance(response, dict) else {}
+                )
+                error_msg = payload.get("message", "Unknown error")
+            else:
+                error_msg = "No response"
             self.error_occurred.emit(f"Device connection failed: {error_msg}")
             self.device_connection_failed.emit(device_id)
             return False
@@ -663,9 +804,13 @@ class Client(QThread):
             self.device_disconnected.emit()
             return True
         else:
-            error_msg = (
-                response.get("message", "Unknown error") if response else "No response"
-            )
+            if response and isinstance(response, dict):
+                payload = (
+                    response.get("payload", {}) if isinstance(response, dict) else {}
+                )
+                error_msg = payload.get("message", "Unknown error")
+            else:
+                error_msg = "No response"
             self.error_occurred.emit(f"Disconnect failed: {error_msg}")
             return False
 
@@ -675,6 +820,12 @@ class Client(QThread):
         Sends a START command over the control channel and updates client state.
         The background run loop will attempt to connect the data socket if needed.
         """
+        if getattr(self, "_discovering_devices", False):
+            self.error_occurred.emit(
+                "Cannot start streaming while device discovery is in progress"
+            )
+            return False
+
         self.log_message.emit("info", "Starting data streaming...")
         response = self.send_control_command(Command.START)
 
@@ -700,14 +851,24 @@ class Client(QThread):
             self.streaming_started.emit(True)
             return True
         else:
-            error_msg = (
-                response.get("message", "Unknown error") if response else "No response"
-            )
+            if response and isinstance(response, dict):
+                payload = (
+                    response.get("payload", {}) if isinstance(response, dict) else {}
+                )
+                error_msg = payload.get("message", "Unknown error")
+            else:
+                error_msg = "No response"
             self.error_occurred.emit(f"Failed to start streaming: {error_msg}")
             return False
 
     def stop_streaming(self):
         """Stop data streaming from device(s)."""
+        if getattr(self, "_discovering_devices", False):
+            self.error_occurred.emit(
+                "Cannot stop streaming while device discovery is in progress"
+            )
+            return False
+
         self.log_message.emit("info", "Stopping data streaming...")
 
         response = self.send_control_command(Command.STOP)
@@ -727,14 +888,24 @@ class Client(QThread):
             self.streaming_stopped.emit(True)
             return True
         else:
-            error_msg = (
-                response.get("message", "Unknown error") if response else "No response"
-            )
+            if response and isinstance(response, dict):
+                payload = (
+                    response.get("payload", {}) if isinstance(response, dict) else {}
+                )
+                error_msg = payload.get("message", "Unknown error")
+            else:
+                error_msg = "No response"
             self.error_occurred.emit(f"Failed to stop streaming: {error_msg}")
             return False
 
     def configure_device(self, device_id, config):
         """Configure device parameters"""
+        if getattr(self, "_discovering_devices", False):
+            self.error_occurred.emit(
+                "Cannot configure device while device discovery is in progress"
+            )
+            return False
+
         self.log_message.emit("info", "Configuring device: {device_id}")
         response = self.send_control_command(
             Command.CONFIGURE, {"id": device_id, "config": config}
@@ -744,9 +915,13 @@ class Client(QThread):
             self.log_message.emit("info", "Device configured successfully")
             return True
         else:
-            error_msg = (
-                response.get("message", "Unknown error") if response else "No response"
-            )
+            if response and isinstance(response, dict):
+                payload = (
+                    response.get("payload", {}) if isinstance(response, dict) else {}
+                )
+                error_msg = payload.get("message", "Unknown error")
+            else:
+                error_msg = "No response"
             self.error_occurred.emit(f"Configuration failed: {error_msg}")
             return False
 

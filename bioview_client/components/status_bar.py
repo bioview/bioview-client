@@ -1,3 +1,4 @@
+import contextlib
 import socket
 from typing import Dict, List
 
@@ -26,6 +27,8 @@ class ServerConnector(QWidget):
 
     network_scan_requested = pyqtSignal()
     server_connection_requested = pyqtSignal(dict)
+    # Emitted when the user requests device discovery on the currently selected server
+    discover_devices_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -58,7 +61,6 @@ class ServerConnector(QWidget):
 
         # Server dropdown (populated by scan)
         self.server_dropdown = QComboBox()
-
         self.server_dropdown.setEnabled(False)
         self.server_dropdown.currentIndexChanged.connect(self.on_server_selected)
         control_layout.addWidget(self.server_dropdown)
@@ -74,6 +76,12 @@ class ServerConnector(QWidget):
         self.disconnect_btn.clicked.connect(self.disconnect_from_server)
         self.disconnect_btn.setEnabled(False)
         control_layout.addWidget(self.disconnect_btn)
+
+        # Discover devices button
+        self.discover_btn = QPushButton("Discover Devices")
+        self.discover_btn.clicked.connect(self.discover_devices)
+        self.discover_btn.setEnabled(False)
+        control_layout.addWidget(self.discover_btn)
 
         # Progress bar
         self.scan_progress_bar = QProgressBar()
@@ -119,6 +127,10 @@ class ServerConnector(QWidget):
 
             self.connect_btn.setEnabled(True)
             self.disconnect_btn.setEnabled(False)
+            # enable discovery once a server is selected
+            if len(discovered_servers) > 0:
+                with contextlib.suppress(Exception):
+                    self.discover_btn.setEnabled(True)
 
     def on_server_selected(self, server_index):
         if server_index < len(self.discovered_servers):
@@ -167,13 +179,36 @@ class ServerConnector(QWidget):
 
     def update_connection_status(self, status):
         """Update connection status display"""
-        self.connection_label.setText(f"Status: {status}")
-        if status == "Connected":
+        # Normalize boolean statuses
+        if isinstance(status, bool):
+            status_text = "Connected" if status else "Disconnected"
+        else:
+            status_text = str(status)
+
+        self.connection_label.setText(f"Status: {status_text}")
+        if status_text == "Connected":
             self.connection_label.setStyleSheet("color: green")
-        elif status == "Disconnected":
+            # Enable device discovery and disconnect when connected
+            try:
+                self.discover_btn.setEnabled(True)
+                self.connect_btn.setEnabled(False)
+                self.disconnect_btn.setEnabled(True)
+            except Exception:
+                pass
+        elif status_text == "Disconnected":
             self.connection_label.setStyleSheet("color: red")
+            try:
+                self.discover_btn.setEnabled(False)
+                self.connect_btn.setEnabled(True)
+                self.disconnect_btn.setEnabled(False)
+            except Exception:
+                pass
         else:
             self.connection_label.setStyleSheet("color: orange")
+
+    def discover_devices(self):
+        """Emit a signal requesting device discovery from the handler."""
+        self.discover_devices_requested.emit()
 
     def closeEvent(self, event):
         """Handle widget close"""
@@ -296,18 +331,22 @@ class StatusBar(QStatusBar):
         super().__init__(parent)
 
         # Use a QWidget with a layout to group widgets
-        container = QWidget()
-        layout = QHBoxLayout(container)
-        layout.setContentsMargins(0, 0, 0, 0)
+        self.container = QWidget()
+        self._layout = QHBoxLayout(self.container)
+        self._layout.setContentsMargins(0, 0, 0, 0)
         self.server_connector = ServerConnector()
-        layout.addWidget(self.server_connector, alignment=Qt.AlignmentFlag.AlignLeft)
-        layout.addStretch()
+        self._layout.addWidget(
+            self.server_connector, alignment=Qt.AlignmentFlag.AlignLeft
+        )
+        self._layout.addStretch()
 
         self.device_status_panel = DeviceStatusPanel(devices={})
-        layout.addWidget(self.device_status_panel, alignment=Qt.AlignmentFlag.AlignRight)
-        container.setLayout(layout)
+        self._layout.addWidget(
+            self.device_status_panel, alignment=Qt.AlignmentFlag.AlignRight
+        )
+        self.container.setLayout(self._layout)
 
-        self.addPermanentWidget(container, stretch=1)
+        self.addPermanentWidget(self.container, stretch=1)
 
         # Forward signals and callbacks from components
         self._forward_signals()
@@ -319,6 +358,8 @@ class StatusBar(QStatusBar):
         self.server_connection_requested = (
             self.server_connector.server_connection_requested
         )
+        # Expose discover devices request
+        self.server_discover_requested = self.server_connector.discover_devices_requested
         self.update_server_connection_status = (
             self.server_connector.update_connection_status
         )
@@ -328,3 +369,18 @@ class StatusBar(QStatusBar):
     def _forward_callbacks(self):
         self.on_scan_complete = self.server_connector.on_scan_complete
         self.update_scan_progress = self.server_connector.update_scan_progress
+
+    def update_devices(self, devices: dict):
+        """Replace the device panel with the discovered devices mapping."""
+        try:
+            old = self.device_status_panel
+            self._layout.removeWidget(old)
+            old.deleteLater()
+        except Exception:
+            pass
+
+        self.device_status_panel = DeviceStatusPanel(devices=devices)
+        self._layout.addWidget(
+            self.device_status_panel, alignment=Qt.AlignmentFlag.AlignRight
+        )
+        self.update_device_state = self.device_status_panel.update_device_state

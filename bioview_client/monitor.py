@@ -184,15 +184,14 @@ class BioViewMonitor(QMainWindow):
         self.client_worker.streaming_started.connect(self.on_streaming_started)
         self.client_worker.streaming_stopped.connect(self.on_streaming_stopped)
 
-        # Device info signals
+        # Devices discovered -> update status bar device panel
+        self.client_worker.devices_discovered.connect(self._handle_devices_discovered)
 
         # General info signals
         self.client_worker.error_occurred.connect(
             lambda msg: self.log_display_panel.log_message("error", msg)
         )
         self.client_worker.log_message.connect(self.log_display_panel.log_message)
-
-        # Data signals
 
         # Start client
         self.client_worker.start_client()
@@ -236,11 +235,29 @@ class BioViewMonitor(QMainWindow):
         self.status_bar.network_scan_requested.connect(
             self.client_worker.discover_servers
         )
-        # Forward UI server connect requests to the client worker
-        if getattr(self.status_bar, "server_connection_requested", None):
-            self.status_bar.server_connection_requested.connect(
-                self._handle_server_connection_request
+        # Wire status bar discover devices button to client handler
+        if getattr(self.status_bar, "server_discover_requested", None):
+            self.status_bar.server_discover_requested.connect(
+                self.client_worker.discover_devices
             )
+
+        # Forward UI server connect requests to client's request_connect slot (runs in client thread)
+        if getattr(self.status_bar, "server_connection_requested", None):
+            # Connect to the client's slot that runs in the client's thread
+            try:
+                # ensure the client has a request_connect slot
+                if hasattr(self.client_worker, "request_connect"):
+                    self.status_bar.server_connection_requested.connect(
+                        self.client_worker.request_connect
+                    )
+                else:
+                    self.status_bar.server_connection_requested.connect(
+                        self._handle_server_connection_request
+                    )
+            except Exception:
+                self.status_bar.server_connection_requested.connect(
+                    self._handle_server_connection_request
+                )
 
     def _handle_server_connection_request(self, server_info: dict):
         """Handle server connect requests from the UI"""
@@ -250,6 +267,18 @@ class BioViewMonitor(QMainWindow):
         if self.client_worker:
             self.client_worker.selected_server = server_info
             self.client_worker.connect_to_server()
+
+    def _handle_devices_discovered(self, devices_map: dict):
+        """Update status bar device panel when client reports discovered devices."""
+        if not devices_map:
+            return
+        try:
+            self.devices = devices_map
+            # Ask status bar to replace device panel
+            if getattr(self.status_bar, "update_devices", None):
+                self.status_bar.update_devices(devices_map)
+        except Exception as e:
+            self.log_display_panel.log_message("error", f"Failed to update devices: {e}")
 
     def closeEvent(self, event):
         """Handle application close"""
