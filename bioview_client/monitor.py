@@ -337,15 +337,20 @@ class BioViewMonitor(QMainWindow):
         # Disconnect request: try direct slot, fallback to request_disconnect if available
         if getattr(self.status_bar, "server_disconnection_requested", None):
             with contextlib.suppress(Exception):
-                self.status_bar.server_disconnection_requested.connect(
-                    self.client_worker.disconnect_from_server
-                )
-            # fallback
-            with contextlib.suppress(Exception):
+                # Prefer an explicit request_disconnect wrapper so the client can
+                # mark the disconnect as manual and avoid auto-reconnect.
                 if hasattr(self.client_worker, "request_disconnect"):
                     self.status_bar.server_disconnection_requested.connect(
                         self.client_worker.request_disconnect
                     )
+                else:
+                    self.status_bar.server_disconnection_requested.connect(
+                        self.client_worker.disconnect_from_server
+                    )
+            # fallback
+            with contextlib.suppress(Exception):
+                # no-op fallback handled above
+                pass
 
         # Server connection requests: prefer client's request_connect slot when present
         if getattr(self.status_bar, "server_connection_requested", None):

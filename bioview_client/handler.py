@@ -64,47 +64,39 @@ class ScanWorker(QRunnable):
         self.control_port = control_port
         self.timeout = timeout
         self.signals = ScanWorkerSignals()
-        self._running = True
 
-    @pyqtSlot()
     def run(self):
-        if not self._running:
-            return
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(self.timeout)
-            # Try to establish a TCP connection first
-            sock.connect((self.ip, self.control_port))
-
-            # Send a lightweight ping to let a BioView server respond with its info
+        # Probe the control port on the target IP and emit a server info dict or None
+        with contextlib.suppress(Exception):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(self.timeout)
+            s.connect((self.ip, self.control_port))
             try:
+                # Send a lightweight ping command and wait for a response
                 ping = json.dumps(
                     {"type": Command.PING_SERVER.value, "payload": {}}
                 ).encode("utf-8")
-                sock.send(ping)
-                data = sock.recv(4096).decode("utf-8")
-                server_info = None
-                try:
-                    resp = json.loads(data)
-                    payload = resp.get("payload", {}) if isinstance(resp, dict) else {}
-                    if isinstance(payload, dict) and "server_info" in payload:
-                        server_info = payload.get("server_info") or {}
-                except Exception:
-                    server_info = None
+                with contextlib.suppress(Exception):
+                    s.send(ping)
+                    data = s.recv(4096)
+                    if data:
+                        try:
+                            resp = parse_and_validate_response(data.decode("utf-8"))
+                            payload = (
+                                resp.get("payload", {}) if isinstance(resp, dict) else {}
+                            )
+                            server_info = payload.get("server_info", {})
+                        except Exception:
+                            server_info = {}
+                        server_info["address"] = self.ip
+                        self.signals.result.emit(server_info if server_info else None)
+                        return
+            finally:
+                with contextlib.suppress(Exception):
+                    s.close()
 
-                # Normalize returned server info
-                if server_info is None:
-                    server_info = {"hostname": self.ip}
-                server_info["address"] = self.ip
-
-                sock.close()
-                self.signals.result.emit(server_info)
-            except Exception:
-                # If ping fails but TCP connect succeeded, still report address so UI can show reachable hosts
-                sock.close()
-                self.signals.result.emit({"address": self.ip, "hostname": self.ip})
-        except Exception:
-            # Couldn't connect at all
+        # Default: emit None when no server found or on error
+        with contextlib.suppress(Exception):
             self.signals.result.emit(None)
 
 
@@ -201,6 +193,25 @@ class Client(QThread):
         self.status = ClientStatus.DEFAULT
         self.data_connected = False
 
+        # Thread pool for background tasks (scanning, device discovery)
+        self.thread_pool = QThreadPool()
+        self.thread_pool.setMaxThreadCount(20)
+        self._cancel_scan = False
+
+        # Device discovery state
+        self._discovering_devices = False
+
+        # If user requested an explicit/intentional disconnect, set this flag
+        # so the background run-loop does not attempt to auto-reconnect.
+        self._manual_disconnect = False
+
+        # Lock to serialize control (and related socket) operations to avoid races
+        # between send/recv and close operations from different threads.
+        self._control_lock = threading.Lock()
+
+        # Running state for the QThread
+        self.running = False
+
         self.device_config = device_config
         self.device_status = {}
         if device_config and isinstance(device_config, dict):
@@ -210,22 +221,16 @@ class Client(QThread):
                     "state": DeviceStatus.DISCONNECTED,
                 }
 
-        # Thread pool for scanning
-        self.thread_pool = QThreadPool()
-        self.thread_pool.setMaxThreadCount(20)
-        self._cancel_scan = False
-
-        # Device discovery state
-        self._discovering_devices = False
-
-        # Lock to serialize control (and related socket) operations to avoid races
-        # between send/recv and close operations from different threads.
-        self._control_lock = threading.Lock()
-
     # Thread handling
     def run(self):
         self.log_message.emit("info", "Starting client handler...")
         while self.running:
+            # Honor an explicit user-requested disconnect: do not auto-reconnect
+            # while this flag is set. A subsequent user connect request must
+            # clear this flag (see request_connect).
+            if getattr(self, "_manual_disconnect", False):
+                time.sleep(0.1)
+                continue
             if self.status != ClientStatus.SERVER_CONNECTED:
                 if self.connect_control():
                     # note: control socket connected but not necessarily authenticated
@@ -615,6 +620,37 @@ class Client(QThread):
             self.server_disconnected.emit()
         self.log_message.emit("info", "Disconnected from server")
 
+    # Public convenience API for UI-driven requests --------------------------------
+    def request_disconnect(self):
+        """User-requested disconnect: mark as manual to avoid auto-reconnect.
+
+        This wrapper ensures that a disconnect initiated by the UI will not be
+        immediately undone by the client's background run-loop trying to
+        re-establish the control socket.
+        """
+        with contextlib.suppress(Exception):
+            self._manual_disconnect = True
+
+        # Perform normal disconnect cleanup
+        self.disconnect_from_server()
+
+    def request_connect(self, server_info: dict = None):
+        """User-requested connect: clear manual-disconnect flag and attempt connection.
+
+        If a server_info dict is provided it becomes the selected server
+        before initiating the connection.
+        """
+        with contextlib.suppress(Exception):
+            # Clear manual disconnect so run-loop may reconnect if needed
+            self._manual_disconnect = False
+
+        if server_info:
+            self.selected_server = server_info
+
+        # Attempt an immediate connection
+        with contextlib.suppress(Exception):
+            self.connect_to_server()
+
     ### Device Commands
 
     ### General functions
@@ -665,11 +701,10 @@ class Client(QThread):
                 self.control_socket.send(command_data)
                 response_data = self.control_socket.recv(MAX_BUFFER_SIZE)
             finally:
-                try:
+                with contextlib.suppress(Exception):
                     if timeout is not None and self.control_socket is not None:
                         self.control_socket.settimeout(prev_timeout)
-                except Exception:
-                    pass
+
         return response_data
 
     def send_control_command(
