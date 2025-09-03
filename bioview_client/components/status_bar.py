@@ -2,7 +2,9 @@ import contextlib
 import socket
 from typing import Dict, List
 
+import qtawesome as qta
 from bioview_common import DeviceStatus
+from bioview_common.protocol.status import ClientStatus
 from PyQt6.QtCore import QEvent, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPen
 from PyQt6.QtWidgets import (
@@ -15,18 +17,22 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-
-# TODO: Find better way of dealing with emit_status
+from bioview_client.constants.theme import get_qcolor
 
 
 class ServerConnector(QWidget):
-    """
-    GUI Component which displays available/connected servers and provides for an option to swap out among servers.
+    """GUI Component which displays available/connected servers and provides for an option to swap out among servers.
     Server connection state is emitted back to the main app for further co-ordination.
     """
 
     network_scan_requested = pyqtSignal()
+    network_scan_cancel_requested = pyqtSignal()
     server_connection_requested = pyqtSignal(dict)
+    server_disconnection_requested = pyqtSignal()
+    # Request that the central StatusBar update server-related UI state.
+    # Emitting a ClientStatus here ensures all button state changes happen
+    # in StatusBar.set_server_status and nowhere else.
+    server_status_change_requested = pyqtSignal(object)
     # Emitted when the user requests device discovery on the currently selected server
     discover_devices_requested = pyqtSignal()
 
@@ -37,31 +43,38 @@ class ServerConnector(QWidget):
         self.selected_server = {}
         self.discovered_servers = []
 
+        # Internal state
+        self._scanning = False
+
         # Setup UI
         self.init_ui()
 
         # Show local network info
         self.local_ip, self.network_ip, self.hostname = self.get_local_network_info()
-        # if self.local_ip:
-        #     self.emit_status(
-        #         f"Local IP: {self.local_ip} | Network: {self.network_ip} | Hostname: {self.hostname}"
-        #     )
-        # else:
-        #     self.emit_status("Ready - Enter server address or scan network")
 
     def init_ui(self):
         """Setup the user interface"""
         # Control panel
         control_layout = QHBoxLayout(self)
+        control_layout.setContentsMargins(4, 0, 4, 0)
 
-        # Scan button
-        self.scan_btn = QPushButton("Scan Network")
+        # Scan button (toggles to cancel while scanning)
+        self.scan_btn = QPushButton()
+        try:
+            self.scan_btn.setIcon(qta.icon("fa6s.search", color=get_qcolor("blue")))
+        except Exception:
+            self.scan_btn.setText("🔍")
+        self.scan_btn.setToolTip("Scan network for BioView servers")
         self.scan_btn.clicked.connect(self.scan_network)
         control_layout.addWidget(self.scan_btn)
 
         # Server dropdown (populated by scan)
         self.server_dropdown = QComboBox()
         self.server_dropdown.setEnabled(False)
+        # make slightly wider to show hostnames
+        with contextlib.suppress(Exception):
+            self.server_dropdown.setMinimumWidth(260)
+
         self.server_dropdown.currentIndexChanged.connect(self.on_server_selected)
         control_layout.addWidget(self.server_dropdown)
 
@@ -83,28 +96,45 @@ class ServerConnector(QWidget):
         self.discover_btn.setEnabled(False)
         control_layout.addWidget(self.discover_btn)
 
-        # Progress bar
+        # Progress bar (hidden until a scan starts)
         self.scan_progress_bar = QProgressBar()
         self.scan_progress_bar.setTextVisible(False)
-        self.scan_progress_bar.setFixedHeight(16)
+        self.scan_progress_bar.setFixedHeight(14)
         self.scan_progress_bar.setRange(0, 100)
         self.scan_progress_bar.setValue(0)
-
+        self.scan_progress_bar.setVisible(False)
         control_layout.addWidget(self.scan_progress_bar)
 
         self.connection_label = QLabel("Status: Disconnected")
+        self.connection_label.setContentsMargins(6, 0, 6, 0)
         control_layout.addWidget(self.connection_label)
 
         self.setLayout(control_layout)
 
     def scan_network(self):
         """Start network scan for servers"""
-        self.scan_btn.setEnabled(False)
-        self.connect_btn.setEnabled(False)
-        self.disconnect_btn.setEnabled(False)
+        # Toggle scanning state: if already scanning, request cancel
+        if self._scanning:
+            # request cancel
+            self.network_scan_cancel_requested.emit()
+            return
 
+        # begin scan
+        self._scanning = True
+        # swap icon to stop glyph
+        try:
+            self.scan_btn.setIcon(qta.icon("fa6s.stop", color=get_qcolor("red")))
+        except Exception:
+            with contextlib.suppress(Exception):
+                self.scan_btn.setText("⏹")
+
+        # Clear choices and show progress; centralize button enablement
+        # through the StatusBar.set_server_status API.
         self.server_dropdown.clear()
-        self.server_dropdown.setEnabled(False)
+
+        # Request central UI to enter SCANNING state
+        self.server_status_change_requested.emit(ClientStatus.SCANNING)
+        self.scan_progress_bar.setVisible(True)
 
         # Ask handler to start scanning
         self.network_scan_requested.emit()
@@ -114,23 +144,39 @@ class ServerConnector(QWidget):
 
     def on_scan_complete(self, discovered_servers: List[Dict] = None):
         """On completion of network scan, handler passes along list of discovered servers"""
-        self.scan_btn.setEnabled(True)
-        self.server_dropdown.setEnabled(True)
+        # stop scanning visuals
+        self._scanning = False
+        try:
+            self.scan_btn.setIcon(qta.icon("fa6s.search", color=get_qcolor("blue")))
+        except Exception:
+            with contextlib.suppress(Exception):
+                self.scan_btn.setText("🔍")
+        self.scan_progress_bar.setVisible(False)
 
+        # populate dropdown only if we have results
         if discovered_servers is None or len(discovered_servers) == 0:
             self.server_dropdown.setEnabled(False)
-        else:
-            self.discovered_servers = discovered_servers
+            self.discovered_servers = []
+            # Ask the central StatusBar to update all button state
+            self.server_status_change_requested.emit(ClientStatus.SERVER_DISCONNECTED)
+            return
 
-            for server in discovered_servers:
-                self.server_dropdown.addItem(server["hostname"])
+        # Save discovered servers and populate by hostname when available
+        self.discovered_servers = discovered_servers
+        self.server_dropdown.clear()
+        for server in discovered_servers:
+            hostname = server.get("hostname") or ""
+            address = server.get("address") or ""
+            if hostname and hostname != address:
+                name = f"{hostname} ({address})"
+            else:
+                name = address or hostname or str(server)
+            self.server_dropdown.addItem(name)
 
-            self.connect_btn.setEnabled(True)
-            self.disconnect_btn.setEnabled(False)
-            # enable discovery once a server is selected
-            if len(discovered_servers) > 0:
-                with contextlib.suppress(Exception):
-                    self.discover_btn.setEnabled(True)
+        # enable connect only when we have choices -- centralize via StatusBar
+        self.server_dropdown.setEnabled(True)
+        # Notify the StatusBar about the available-but-not-connected state
+        self.server_status_change_requested.emit(ClientStatus.SERVER_DISCONNECTED)
 
     def on_server_selected(self, server_index):
         if server_index < len(self.discovered_servers):
@@ -145,17 +191,17 @@ class ServerConnector(QWidget):
             # self.status ("Invalid server selected.")
             return
 
-        # Update UI
-        self.connect_btn.setEnabled(False)  # re-enable on failed connection
-        self.disconnect_btn.setEnabled(False)  # re-enable on successful connection
-
-        # self.emit_status(f"Connecting...")
+    # UI state is controlled centrally by StatusBar; the handler should
+    # emit a real CLIENT status update which will be applied via
+    # StatusBar.set_server_status. Avoid local optimistic changes here.
 
     def disconnect_from_server(self):
         """Disconnect from the data server"""
-        self.connect_btn.setEnabled(True)
-        self.disconnect_btn.setEnabled(False)
-        # self.emit_status("Disconnected")
+        # Emit the request for the handler to disconnect
+        self.server_disconnection_requested.emit()
+
+        # Ask the central StatusBar to reflect a disconnected server state.
+        self.server_status_change_requested.emit(ClientStatus.SERVER_DISCONNECTED)
 
     def get_local_network_info(self):
         """Get local network information for display"""
@@ -177,34 +223,7 @@ class ServerConnector(QWidget):
         except Exception:
             return None, None, None
 
-    def update_connection_status(self, status):
-        """Update connection status display"""
-        # Normalize boolean statuses
-        if isinstance(status, bool):
-            status_text = "Connected" if status else "Disconnected"
-        else:
-            status_text = str(status)
-
-        self.connection_label.setText(f"Status: {status_text}")
-        if status_text == "Connected":
-            self.connection_label.setStyleSheet("color: green")
-            # Enable device discovery and disconnect when connected
-            try:
-                self.discover_btn.setEnabled(True)
-                self.connect_btn.setEnabled(False)
-                self.disconnect_btn.setEnabled(True)
-            except Exception:
-                pass
-        elif status_text == "Disconnected":
-            self.connection_label.setStyleSheet("color: red")
-            try:
-                self.discover_btn.setEnabled(False)
-                self.connect_btn.setEnabled(True)
-                self.disconnect_btn.setEnabled(False)
-            except Exception:
-                pass
-        else:
-            self.connection_label.setStyleSheet("color: orange")
+    # Legacy text-based update method removed. Use set_server_status(ClientStatus) instead.
 
     def discover_devices(self):
         """Emit a signal requesting device discovery from the handler."""
@@ -212,7 +231,9 @@ class ServerConnector(QWidget):
 
     def closeEvent(self, event):
         """Handle widget close"""
-        self.cleanup()
+        # Best-effort cleanup
+        with contextlib.suppress(Exception):
+            self.network_scan_cancel_requested.emit()
         super().closeEvent(event)
 
 
@@ -353,18 +374,70 @@ class StatusBar(QStatusBar):
         self._forward_callbacks()
 
     def _forward_signals(self):
+        # Map and expose signals from the embedded ServerConnector so external
+        # code can connect to them via StatusBar.
         self.network_scan_requested = self.server_connector.network_scan_requested
-        # Expose server connection request signal for external wiring
+
+        # Cancel / control signals
+        self.network_scan_cancel_requested = (
+            self.server_connector.network_scan_cancel_requested
+        )
         self.server_connection_requested = (
             self.server_connector.server_connection_requested
         )
-        # Expose discover devices request
-        self.server_discover_requested = self.server_connector.discover_devices_requested
-        self.update_server_connection_status = (
-            self.server_connector.update_connection_status
+        self.server_disconnection_requested = (
+            self.server_connector.server_disconnection_requested
         )
 
+        # Device discovery request
+        self.server_discover_requested = self.server_connector.discover_devices_requested
+
+        # Centralized server status change requests from the connector
+        # are forwarded to the StatusBar.set_server_status method so that
+        # all button state updates remain in one place.
+        with contextlib.suppress(Exception):
+            self.server_connector.server_status_change_requested.connect(
+                lambda status: self.set_server_status(status)
+            )
+
+        # Expose device update helper from the panel
         self.update_device_state = self.device_status_panel.update_device_state
+
+    def set_server_status(self, status: ClientStatus):
+        """Centralize server-related UI updates based on ClientStatus."""
+        try:
+            if status == ClientStatus.SERVER_CONNECTED:
+                self.server_connector.connection_label.setText("Status: Connected")
+                self.server_connector.connection_label.setStyleSheet(
+                    f"color: {get_qcolor('green').name()}"
+                )
+                self.server_connector.connect_btn.setEnabled(False)
+                self.server_connector.disconnect_btn.setEnabled(True)
+                self.server_connector.discover_btn.setEnabled(True)
+
+            elif status == ClientStatus.SERVER_DISCONNECTED:
+                self.server_connector.connection_label.setText("Status: Disconnected")
+                self.server_connector.connection_label.setStyleSheet(
+                    f"color: {get_qcolor('red').name()}"
+                )
+                # Enable connect only if dropdown has items
+                has_choices = self.server_connector.server_dropdown.count() > 0
+                self.server_connector.connect_btn.setEnabled(has_choices)
+                self.server_connector.disconnect_btn.setEnabled(False)
+                self.server_connector.discover_btn.setEnabled(False)
+
+            else:
+                # Default/other server states: set neutral text and allow connect if choices
+                self.server_connector.connection_label.setText("Status: Idle")
+                self.server_connector.connection_label.setStyleSheet(
+                    f"color: {get_qcolor('orange').name()}"
+                )
+                has_choices = self.server_connector.server_dropdown.count() > 0
+                self.server_connector.connect_btn.setEnabled(has_choices)
+                self.server_connector.disconnect_btn.setEnabled(False)
+        except Exception:
+            # Best-effort: avoid UI exceptions
+            pass
 
     def _forward_callbacks(self):
         self.on_scan_complete = self.server_connector.on_scan_complete

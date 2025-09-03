@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Dict, List
 
 from bioview_common import Configuration, DataSource, DeviceStatus
+from bioview_common.protocol.status import ClientStatus
 from PyQt6.QtGui import QGuiApplication, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
@@ -271,14 +272,30 @@ class BioViewMonitor(QMainWindow):
         if self.client_worker is None:
             self._setup_client()
 
-        # App Bar
+        # Defer to smaller helpers to reduce cognitive complexity for linters
+        self._connect_command_bar_signals()
+        self._connect_settings_panel_signals()
+        self._connect_plot_grid_signals()
+        self._connect_statusbar_signals()
+
+    def _handle_server_connection_request(self, server_info: dict):
+        """Handle server connect requests from the UI"""
+        if not server_info:
+            return
+        # Set selected server on client worker and ask it to connect
+        if self.client_worker:
+            self.client_worker.selected_server = server_info
+            self.client_worker.connect_to_server()
+
+    # --- Extracted signal connection helpers (keeps _connect_signals small) ---
+    def _connect_command_bar_signals(self):
         self.command_bar.connect_devices.connect(self.on_device_connection_requested)
         self.command_bar.start_streaming.connect(self.client_worker.start_streaming)
         self.command_bar.stop_streaming.connect(self.client_worker.stop_streaming)
         self.command_bar.enable_data_saving.connect(self.update_save_state)
         self.command_bar.enable_instructions.connect(self.toggle_instructions)
 
-        # Settings Panel
+    def _connect_settings_panel_signals(self):
         if getattr(self.settings_panel, "display_duration_changed", None):
             self.settings_panel.display_duration_changed.connect(
                 self.handle_time_window_change
@@ -292,49 +309,60 @@ class BioViewMonitor(QMainWindow):
         if getattr(self.settings_panel, "remove_data_source", None):
             self.settings_panel.remove_data_source.connect(self.remove_plot_source)
 
+        # logging hookup
         self.settings_panel.log_event.connect(self.log_display_panel.log_message)
 
-        # Annotate Event Panel
-
-        # Plot Grid
+    def _connect_plot_grid_signals(self):
         self.plot_grid.log_event.connect(self.log_display_panel.log_message)
 
-        # Status Bar
+    def _connect_statusbar_signals(self):
+        # Discovery/start scan
         self.status_bar.network_scan_requested.connect(
             self.client_worker.discover_servers
         )
-        # Wire status bar discover devices button to client handler
+
+        # Cancel scan (best-effort)
+        if getattr(self.status_bar, "network_scan_cancel_requested", None):
+            with contextlib.suppress(Exception):
+                self.status_bar.network_scan_cancel_requested.connect(
+                    self.client_worker.cancel_scan
+                )
+
+        # Discover devices
         if getattr(self.status_bar, "server_discover_requested", None):
             self.status_bar.server_discover_requested.connect(
                 self.client_worker.discover_devices
             )
 
-        # Forward UI server connect requests to client's request_connect slot (runs in client thread)
+        # Disconnect request: try direct slot, fallback to request_disconnect if available
+        if getattr(self.status_bar, "server_disconnection_requested", None):
+            with contextlib.suppress(Exception):
+                self.status_bar.server_disconnection_requested.connect(
+                    self.client_worker.disconnect_from_server
+                )
+            # fallback
+            with contextlib.suppress(Exception):
+                if hasattr(self.client_worker, "request_disconnect"):
+                    self.status_bar.server_disconnection_requested.connect(
+                        self.client_worker.request_disconnect
+                    )
+
+        # Server connection requests: prefer client's request_connect slot when present
         if getattr(self.status_bar, "server_connection_requested", None):
-            # Connect to the client's slot that runs in the client's thread
-            try:
-                # ensure the client has a request_connect slot
-                if hasattr(self.client_worker, "request_connect"):
+            if hasattr(self.client_worker, "request_connect"):
+                try:
                     self.status_bar.server_connection_requested.connect(
                         self.client_worker.request_connect
                     )
-                else:
+                except Exception:
+                    # fallback to local handler if connecting to client's slot fails
                     self.status_bar.server_connection_requested.connect(
                         self._handle_server_connection_request
                     )
-            except Exception:
+            else:
                 self.status_bar.server_connection_requested.connect(
                     self._handle_server_connection_request
                 )
-
-    def _handle_server_connection_request(self, server_info: dict):
-        """Handle server connect requests from the UI"""
-        if not server_info:
-            return
-        # Set selected server on client worker and ask it to connect
-        if self.client_worker:
-            self.client_worker.selected_server = server_info
-            self.client_worker.connect_to_server()
 
     def _handle_devices_discovered(self, devices_map: dict):
         """Update status bar device panel when client reports discovered devices."""
@@ -403,20 +431,44 @@ class BioViewMonitor(QMainWindow):
         """Handle server connection"""
         # connected is a boolean emitted by client_worker.server_connected
         if connected:
-            self.status_bar.update_server_connection_status("Connected")
+            # Centralize UI updates via ServerStatus
             self.log_display_panel.log_message("info", "Connected to server")
+
+            try:
+                self.status_bar.set_server_status(ClientStatus.SERVER_CONNECTED)
+            except Exception:
+                self.log_display_panel.log_message(
+                    "warning", "Unable to update status bar"
+                )
+                self.status_bar.set_server_status(ClientStatus.SERVER_CONNECTED)
+
             # Auto-ping
             if self.client_worker:
                 self.client_worker.ping_server()
+
+            # Ensure UI buttons reflect connected state (defensive)
+            with contextlib.suppress(Exception):
+                # still ensure discover button enabled
+                self.status_bar.server_connector.discover_btn.setEnabled(True)
+
         else:
-            self.status_bar.update_server_connection_status("Disconnected")
+            try:
+                self.status_bar.set_server_status(ClientStatus.SERVER_DISCONNECTED)
+            except Exception:
+                self.log_display_panel.log_message(
+                    "warning", "Unable to update status bar"
+                )
+
             self.log_display_panel.log_message("warning", "Failed to connect to server")
 
         # TODO: Populate display sources by querying server
 
     def on_server_disconnected(self):
         """Handle server disconnection"""
-        self.status_bar.update_server_connection_status(False)
+        try:
+            self.status_bar.set_server_status(ClientStatus.SERVER_DISCONNECTED)
+        except Exception:
+            self.log_display_panel.log_message("warning", "Unable to update status bar")
         self.log_display_panel.log_message("warning", "Disconnected from server")
 
     def on_device_connected(self, device_id):
