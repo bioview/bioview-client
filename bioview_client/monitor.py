@@ -3,13 +3,16 @@ BioView Monitor can be launched via CLI, with/without configuration JSONs pre-sp
 In case no valid configuration files are found, the app will prompt the user to provide configuration JSONs.
 Regardless on any configurations, the UI will load with appropriate components/default values
 """
+import argparse
+import contextlib
+import json
 import logging  # TODO: Remove
 import queue
 import sys
 from pathlib import Path
 from typing import Dict, List
 
-from bioview_common import DataSource, DeviceStatus
+from bioview_common import Configuration, DataSource, DeviceStatus
 from PyQt6.QtGui import QGuiApplication, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
@@ -39,28 +42,20 @@ class BioViewMonitor(QMainWindow):
         self,
         device_config: List[Dict] = None,
         common_config: Dict = None,
+        autodiscover: bool = True,
+        autoconnect: bool = False,
     ):
         super().__init__()
+        # Persist CLI/UI flags
+        self.autodiscover = autodiscover
+        self.autoconnect = autoconnect
 
-        # Check for valid configuration files provided and, if None, ask user to add
-        if not common_config or not device_config:
-            dialog = ConfigurationPrompt()
-            configurations = None
-
-            if dialog.exec() == QDialog.DialogCode.Accepted:
-                configurations = dialog.get_configurations()
-
-            if configurations:
-                common_config = configurations.get("common", None)
-                device_config = configurations.get("devicez", None)
-            else:
-                # Generate a default common configuration
-                common_config = DEFAULT_COMMON_CONFIGURATION
-                device_config = {}
-
-        # Store configurations
-        self.common_config = common_config
-        self.device_config = device_config
+        # Resolve initial configurations (possibly from dialog) and convert them
+        common_cfg, device_cfgs = self._resolve_initial_configs(
+            common_config, device_config
+        )
+        self.common_config = self._convert_common_config(common_cfg)
+        self.device_config = self._convert_device_configs(device_cfgs)
 
         # Store device names and states - since that's all the UI needs
         self.devices = {}
@@ -159,6 +154,79 @@ class BioViewMonitor(QMainWindow):
         # Status Bar
         self.status_bar = StatusBar(self)
         self.setStatusBar(self.status_bar)
+
+    # --- Configuration helpers (extracted to reduce __init__ complexity) ---
+    def _resolve_initial_configs(self, common_config, device_config):
+        """Return tuple (common_cfg, device_cfgs) after possibly prompting user."""
+        if not common_config or not device_config:
+            dialog = ConfigurationPrompt()
+            configurations = None
+
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                configurations = dialog.get_configurations()
+
+            if configurations:
+                common_cfg = configurations.get("common", None)
+                device_cfgs = configurations.get("devices", None)
+            else:
+                common_cfg = DEFAULT_COMMON_CONFIGURATION
+                device_cfgs = {}
+        else:
+            common_cfg = common_config
+            device_cfgs = device_config
+
+        return common_cfg, device_cfgs
+
+    def _convert_common_config(self, common_cfg):
+        """Convert common config dict into a Configuration when possible."""
+        if isinstance(common_cfg, Configuration):
+            return common_cfg
+        if isinstance(common_cfg, dict):
+            try:
+                return Configuration.from_dict(common_cfg)
+            except Exception:
+                return common_cfg
+        return common_cfg
+
+    def _convert_device_configs(self, device_cfgs):
+        """Normalize device configs into list/dict with Configuration objects where possible."""
+        if isinstance(device_cfgs, list):
+            return self._convert_device_list(device_cfgs)
+
+        if isinstance(device_cfgs, dict):
+            return self._convert_device_dict(device_cfgs)
+
+        return device_cfgs
+
+    def _convert_device_item(self, item):
+        """Convert a single device config item into a Configuration when possible."""
+        if isinstance(item, Configuration):
+            return item
+        if isinstance(item, dict):
+            try:
+                return Configuration.from_dict(item)
+            except Exception:
+                return item
+        return item
+
+    def _convert_device_list(self, lst):
+        """Convert a list of device configs."""
+        converted = []
+        for item in lst:
+            converted.append(self._convert_device_item(item))
+        return converted
+
+    def _convert_device_dict(self, dct):
+        """Convert a dict of device configs where values may be dict/list/Configuration."""
+        converted = {}
+        for k, v in dct.items():
+            if isinstance(v, list):
+                converted[k] = self._convert_device_list(v)
+            elif isinstance(v, dict):
+                converted[k] = self._convert_device_item(v)
+            else:
+                converted[k] = v
+        return converted
 
     def _setup_client(self):
         """Connect to client"""
@@ -394,12 +462,119 @@ class BioViewMonitor(QMainWindow):
 if __name__ == "__main__":
     import qdarktheme  # Provide consistent styling across all OSes
 
+    def _load_json_files(file_list):
+        configs = []
+        for p in file_list or []:
+            try:
+                with open(p, encoding="utf-8") as f:
+                    configs.append(json.load(f))
+            except Exception:
+                # skip invalid files
+                continue
+        return configs
+
+    parser = argparse.ArgumentParser(description="Launch BioView Monitor UI")
+    parser.add_argument(
+        "--devices",
+        nargs="*",
+        help="List of device configuration JSON files",
+        default=None,
+    )
+    parser.add_argument(
+        "--common",
+        help="Common configuration JSON file",
+        default=None,
+    )
+    parser.add_argument(
+        "--autodiscover",
+        dest="autodiscover",
+        action="store_true",
+        help="Automatically discover servers on start (default)",
+    )
+    parser.add_argument(
+        "--no-autodiscover",
+        dest="autodiscover",
+        action="store_false",
+        help="Do not automatically discover servers on start",
+    )
+    parser.set_defaults(autodiscover=True)
+
+    parser.add_argument(
+        "--autoconnect",
+        dest="autoconnect",
+        action="store_true",
+        help="Automatically connect to first discovered server",
+    )
+
+    args = parser.parse_args()
+
+    # Load JSONs
+    device_configs_raw = None
+    common_config_raw = None
+
+    if args.devices:
+        loaded = _load_json_files(args.devices)
+        # If only one file and it contains a dict mapping ids->configs, use it
+        if len(loaded) == 1 and isinstance(loaded[0], dict):
+            device_configs_raw = loaded[0]
+        else:
+            device_configs_raw = loaded
+
+    if args.common:
+        try:
+            with open(args.common, encoding="utf-8") as f:
+                common_config_raw = json.load(f)
+        except Exception:
+            common_config_raw = None
+
     qdarktheme.enable_hi_dpi()
     app = QApplication(sys.argv)
     qdarktheme.setup_theme(theme="auto")
 
-    # Create and show main window
-    window = BioViewMonitor()
+    # Create and show main window with parsed configs and flags
+    window = BioViewMonitor(
+        device_config=device_configs_raw,
+        common_config=common_config_raw,
+        autodiscover=args.autodiscover,
+        autoconnect=args.autoconnect,
+    )
     window.show()
+
+    # Optionally trigger autodiscover. If autoconnect is requested, only attempt
+    # connection after the scan completes (one-time handler).
+    if window.autodiscover and window.client_worker:
+        try:
+            if window.autoconnect:
+
+                def _on_scan_complete(servers):
+                    try:
+                        # servers is a list of discovered server info dicts. If any found,
+                        # pick the first and set it as the selected server so
+                        # connect_to_server() will not re-run discovery.
+                        if servers and isinstance(servers, list) and len(servers) > 0:
+                            with contextlib.suppress(Exception):
+                                window.client_worker.selected_server = servers[0]
+
+                        # attempt connect once (will skip discovery if selected_server set)
+                        with contextlib.suppress(Exception):
+                            window.client_worker.connect_to_server()
+
+                    finally:
+                        # disconnect this handler to avoid repeated attempts
+                        with contextlib.suppress(Exception):
+                            window.client_worker.server_scan_completed.disconnect(
+                                _on_scan_complete
+                            )
+
+                window.client_worker.server_scan_completed.connect(_on_scan_complete)
+
+            window.client_worker.discover_servers()
+        except Exception:
+            pass
+    elif window.autoconnect and window.client_worker:
+        # If autodiscover is disabled but autoconnect requested, attempt connect
+        # directly (this will perform an internal discover if needed).
+        with contextlib.suppress(Exception):
+            window.client_worker.connect_to_server()
 
     sys.exit(app.exec())
