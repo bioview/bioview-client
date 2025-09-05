@@ -1,8 +1,9 @@
+import contextlib
 import json
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict
 
-from bioview_common import APP_VERSION, Configuration
+from bioview_common import APP_VERSION
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QDialog,
@@ -18,6 +19,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
+from bioview_client.utils import is_dict_of_dicts, load_json_file
+
 
 class ConfigurationPrompt(QDialog):
     """
@@ -25,15 +28,19 @@ class ConfigurationPrompt(QDialog):
     """
 
     def __init__(
-        self, common_config: Dict = None, device_configs: List[Dict] = None, parent=None
+        self,
+        common_config: Dict = None,
+        group_configs: Dict[str, Dict] = None,
+        parent=None,
     ):
         super().__init__(parent)
         self.common_config = common_config
 
-        if device_configs is None:
-            self.device_configs = []
+        # Canonical internal representation: dict[group_id] -> dict[device_id] -> config
+        if is_dict_of_dicts(group_configs):
+            self.group_configs = group_configs
         else:
-            self.device_configs = device_configs
+            self.group_configs = {}
 
         self.setup_ui()
         self.populate_device_list()
@@ -99,14 +106,14 @@ class ConfigurationPrompt(QDialog):
         device_controls_layout.addWidget(QLabel("Device Configurations:"))
         device_controls_layout.addStretch()
 
-        self.add_device_btn = QPushButton("Add Device Config")
-        self.add_device_btn.clicked.connect(self.add_device_config)
-        device_controls_layout.addWidget(self.add_device_btn)
+        self.add_device_group_btn = QPushButton("Add Device Config")
+        self.add_device_group_btn.clicked.connect(self.add_device_group_config)
+        device_controls_layout.addWidget(self.add_device_group_btn)
 
-        self.remove_device_btn = QPushButton("Remove Selected")
-        self.remove_device_btn.clicked.connect(self.remove_device_config)
-        self.remove_device_btn.setEnabled(False)
-        device_controls_layout.addWidget(self.remove_device_btn)
+        self.remove_device_group_btn = QPushButton("Remove Selected")
+        self.remove_device_group_btn.clicked.connect(self.remove_device_group_config)
+        self.remove_device_group_btn.setEnabled(False)
+        device_controls_layout.addWidget(self.remove_device_group_btn)
 
         device_layout.addLayout(device_controls_layout)
 
@@ -149,74 +156,83 @@ class ConfigurationPrompt(QDialog):
         """Populate the device list with existing device configs."""
         self.device_list.clear()
 
-        if self.device_configs is None:
+        if not self.group_configs or self.group_configs == {}:
             return
 
-        for index, device_config in enumerate(self.device_configs):
-            # Try to get a meaningful name for the device
-            device_name = self.get_device_display_name(device_config, index)
+        # Flatten groups and devices into the list. Store (group_id, device_id) as item data
+        for group_id, group_dict in self.group_configs.items():
+            # Ensure group_dict is a dict
+            if not isinstance(group_dict, dict):
+                group_dict = {"device_0": group_dict}
+                self.group_configs[group_id] = group_dict
 
-            item = QListWidgetItem(device_name)
-            item.setData(Qt.ItemDataRole.UserRole, index)
-            self.device_list.addItem(item)
+            for device_id, device_config in group_dict.items():
+                device_name = self.get_device_display_name(device_config)
+                display_label = f"{group_id}/{device_id} - {device_name}"
+                item = QListWidgetItem(display_label)
+                item.setData(Qt.ItemDataRole.UserRole, (group_id, device_id))
+                self.device_list.addItem(item)
 
-    def get_device_display_name(self, device_config, index):
+    def get_device_display_name(self, device_config):
         """Get a display name for the device config."""
         # Try common fields that might contain a name
-        name_fields = ["name", "device_name", "id", "device_id", "type", "device_type"]
+        name_fields = ["device_name", "name", "id", "device_id", "type", "device_type"]
 
         for field in name_fields:
             if field in device_config and device_config[field]:
                 return str(device_config[field])
 
-        # Fallback to index-based name
-        return f"Device {index + 1}"
+        return "Device"
 
     def format_device_preview(self, device_config):
-        """Format device configuration for preview, showing only valid fields.
-
-        Override this method to use your wrapper object for proper formatting.
         """
-        # Default implementation - you can replace this with your wrapper object logic
-
-        # Define common valid fields for different device types
+        Format device configuration for preview, showing only valid fields.
+        """
+        # device_type: fields
         valid_fields = {
-            "common": ["name", "type", "id", "enabled", "description"],
-            "sensor": ["sensor_type", "port", "baudrate", "sampling_rate", "units"],
-            "camera": ["resolution", "fps", "exposure", "gain", "format"],
-            "actuator": ["actuator_type", "range", "precision", "speed"],
-            "controller": ["protocol", "address", "timeout", "parameters"],
+            "usrp": {
+                "name": "Device Name",
+                "type": "Device Type",
+                "samp_rate": "Sampling Rate (Hz)",
+                "if_freq": "IF Frequency (Hz)",
+                "tx_gain": "Tx Gains (dB)",
+                "rx_gain": "Rx Gains (dB)",
+            },
+            "biopac": {
+                "name": "Device Name",
+                "type": "Device Type",
+                "samp_rate": "Sampling Rate (Hz)",
+                "channels": "Channels",
+            },
         }
 
         # Try to determine device type
-        device_type = device_config.get(
-            "type", device_config.get("device_type", "common")
-        )
+        device_type = device_config.get("device_type", "undefined")
 
-        # Get relevant valid fields
-        relevant_fields = valid_fields.get("common", [])
-        if device_type in valid_fields:
-            relevant_fields.extend(valid_fields[device_type])
+        if device_type not in valid_fields:
+            # Just return the dictionary
+            return device_config
 
+        # Else, show in a pretty format
         # Format the preview
         formatted_lines = []
-        formatted_lines.append(f"Device Type: {device_type}")
         formatted_lines.append("-" * 30)
 
-        # Show only valid fields that exist in the config
-        for field in relevant_fields:
+        # Pretty format supported fields
+        relevant_fields = valid_fields[device_type]
+        for field in relevant_fields:  # All keys
             if field in device_config:
                 value = device_config[field]
                 if isinstance(value, (dict, list)):
                     value_str = json.dumps(value, indent=2)
                 else:
                     value_str = str(value)
-                formatted_lines.append(f"{field.replace('_', ' ').title()}: {value_str}")
+                formatted_lines.append(f"{relevant_fields[field]}: {value_str}")
 
         # Show any additional fields that weren't in the valid list
         other_fields = [k for k in device_config if k not in relevant_fields]
         if other_fields:
-            formatted_lines.append("\nOther Fields:")
+            formatted_lines.append("\nOther Parameters:")
             formatted_lines.append("-" * 15)
             for field in other_fields:
                 value = device_config[field]
@@ -234,24 +250,20 @@ class ConfigurationPrompt(QDialog):
             self, "Upload Common Configuration", "", "JSON Files (*.json);;All Files (*)"
         )
 
-        if file_path:
-            try:
-                with open(file_path, encoding="utf-8") as f:
-                    config_data = json.load(f)
+        if not file_path:
+            raise ValueError("No file selected")
 
-                self.common_config = config_data
-                self.update_common_preview()
-                self.common_status_label.setText(f"Loaded: {Path(file_path).name}")
-                self.common_status_label.setStyleSheet("color: green;")
-                self.clear_common_btn.setEnabled(True)
-
-            except (json.JSONDecodeError, FileNotFoundError, PermissionError) as e:
-                QMessageBox.critical(
-                    self, "Error", f"Failed to load common configuration:\n{str(e)}"
-                )
-
-        """ Format successfully loaded common configuration with the appropriate object handler to ensure functionality
-        """
+        try:
+            # Load dict
+            self.common_config = load_json_file(file_path)
+        except ValueError as e:
+            QMessageBox.critical(
+                self, "Error", f"Failed to load common configuration:\n{str(e)}"
+            )
+        self.update_common_preview()
+        self.common_status_label.setText(f"Loaded: {Path(file_path).name}")
+        self.common_status_label.setStyleSheet("color: green;")
+        self.clear_common_btn.setEnabled(True)
 
     def clear_common_config(self):
         """Clear common configuration."""
@@ -272,64 +284,93 @@ class ConfigurationPrompt(QDialog):
         else:
             self.common_preview.clear()
 
-    def add_device_config(self):
-        """Add a new device configuration."""
+    def add_device_group_config(self):
+        """Add a new device group configuration."""
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Add Device Configuration", "", "JSON Files (*.json);;All Files (*)"
+            self,
+            "Add Device Group Configuration",
+            "",
+            "JSON Files (*.json);;All Files (*)",
         )
 
-        if file_path:
-            try:
-                with open(file_path, encoding="utf-8") as f:
-                    config_data = json.load(f)
+        if not file_path:
+            raise ValueError("No file selected")
 
-                # Add the config dict directly to the list
-                self.device_configs.append(config_data)
+        try:
+            group_cfg = load_json_file(file_path)
 
-                # Add to list widget
-                device_name = self.get_device_display_name(
-                    config_data, len(self.device_configs) - 1
-                )
-                item = QListWidgetItem(device_name)
-                item.setData(Qt.ItemDataRole.UserRole, len(self.device_configs) - 1)
-                self.device_list.addItem(item)
+            # Since a group name won't be provided by default, use filename stem
+            # as base group id and ensure uniqueness
+            stem = Path(file_path).stem or "group"
+            group_id = stem
+            suffix = 1
+            while group_id in self.group_configs:
+                group_id = f"{stem}_{suffix}"
+                suffix += 1
 
-                # Select the newly added item
-                self.device_list.setCurrentItem(item)
-
-            except (json.JSONDecodeError, FileNotFoundError, PermissionError) as e:
-                QMessageBox.critical(
-                    self, "Error", f"Failed to load device configuration:\n{str(e)}"
+            # Ensure that group_cfg is dict_of_dicts
+            if not is_dict_of_dicts(group_cfg):
+                raise ValueError(
+                    "Specified device group configuration must be a dict of dict"
                 )
 
-    def remove_device_config(self):
-        """Remove selected device configuration."""
-        current_item = self.device_list.currentItem()
-        if current_item:
-            device_index = current_item.data(Qt.ItemDataRole.UserRole)
+            self.group_configs[group_id] = group_cfg
 
-            # Remove from list
-            self.device_configs.pop(device_index)
-            self.device_list.takeItem(self.device_list.row(current_item))
-
-            # Update indices for remaining items
+            # Refresh list and select first item in new group
+            self.populate_device_list()
             for i in range(self.device_list.count()):
                 item = self.device_list.item(i)
-                current_index = item.data(Qt.ItemDataRole.UserRole)
-                if current_index > device_index:
-                    item.setData(Qt.ItemDataRole.UserRole, current_index - 1)
+                data = item.data(Qt.ItemDataRole.UserRole)
+                if isinstance(data, tuple) and data[0] == group_id:
+                    self.device_list.setCurrentItem(item)
+                    break
 
-            # Clear preview if no items left
-            if self.device_list.count() == 0:
-                self.device_preview.clear()
-                self.remove_device_btn.setEnabled(False)
+        except (
+            json.JSONDecodeError,
+            FileNotFoundError,
+            PermissionError,
+            ValueError,
+        ) as e:
+            QMessageBox.critical(
+                self, "Error", f"Failed to load device configuration:\n{str(e)}"
+            )
+
+    def remove_device_group_config(self):
+        """Remove selected device group configuration."""
+        current_item = self.device_list.currentItem()
+
+        if current_item is None:
+            return
+
+        data = current_item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(data, tuple) or len(data) != 2:
+            return
+
+        group_id, _ = data
+
+        # For now, we remove the entire group.
+        # FUTURE: We may want to let individual device configs be changed through UI.
+        with contextlib.suppress(Exception):
+            del self.group_configs[group_id]
+
+        # Refresh list
+        self.populate_device_list()
+
+        # Clear preview if no items left
+        if self.device_list.count() == 0:
+            self.device_preview.clear()
+            self.remove_device_group_btn.setEnabled(False)
 
     def on_device_selection_changed(self):
         """Handle device selection change."""
         current_item = self.device_list.currentItem()
         if current_item:
-            device_index = current_item.data(Qt.ItemDataRole.UserRole)
-            device_config = self.device_configs[device_index]
+            data = current_item.data(Qt.ItemDataRole.UserRole)
+            if not isinstance(data, tuple) or len(data) != 2:
+                self.device_preview.clear()
+                return
+            group_id, device_id = data
+            device_config = self.group_configs.get(group_id, {}).get(device_id, {})
 
             # Use the formatted preview instead of raw JSON
             preview_text = self.format_device_preview(device_config)
@@ -339,32 +380,23 @@ class ConfigurationPrompt(QDialog):
                 preview_text = preview_text[:1000] + "\n... (truncated)"
 
             self.device_preview.setPlainText(preview_text)
-            self.remove_device_btn.setEnabled(True)
+            self.remove_device_group_btn.setEnabled(True)
         else:
             self.device_preview.clear()
-            self.remove_device_btn.setEnabled(False)
+            self.remove_device_group_btn.setEnabled(False)
 
     def get_configurations(self):
         """
         Since all configurations will be passed to UI from this function,
         we can delegate the task of wrapping in here
         """
-
         result = {}
 
         if self.common_config:
-            try:
-                import logging
+            result["common"] = self.common_config
 
-                logger = logging.getLogger(__name__)
-                logger.debug("common_config type: %s", type(self.common_config))
-            except Exception:
-                pass
-            result["common"] = Configuration.from_dict(self.common_config)
-
-        if self.device_configs:
-            result["devices"] = [
-                Configuration.from_dict(device_cfg) for device_cfg in self.device_configs
-            ]
+        if self.group_configs:
+            # Monitor expects device groups under key 'groups'
+            result["groups"] = self.group_configs
 
         return result

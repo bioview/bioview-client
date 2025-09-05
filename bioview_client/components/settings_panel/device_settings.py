@@ -19,9 +19,11 @@ class DeviceSettingsPanel(QGroupBox):
     log_event = pyqtSignal(str, str)
 
     def __init__(self, device_configuration: Configuration, parent=None):
-        super().__init__("Device Settings", parent)
+        super().__init__(
+            f"{device_configuration.get_param("device_name", "Device")} Settings", parent
+        )
 
-        self.device_name = device_configuration.get_param("device_name", "dummy_device")
+        self.device_name = device_configuration.get_param("device_name", "Device")
         self.device_configuration = device_configuration
 
         self.init_ui()

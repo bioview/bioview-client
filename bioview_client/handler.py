@@ -35,7 +35,6 @@ from bioview_common import (
     AuthenticationError,
     ClientStatus,
     Command,
-    Configuration,
     DataSource,
     DeviceStatus,
     Response,
@@ -44,7 +43,7 @@ from bioview_common import (
 )
 from PyQt6.QtCore import QObject, QRunnable, QThread, QThreadPool, pyqtSignal, pyqtSlot
 
-from bioview_client.utils import parse_and_validate_response
+from bioview_client.utils import is_dict_of_dicts, parse_and_validate_response
 
 
 class ScanWorkerSignals(QObject):
@@ -115,10 +114,15 @@ class DeviceDiscoverWorker(QRunnable):
             # Device discovery can be slow on server side; use a longer timeout and
             # do not disconnect the control socket on timeout so the client remains connected.
             response = self.client_ref.send_control_command(
-                Command.DISCOVER_DEVICES, timeout=30.0, disconnect_on_error=False
+                Command.DISCOVER_DEVICES,
+                params={
+                    "config": self.client_ref.common_config or {},
+                    "groups": self.client_ref.group_configs or {},
+                },
+                timeout=30.0,
+                disconnect_on_error=False,
             )
-            if response and response.get("type") == "success":
-                # Server responses use the structure {"type": str, "payload": { ... }}
+            if response and response.get("type") == Response.SUCCESS.value:
                 payload = (
                     response.get("payload", {}) if isinstance(response, dict) else {}
                 )
@@ -144,6 +148,8 @@ class Client(QThread):
     # Device control signals
     device_connected = pyqtSignal(str, bool)
     device_disconnected = pyqtSignal(str, bool)
+    # Emitted when a device connection attempt fails; provides device_id
+    device_connection_failed = pyqtSignal(str)
     streaming_started = pyqtSignal(bool)
     streaming_stopped = pyqtSignal(bool)
 
@@ -161,8 +167,8 @@ class Client(QThread):
 
     def __init__(
         self,
-        common_config: Configuration = None,
-        device_config: List[Dict] = None,
+        common_config: Dict = None,
+        group_configs: Dict = None,
         data_port: int = DATA_PORT,
         control_port: int = CONTROL_PORT,
         auth_timeout: int = AUTH_TIMEOUT,
@@ -212,11 +218,21 @@ class Client(QThread):
         # Running state for the QThread
         self.running = False
 
-        self.device_config = device_config
-        self.device_status = {}
-        if device_config and isinstance(device_config, dict):
-            for device_id, device_cfg in device_config.items():
-                self.device_status[device_id] = {
+        # Keep track of common configuration
+        self.common_config = common_config or {}
+
+        # Keep track of device configuration and states
+        self.group_configs = group_configs or {}
+        # Now, while we understand devices in the form of groups, we keep track of
+        # states for individual devices for clearer presentation in the UI
+        self.device_states = {}
+        for group_id, group_dict in group_configs.items():
+            self.device_states[group_id] = {}
+
+            for device_id, device_cfg in group_dict.items():
+                self.device_states[group_id][device_id] = {
+                    "group": group_id,
+                    "id": device_id,
                     "config": device_cfg,
                     "state": DeviceStatus.DISCONNECTED,
                 }
@@ -257,9 +273,13 @@ class Client(QThread):
             server_info = (
                 payload.get("server_info", {}) if isinstance(payload, dict) else {}
             )
+            sanitized = self._sanitize_server_info(
+                server_info, self.selected_server.get("address", "unknown")
+            )
+            # Ping success is noisy; log as debug to avoid cluttering info logs
             self.log_message.emit(
-                "info",
-                f"Server ping successful - {server_info.get('hostname', 'unknown')}",
+                "debug",
+                f"Server ping successful - {sanitized.get('hostname')}",
             )
             return True
         else:
@@ -410,7 +430,7 @@ class Client(QThread):
             )
 
             # Extract server hostname info
-            server_hostname = response_payload.get("server_hostname", server_ip)
+            server_hostname = response_payload.get("hostname", server_ip)
 
             # Check if connection was refused
             if response_type == Response.CONNECTION_REFUSED.value:
@@ -587,7 +607,16 @@ class Client(QThread):
             # Emit status
             self.status = ClientStatus.SERVER_CONNECTED
             self.server_connected.emit(True)
-
+            # After successful connect, request device discovery asynchronously
+            # so we don't block UI. Background worker will emit discovery signals.
+            try:
+                # Start background discovery (DeviceDiscoverWorker is used by discover_devices)
+                self.discover_devices()
+            except Exception:
+                # Best-effort: don't fail the connection flow if discovery cannot start
+                self.log_message.emit(
+                    "debug", "Background device discovery could not be started"
+                )
         except AuthenticationError as e:
             self.status = ClientStatus.DEFAULT
             self.log_message.emit("error", f"Authentication failed: {e}")
@@ -767,32 +796,32 @@ class Client(QThread):
         worker = DeviceDiscoverWorker(self)
 
         def _on_finished(discovered):
+            """
+            Server response for discovered groups follows the same convention as handler, i.e.
+            'group_id': {
+                'device_id': DeviceStatus
+            }
+
+            Note that the server will only return devices for groups that were requested in the
+            discovery command payload. If no groups were specified, all available devices are
+            returned, without being formatted into groups.
+            """
             try:
-                # discovered is expected to be a dict: {device_group_id: [device_dicts]}
-                raw_devices = discovered if isinstance(discovered, dict) else {}
-                # Log raw discovered devices for debugging in UI
-                self.log_message.emit("debug", f"Discovered raw devices: {raw_devices}")
-
-                # Build a devices_map containing only configured device groups
-                devices_map = {}
-                if isinstance(self.device_config, dict):
-                    configured_groups = list(self.device_config.keys())
-                elif isinstance(self.device_config, list):
-                    configured_groups = list(self.device_config)
+                if is_dict_of_dicts(discovered):
+                    # We have groups that are discovered, so we parse accordingly
+                    for group_id, device_dicts in discovered.items():
+                        for device_id, device_status in device_dicts.items():
+                            self.device_states[group_id][device_id][
+                                "state"
+                            ] = DeviceStatus(device_status)
                 else:
-                    configured_groups = []
-
-                for group in configured_groups:
-                    devices_map[group] = raw_devices.get(group, [])
-
-                # Emit the filtered map for the UI status panel, and raw results for debugging
-                self.devices_discovered.emit(devices_map)
-                self.device_discovery_finished.emit(raw_devices)
-                self.log_message.emit(
-                    "info",
-                    f"Found {sum(len(v) for v in raw_devices.values()) if raw_devices else 0} devices",
-                )
+                    # Log all discovered devices for debugging in UI
+                    self.log_message.emit(
+                        "info", f"No devices specified. Available devices: {discovered}"
+                    )
             finally:
+                # Emit discovery finished signal with current device states
+                self.devices_discovered.emit(self.device_states)
                 self._discovering_devices = False
 
         worker.signals.finished.connect(_on_finished)
@@ -806,7 +835,7 @@ class Client(QThread):
             )
             return False
         self.log_message.emit("info", "Connecting...")
-        response = self.send_control_command(Command.CONNECT, {"id": device_id})
+        response = self.send_control_command(Command.CONNECT_DEVICES, {"id": device_id})
 
         if response and response.get("type") == Response.SUCCESS.value:
             self.log_message.emit("info", "Device connected successfully")
@@ -832,9 +861,9 @@ class Client(QThread):
         if self.status == ClientStatus.STREAMING:
             self.stop_streaming()
 
-        response = self.send_control_command(Command.DISCONNECT)
+        response = self.send_control_command(Command.DISCONNECT_DEVICES)
 
-        if response and response.get("type") == "success":
+        if response and response.get("type") == Response.SUCCESS.value:
             self.log_message.emit("info", "Device disconnected")
             self.device_disconnected.emit()
             return True
@@ -862,7 +891,7 @@ class Client(QThread):
             return False
 
         self.log_message.emit("info", "Starting data streaming...")
-        response = self.send_control_command(Command.START)
+        response = self.send_control_command(Command.START_STREAMING)
 
         if response and response.get("type") == Response.SUCCESS.value:
             # Enter streaming state; data socket will be connected by run() or here
@@ -906,7 +935,7 @@ class Client(QThread):
 
         self.log_message.emit("info", "Stopping data streaming...")
 
-        response = self.send_control_command(Command.STOP)
+        response = self.send_control_command(Command.STOP_STREAMING)
 
         # Close/cleanup data socket regardless of control response
         if self.data_socket:
@@ -943,10 +972,10 @@ class Client(QThread):
 
         self.log_message.emit("info", "Configuring device: {device_id}")
         response = self.send_control_command(
-            Command.CONFIGURE, {"id": device_id, "config": config}
+            Command.UPDATE_RUNNING_PARAMETER, {"id": device_id, "config": config}
         )
 
-        if response and response.get("type") == "success":
+        if response and response.get("type") == Response.SUCCESS.value:
             self.log_message.emit("info", "Device configured successfully")
             return True
         else:

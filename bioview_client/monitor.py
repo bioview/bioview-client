@@ -5,7 +5,6 @@ Regardless on any configurations, the UI will load with appropriate components/d
 """
 import argparse
 import contextlib
-import json
 import logging  # TODO: Remove
 import queue
 import sys
@@ -36,12 +35,33 @@ from bioview_client.components import (
 )
 from bioview_client.constants import DEFAULT_COMMON_CONFIGURATION
 from bioview_client.handler import Client
+from bioview_client.utils import is_dict_of_dicts, load_json_file
 
 
 class BioViewMonitor(QMainWindow):
+    """'
+    The main UI can be launched with or without CL arguments.
+
+    Inputs -
+    group_configs: List[Dict] or Dict
+        A list of device group configurations. Each element in the list pertains to one
+        device group (dictionary). Key-value pairs in the device group correspond to
+        device ID and device configurations respectively. If None, the application will
+        prompt the user for configurations via a dialog.
+    common_config: Dict
+        A dictionary containing common configuration parameters. If None, the application
+        will prompt the user for configurations via a dialog.
+    autodiscover: bool
+        If True, the application will automatically scan for available servers on startup.
+        Default is True.
+    autoconnect: bool
+        If True, the application will attempt to connect to the first discovered server
+        after autodiscovery. Default is False.
+    """
+
     def __init__(
         self,
-        device_config: List[Dict] = None,
+        group_configs: List[Dict] = None,
         common_config: Dict = None,
         autodiscover: bool = True,
         autoconnect: bool = False,
@@ -51,12 +71,13 @@ class BioViewMonitor(QMainWindow):
         self.autodiscover = autodiscover
         self.autoconnect = autoconnect
 
-        # Resolve initial configurations (possibly from dialog) and convert them
-        common_cfg, device_cfgs = self._resolve_initial_configs(
-            common_config, device_config
+        # Check for valid configurations, else prompt user.
+        # Return in a standardized format
+        common_cfg, group_cfgs = self._resolve_initial_configs(
+            common_config, group_configs
         )
-        self.common_config = self._convert_common_config(common_cfg)
-        self.device_config = self._convert_device_configs(device_cfgs)
+        self.common_config = self._convert_dict_to_configuration(common_cfg)
+        self.group_configs = self._convert_group_configs(group_cfgs)
 
         # Store device names and states - since that's all the UI needs
         self.devices = {}
@@ -120,13 +141,7 @@ class BioViewMonitor(QMainWindow):
         self.command_bar = AppControlPanel()
         controls_layout.addWidget(self.command_bar, stretch=1)
 
-        # TODO: Make settings panel
-        # usrp_cfg = []
-        # for device_dict in self.devices.values():
-        #     if type(device_dict['config']).__name__ == 'MultiUsrpConfiguration':
-        #         usrp_cfg = device_dict["config"].get_individual_configs()
-
-        self.settings_panel = SettingsPanel(self.common_config, self.device_config)
+        self.settings_panel = SettingsPanel(self.common_config, self.group_configs)
         controls_layout.addWidget(self.settings_panel, stretch=3)
 
         top_layout.addLayout(controls_layout, stretch=3)
@@ -157,9 +172,9 @@ class BioViewMonitor(QMainWindow):
         self.setStatusBar(self.status_bar)
 
     # --- Configuration helpers (extracted to reduce __init__ complexity) ---
-    def _resolve_initial_configs(self, common_config, device_config):
+    def _resolve_initial_configs(self, common_config, group_configs):
         """Return tuple (common_cfg, device_cfgs) after possibly prompting user."""
-        if not common_config or not device_config:
+        if not common_config or not group_configs:
             dialog = ConfigurationPrompt()
             configurations = None
 
@@ -168,17 +183,17 @@ class BioViewMonitor(QMainWindow):
 
             if configurations:
                 common_cfg = configurations.get("common", None)
-                device_cfgs = configurations.get("devices", None)
+                group_cfgs = configurations.get("groups", None)
             else:
                 common_cfg = DEFAULT_COMMON_CONFIGURATION
-                device_cfgs = {}
+                group_cfgs = {}
         else:
             common_cfg = common_config
-            device_cfgs = device_config
+            group_cfgs = group_configs
 
-        return common_cfg, device_cfgs
+        return common_cfg, group_cfgs
 
-    def _convert_common_config(self, common_cfg):
+    def _convert_dict_to_configuration(self, common_cfg: Dict | Configuration):
         """Convert common config dict into a Configuration when possible."""
         if isinstance(common_cfg, Configuration):
             return common_cfg
@@ -189,52 +204,36 @@ class BioViewMonitor(QMainWindow):
                 return common_cfg
         return common_cfg
 
-    def _convert_device_configs(self, device_cfgs):
-        """Normalize device configs into list/dict with Configuration objects where possible."""
-        if isinstance(device_cfgs, list):
-            return self._convert_device_list(device_cfgs)
+    def _convert_group_configs(self, group_cfgs: Dict):
+        if not is_dict_of_dicts(group_cfgs):
+            return {}
 
-        if isinstance(device_cfgs, dict):
-            return self._convert_device_dict(device_cfgs)
+        converted: Dict[str, Dict] = {}
+        for group_id, device_dict in group_cfgs.items():
+            converted[group_id] = {}
+            for device_id, device_cfg in device_dict.items():
+                converted[group_id][device_id] = self._convert_dict_to_configuration(
+                    device_cfg
+                )
 
-        return device_cfgs
-
-    def _convert_device_item(self, item):
-        """Convert a single device config item into a Configuration when possible."""
-        if isinstance(item, Configuration):
-            return item
-        if isinstance(item, dict):
-            try:
-                return Configuration.from_dict(item)
-            except Exception:
-                return item
-        return item
-
-    def _convert_device_list(self, lst):
-        """Convert a list of device configs."""
-        converted = []
-        for item in lst:
-            converted.append(self._convert_device_item(item))
-        return converted
-
-    def _convert_device_dict(self, dct):
-        """Convert a dict of device configs where values may be dict/list/Configuration."""
-        converted = {}
-        for k, v in dct.items():
-            if isinstance(v, list):
-                converted[k] = self._convert_device_list(v)
-            elif isinstance(v, dict):
-                converted[k] = self._convert_device_item(v)
-            else:
-                converted[k] = v
         return converted
 
     def _setup_client(self):
-        """Connect to client"""
+        """Connect to client and wire UI handlers."""
+        self._create_client_worker()
+        self._connect_client_signals()
+        self.client_worker.start_client()
+        # Show declared device configs on the status bar (non-fatal)
+        self._show_declared_devices()
+
+    def _create_client_worker(self):
+        """Create the Client worker instance."""
         self.client_worker = Client(
-            common_config=self.common_config, device_config=self.device_config
+            common_config=self.common_config, group_configs=self.group_configs
         )
 
+    def _connect_client_signals(self):
+        """Connect client signals to UI handlers."""
         # Server control signals
         self.client_worker.server_scan_completed.connect(
             self.status_bar.on_scan_complete
@@ -250,6 +249,11 @@ class BioViewMonitor(QMainWindow):
         # Device control signals
         self.client_worker.device_connected.connect(self.on_device_connected)
         self.client_worker.device_disconnected.connect(self.on_device_disconnected)
+        # Notify UI when a device connection attempt fails
+        if hasattr(self.client_worker, "device_connection_failed"):
+            self.client_worker.device_connection_failed.connect(
+                self.on_device_connection_failed
+            )
         self.client_worker.streaming_started.connect(self.on_streaming_started)
         self.client_worker.streaming_stopped.connect(self.on_streaming_stopped)
 
@@ -262,8 +266,50 @@ class BioViewMonitor(QMainWindow):
         )
         self.client_worker.log_message.connect(self.log_display_panel.log_message)
 
-        # Start client
-        self.client_worker.start_client()
+    def _show_declared_devices(self):
+        """Populate the status bar with declared device configs before discovery."""
+        devices_map = self._build_devices_map_from_group_configs()
+        if devices_map:
+            self.devices = devices_map
+            if getattr(self.status_bar, "update_devices", None):
+                self.status_bar.update_devices(devices_map)
+
+    def _build_devices_map_from_group_configs(self):
+        """Return a flat devices mapping from self.group_configs suitable for StatusBar."""
+        devices_map = {}
+        if not isinstance(self.group_configs, dict):
+            return devices_map
+
+        for group_id, cfg in self.group_configs.items():
+            # cfg may be a single Configuration/dict or a list of them
+            if isinstance(cfg, list):
+                for idx, dev in enumerate(cfg):
+                    dev_name = None
+                    if isinstance(dev, Configuration):
+                        dev_name = dev.get_param("name", f"{group_id}:{idx}")
+                    elif isinstance(dev, dict):
+                        dev_name = dev.get("name", f"{group_id}:{idx}")
+                    else:
+                        dev_name = f"{group_id}:{idx}"
+                    devices_map[dev_name] = {
+                        "config": dev,
+                        "state": DeviceStatus.DISCONNECTED,
+                    }
+            else:
+                dev = cfg
+                dev_name = None
+                if isinstance(dev, Configuration):
+                    dev_name = dev.get_param("name", group_id)
+                elif isinstance(dev, dict):
+                    dev_name = dev.get("name", group_id)
+                else:
+                    dev_name = group_id
+                devices_map[dev_name] = {
+                    "config": dev,
+                    "state": DeviceStatus.DISCONNECTED,
+                }
+
+        return devices_map
 
     def _connect_signals(self):
         """
@@ -497,6 +543,20 @@ class BioViewMonitor(QMainWindow):
 
         self.update_buttons()
 
+    def on_device_connection_failed(self, device_id: str):
+        """Handle a failed device connection attempt by updating UI state."""
+        if device_id is None:
+            # If None, assume all failed
+            for did in self.devices:
+                self.devices[did]["state"] = DeviceStatus.DISCONNECTED
+                self.status_bar.update_device_state(did, DeviceStatus.DISCONNECTED)
+        else:
+            if device_id in self.devices:
+                self.devices[device_id]["state"] = DeviceStatus.DISCONNECTED
+            # Update status bar regardless
+            with contextlib.suppress(Exception):
+                self.status_bar.update_device_state(device_id, DeviceStatus.DISCONNECTED)
+
     def on_streaming_started(self):
         pass
 
@@ -518,17 +578,6 @@ class BioViewMonitor(QMainWindow):
 
 if __name__ == "__main__":
     import qdarktheme  # Provide consistent styling across all OSes
-
-    def _load_json_files(file_list):
-        configs = []
-        for p in file_list or []:
-            try:
-                with open(p, encoding="utf-8") as f:
-                    configs.append(json.load(f))
-            except Exception:
-                # skip invalid files
-                continue
-        return configs
 
     parser = argparse.ArgumentParser(description="Launch BioView Monitor UI")
     parser.add_argument(
@@ -566,23 +615,40 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Load JSONs
-    device_configs_raw = None
-    common_config_raw = None
+    cli_group_configs = {}
+    cli_common_config = {}
 
     if args.devices:
-        loaded = _load_json_files(args.devices)
-        # If only one file and it contains a dict mapping ids->configs, use it
-        if len(loaded) == 1 and isinstance(loaded[0], dict):
-            device_configs_raw = loaded[0]
-        else:
-            device_configs_raw = loaded
+        for file_path in args.devices:
+            try:
+                # Load config
+                group_cfg = load_json_file(file_path)
+                # Since a group name won't be provided by default, use filename stem
+                # as base group id and ensure uniqueness
+                stem = Path(file_path).stem or "group"
+                group_id = stem
+                suffix = 1
+
+                while group_id in cli_group_configs:
+                    group_id = f"{stem}_{suffix}"
+                    suffix += 1
+
+                # Ensure that group_cfg is dict_of_dicts
+                if not is_dict_of_dicts(group_cfg):
+                    raise ValueError(
+                        "Specified device group configuration must be a dict of dict"
+                    )
+
+                cli_group_configs[group_id] = group_cfg
+
+            except ValueError as e:
+                print(f"Invalid device group configuration in {file_path}: {e}")
 
     if args.common:
         try:
-            with open(args.common, encoding="utf-8") as f:
-                common_config_raw = json.load(f)
-        except Exception:
-            common_config_raw = None
+            cli_common_config = load_json_file(args.common)
+        except Exception as e:
+            print(f"Invalid common configuration in {args.common}: {e}")
 
     qdarktheme.enable_hi_dpi()
     app = QApplication(sys.argv)
@@ -590,8 +656,8 @@ if __name__ == "__main__":
 
     # Create and show main window with parsed configs and flags
     window = BioViewMonitor(
-        device_config=device_configs_raw,
-        common_config=common_config_raw,
+        group_configs=cli_group_configs,
+        common_config=cli_common_config,
         autodiscover=args.autodiscover,
         autoconnect=args.autoconnect,
     )

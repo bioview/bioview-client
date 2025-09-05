@@ -5,7 +5,7 @@ from typing import Dict, List
 import qtawesome as qta
 from bioview_common import DeviceStatus
 from bioview_common.protocol.status import ClientStatus
-from PyQt6.QtCore import QEvent, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPen
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from bioview_client.constants.theme import get_qcolor
+from bioview_client.constants.theme import CONNECTION_STATE_COLORS, get_qcolor
 
 
 class ServerConnector(QWidget):
@@ -61,7 +61,10 @@ class ServerConnector(QWidget):
         # Scan button (toggles to cancel while scanning)
         self.scan_btn = QPushButton()
         try:
-            self.scan_btn.setIcon(qta.icon("fa6s.search", color=get_qcolor("blue")))
+            # store icons so we can swap instead of stacking
+            self._scan_icon = qta.icon("fa6s.search", color=get_qcolor("blue"))
+            self._stop_icon = qta.icon("fa6s.stop", color=get_qcolor("red"))
+            self.scan_btn.setIcon(self._scan_icon)
         except Exception:
             self.scan_btn.setText("🔍")
         self.scan_btn.setToolTip("Scan network for BioView servers")
@@ -121,9 +124,12 @@ class ServerConnector(QWidget):
 
         # begin scan
         self._scanning = True
-        # swap icon to stop glyph
+        # swap icon to stop glyph (replace existing icon)
         try:
-            self.scan_btn.setIcon(qta.icon("fa6s.stop", color=get_qcolor("red")))
+            if hasattr(self, "_stop_icon"):
+                self.scan_btn.setIcon(self._stop_icon)
+            else:
+                self.scan_btn.setIcon(qta.icon("fa6s.stop", color=get_qcolor("red")))
         except Exception:
             with contextlib.suppress(Exception):
                 self.scan_btn.setText("⏹")
@@ -147,7 +153,10 @@ class ServerConnector(QWidget):
         # stop scanning visuals
         self._scanning = False
         try:
-            self.scan_btn.setIcon(qta.icon("fa6s.search", color=get_qcolor("blue")))
+            if hasattr(self, "_scan_icon"):
+                self.scan_btn.setIcon(self._scan_icon)
+            else:
+                self.scan_btn.setIcon(qta.icon("fa6s.search", color=get_qcolor("blue")))
         except Exception:
             with contextlib.suppress(Exception):
                 self.scan_btn.setText("🔍")
@@ -238,38 +247,71 @@ class ServerConnector(QWidget):
 
 
 class StatusIndicator(QWidget):
-    """Indicate device status using the following codes -
-    Connected: Green,
-    Connecting: Yellow,
-    Disconnected: Red
+    """Small circular indicator that reflects a device's DeviceStatus.
+
+    - CONNECTED -> solid green
+    - DISCONNECTED -> solid orange
+    - CONNECTING -> blinking yellow
+    - STREAMING -> solid blue
     """
 
-    def __init__(self, state=DeviceStatus.DISCONNECTED, size: int = 12):
+    def __init__(self, state: DeviceStatus = DeviceStatus.DISCONNECTED, size: int = 12):
         super().__init__()
         self.state = state
         self.size = size
         self.setFixedSize(size, size)
 
+        # Blinking support for CONNECTING state
+        self._blink_on = False
+        self._blink_timer = QTimer(self)
+        self._blink_timer.setInterval(500)
+        self._blink_timer.timeout.connect(self._on_blink)
+
+        # Initialize
         self.update_state(state)
 
-    def update_state(self, state):
+    def update_state(self, state: DeviceStatus):
         self.state = state
-        self.repaint()
+
+        # Start/stop blinking for CONNECTING
+        if self.state == DeviceStatus.CONNECTING:
+            if not self._blink_timer.isActive():
+                self._blink_on = True
+                self._blink_timer.start()
+        else:
+            if self._blink_timer.isActive():
+                self._blink_timer.stop()
+                self._blink_on = False
+
+        # Request repaint
+        self.update()
+
+    def _on_blink(self):
+        self._blink_on = not self._blink_on
+        self.update()
 
     def paintEvent(self, event):
-        # Draw the LED circle with appropriate color
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        color = self.state.value[1]
+            # Base color from theme mapping (QColor)
+            base_color = CONNECTION_STATE_COLORS.get(self.state, get_qcolor("red"))
 
-        painter.setBrush(color)
-        painter.setPen(QPen(QColor(50, 50, 50), 1))
+            # For CONNECTING state, hide when blink is off
+            if self.state == DeviceStatus.CONNECTING and not self._blink_on:
+                return
 
-        margin = 1
-        painter.drawEllipse(
-            margin, margin, self.size - 2 * margin, self.size - 2 * margin
-        )
+            painter.setBrush(base_color)
+            painter.setPen(QPen(QColor(50, 50, 50), 1))
+
+            margin = 1
+            painter.drawEllipse(
+                margin, margin, self.size - 2 * margin, self.size - 2 * margin
+            )
+        finally:
+            with contextlib.suppress(Exception):
+                painter.end()
 
 
 class DeviceStatusWidget(QWidget):
@@ -446,12 +488,63 @@ class StatusBar(QStatusBar):
     def update_devices(self, devices: dict):
         """Replace the device panel with the discovered devices mapping."""
         try:
+            # If empty or None devices passed, preserve existing device list.
+            if not devices:
+                return
+            # Detect discovery result shape and delegate handling
+            first_val = None
+            try:
+                first_val = next(iter(devices.values()))
+            except Exception:
+                first_val = None
+
+            if isinstance(first_val, list):
+                self._handle_discovery_style_devices(devices)
+                return
+
+            # Otherwise assume devices is a per-device mapping and rebuild panel
             old = self.device_status_panel
             self._layout.removeWidget(old)
             old.deleteLater()
         except Exception:
             pass
 
+        # Build the panel from provided devices (these should come from configs)
+        self._rebuild_devices_panel(devices)
+
+    def _handle_discovery_style_devices(self, devices: dict):
+        """Handle discovery-style payloads: group -> list of device dicts."""
+        # Build set of discovered device names from payload. The payload
+        # may not include a 'name' field, so attempt to match by name when present;
+        # otherwise use group:index naming.
+        discovered_names = set()
+        for group, dev_list in devices.items():
+            if not isinstance(dev_list, list):
+                continue
+            for idx, dev in enumerate(dev_list):
+                name = None
+                try:
+                    if isinstance(dev, dict):
+                        name = dev.get("name")
+                except Exception:
+                    name = None
+                if not name:
+                    name = f"{group}:{idx}"
+                discovered_names.add(name)
+
+        # Update existing widgets: mark discovered ones CONNECTED, else DISCONNECTED
+        for device_name, widget in list(self.device_status_panel.device_widgets.items()):
+            new_state = (
+                DeviceStatus.CONNECTED
+                if device_name in discovered_names
+                else DeviceStatus.DISCONNECTED
+            )
+            widget.update_state(new_state)
+            # mirror into panel state map
+            self.device_status_panel.devices[device_name] = new_state
+
+    def _rebuild_devices_panel(self, devices: dict):
+        """Create a fresh DeviceStatusPanel from provided per-device mapping."""
         self.device_status_panel = DeviceStatusPanel(devices=devices)
         self._layout.addWidget(
             self.device_status_panel, alignment=Qt.AlignmentFlag.AlignRight

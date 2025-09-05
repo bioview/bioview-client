@@ -14,7 +14,7 @@ class SettingsPanel(QTabWidget):
     def __init__(
         self,
         common_config: Configuration = None,
-        device_config: Dict[str, Configuration] = None,
+        group_configs: Dict[str, Dict] = None,
     ):
         super().__init__()
 
@@ -40,13 +40,23 @@ class SettingsPanel(QTabWidget):
 
         # Create panels for connected devices
         self.device_settings_panel = {}
-        if device_config is not None:
-            for device_group_id, device_group_config in device_config.items():
-                dev_panel = DeviceSettingsPanel(device_group_config)
-                self.device_settings_panel[device_group_id] = dev_panel
-                self.addTab(dev_panel, device_group_id)
 
-                # TODO: Connect signals for update_param
+        # Group configs are Dicts of device configuration dicts
+        for device_group_id, device_group_config in group_configs.items():
+            # If group contains multiple devices, create a tab per device with label 'group/device'
+            if isinstance(device_group_config, dict):
+                for device_id, device_cfg in device_group_config.items():
+                    tab_label = f"{device_group_id}/{device_id}"
+                    dev_panel = DeviceSettingsPanel(device_cfg)
+                    self.device_settings_panel[tab_label] = dev_panel
+                    self.addTab(dev_panel, tab_label)
+                    dev_panel.log_event.connect(self.send_to_log)
+            else:
+                # single device entry
+                tab_label = device_group_id
+                dev_panel = DeviceSettingsPanel(device_group_config)
+                self.device_settings_panel[tab_label] = dev_panel
+                self.addTab(dev_panel, tab_label)
                 dev_panel.log_event.connect(self.send_to_log)
 
         # Add styling
@@ -76,180 +86,3 @@ class SettingsPanel(QTabWidget):
 
     def send_to_log(self):
         pass
-
-    def get_sample_config(self):
-        return {
-            "groupA": [
-                Configuration(
-                    config_dict={
-                        "parameters": {
-                            "device_name": "Device 9",
-                            "device_type": "usrp",
-                            "txGain": 9,
-                            "rxGain": 4,
-                            "IFAmplitude": 1,
-                        },
-                        "ui_parameters": {
-                            "txGain": {
-                                "display_label": "TX Gain (dB)",
-                                "display_type": "slider",
-                                "multiplier": 1,
-                                "range": [1, 50],
-                                "step": 2,
-                            },
-                            "rxGain": {
-                                "display_label": "RX Gain (dB)",
-                                "display_type": "slider",
-                                "multiplier": 1,
-                                "range": [1, 50],
-                                "step": 2,
-                            },
-                            "IFAmplitude": {
-                                "display_label": "IF Amplitude",
-                                "display_type": "slider",
-                                "multiplier": 1,
-                                "range": [1, 10],
-                                "step": 1,
-                            },
-                        },
-                    }
-                ),
-                Configuration(
-                    config_dict={
-                        "parameters": {
-                            "device_name": "Device 4",
-                            "device_type": "usrp",
-                            "txGain": 8,
-                            "rxGain": 10,
-                            "IFAmplitude": 4,
-                        },
-                        "ui_parameters": {
-                            "txGain": {
-                                "display_label": "TX Gain (dB)",
-                                "display_type": "slider",
-                                "multiplier": 1,
-                                "range": [1, 10],
-                                "step": 1,
-                                "value": 8,
-                            },
-                            "rxGain": {
-                                "display_label": "RX Gain (dB)",
-                                "display_type": "slider",
-                                "multiplier": 1,
-                                "range": [1, 10],
-                                "step": 1,
-                                "value": 10,
-                            },
-                            "IFAmplitude": {
-                                "display_label": "IF Amplitude",
-                                "display_type": "slider",
-                                "multiplier": 1,
-                                "range": [1, 10],
-                                "step": 1,
-                                "value": 4,
-                            },
-                        },
-                    }
-                ),
-                Configuration(
-                    config_dict={
-                        "parameters": {
-                            "device_name": "Device 1",
-                            "device_type": "usrp",
-                            "txGain": 3,
-                            "rxGain": 8,
-                            "IFAmplitude": 7,
-                        },
-                        "ui_parameters": {
-                            "txGain": {
-                                "display_label": "TX Gain (dB)",
-                                "display_type": "slider",
-                                "multiplier": 1,
-                                "range": [1, 10],
-                                "step": 1,
-                            },
-                            "rxGain": {
-                                "display_label": "RX Gain (dB)",
-                                "display_type": "slider",
-                                "multiplier": 1,
-                                "range": [1, 10],
-                                "step": 1,
-                            },
-                            "IFAmplitude": {
-                                "display_label": "IF Amplitude",
-                                "display_type": "slider",
-                                "multiplier": 1,
-                                "range": [1, 10],
-                                "step": 1,
-                            },
-                        },
-                    }
-                ),
-            ],
-            "groupB": [
-                Configuration(
-                    config_dict={
-                        "parameters": {
-                            "device_name": "Device 2",
-                            "device_type": "terp",
-                            "prefix": 1.8,
-                            "anod": 4,
-                        },
-                        "ui_parameters": {
-                            "prefix": {
-                                "display_label": "Log Prefix",
-                                "display_type": "text",
-                                "multiplier": 1,
-                            },
-                            "anod": {
-                                "display_label": "Anodization",
-                                "display_type": "slider",
-                                "multiplier": 1,
-                                "range": [1, 10],
-                                "step": 1,
-                            },
-                        },
-                    }
-                )
-            ],
-            "groupC": [
-                Configuration(
-                    config_dict={
-                        "parameters": {
-                            "device_name": "Device 3",
-                            "device_type": "maxx",
-                            "sliderA": 2,
-                            "sliderB": 4,
-                            "inputA": 3.5,
-                            "inputB": 2.7,
-                        },
-                        "ui_parameters": {
-                            "sliderA": {
-                                "display_label": "Slider A",
-                                "display_type": "slider",
-                                "multiplier": 1,
-                                "range": [1, 10],
-                                "step": 1,
-                            },
-                            "sliderB": {
-                                "display_label": "Slider B",
-                                "display_type": "slider",
-                                "multiplier": 1,
-                                "range": [1, 10],
-                                "step": 1,
-                            },
-                            "inputA": {
-                                "display_label": "Text A",
-                                "display_type": "text",
-                                "multiplier": 2,
-                            },
-                            "inputB": {
-                                "display_label": "Text B",
-                                "display_type": "text",
-                                "multiplier": 2,
-                            },
-                        },
-                    }
-                )
-            ],
-        }
