@@ -1,8 +1,8 @@
 import qtawesome as qta
-from PyQt6.QtWidgets import QGroupBox, QPushButton, QHBoxLayout, QCheckBox
-from PyQt6.QtCore import pyqtSignal, QEvent
-
 from bioview_common import DeviceStatus
+from PyQt6.QtCore import QEvent, pyqtSignal
+from PyQt6.QtWidgets import QCheckBox, QGroupBox, QHBoxLayout, QPushButton
+
 from bioview_client.constants import get_qcolor
 
 
@@ -51,6 +51,17 @@ class AppControlPanel(QGroupBox):
         self.stop_button.clicked.connect(self.on_stop_clicked)
         layout.addWidget(self.stop_button)
 
+        # Gain/balance button (visual control placeholder)
+        self.gain_balance_button = QPushButton()
+        try:
+            self.gain_balance_button.setIcon(
+                qta.icon("fa6s.rotate", color=get_qcolor("blue"))
+            )
+        except Exception:
+            self.gain_balance_button.setText("Balance")
+        self.gain_balance_button.setEnabled(False)
+        layout.addWidget(self.gain_balance_button)
+
         layout.addStretch()
         self.setLayout(layout)
 
@@ -97,9 +108,9 @@ class AppControlPanel(QGroupBox):
             self.stop_button.setEnabled(False)
             self.gain_balance_button.setEnabled(False)
 
-        else: 
-            # TODO: Log error 
-            pass 
+        else:
+            # TODO: Log error
+            pass
 
     def on_connect_clicked(self):
         self.connect_devices.emit()

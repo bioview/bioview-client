@@ -13,6 +13,7 @@ from typing import Dict, List
 
 from bioview_common import Configuration, DataSource, DeviceStatus
 from bioview_common.protocol.status import ClientStatus
+from PyQt6.QtCore import QRunnable, QThreadPool, pyqtSlot
 from PyQt6.QtGui import QGuiApplication, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
@@ -80,7 +81,8 @@ class BioViewMonitor(QMainWindow):
         self.group_configs = self._convert_group_configs(group_cfgs)
 
         # Store device names and states - since that's all the UI needs
-        self.devices = {}
+        # Use group->device mapping in self.device_states
+        self.device_states: Dict[str, Dict] = {}
 
         # Keep track for display sources
         if not self.common_config.get_param("display_sources", None):
@@ -223,8 +225,6 @@ class BioViewMonitor(QMainWindow):
         self._create_client_worker()
         self._connect_client_signals()
         self.client_worker.start_client()
-        # Show declared device configs on the status bar (non-fatal)
-        self._show_declared_devices()
 
     def _create_client_worker(self):
         """Create the Client worker instance."""
@@ -266,50 +266,10 @@ class BioViewMonitor(QMainWindow):
         )
         self.client_worker.log_message.connect(self.log_display_panel.log_message)
 
-    def _show_declared_devices(self):
-        """Populate the status bar with declared device configs before discovery."""
-        devices_map = self._build_devices_map_from_group_configs()
-        if devices_map:
-            self.devices = devices_map
-            if getattr(self.status_bar, "update_devices", None):
-                self.status_bar.update_devices(devices_map)
+    # removed temporary stdout print hook
 
-    def _build_devices_map_from_group_configs(self):
-        """Return a flat devices mapping from self.group_configs suitable for StatusBar."""
-        devices_map = {}
-        if not isinstance(self.group_configs, dict):
-            return devices_map
-
-        for group_id, cfg in self.group_configs.items():
-            # cfg may be a single Configuration/dict or a list of them
-            if isinstance(cfg, list):
-                for idx, dev in enumerate(cfg):
-                    dev_name = None
-                    if isinstance(dev, Configuration):
-                        dev_name = dev.get_param("name", f"{group_id}:{idx}")
-                    elif isinstance(dev, dict):
-                        dev_name = dev.get("name", f"{group_id}:{idx}")
-                    else:
-                        dev_name = f"{group_id}:{idx}"
-                    devices_map[dev_name] = {
-                        "config": dev,
-                        "state": DeviceStatus.DISCONNECTED,
-                    }
-            else:
-                dev = cfg
-                dev_name = None
-                if isinstance(dev, Configuration):
-                    dev_name = dev.get_param("name", group_id)
-                elif isinstance(dev, dict):
-                    dev_name = dev.get("name", group_id)
-                else:
-                    dev_name = group_id
-                devices_map[dev_name] = {
-                    "config": dev,
-                    "state": DeviceStatus.DISCONNECTED,
-                }
-
-        return devices_map
+    # Legacy device pre-population helpers removed. The UI will only be
+    # updated from discovery responses to prevent showing stale configurations.
 
     def _connect_signals(self):
         """
@@ -331,7 +291,49 @@ class BioViewMonitor(QMainWindow):
         # Set selected server on client worker and ask it to connect
         if self.client_worker:
             self.client_worker.selected_server = server_info
-            self.client_worker.connect_to_server()
+
+            # Update UI immediately to show connecting state: enable spinner visually
+            # No UI spinner in ServerConnector; proceed to connect
+
+            # Run the actual connect in background so UI remains responsive
+            class _ConnectTask(QRunnable):
+                def __init__(self, client_ref):
+                    super().__init__()
+                    self.client_ref = client_ref
+
+                @pyqtSlot()
+                def run(self):
+                    self.client_ref.connect_to_server()
+
+            try:
+                task = _ConnectTask(self.client_worker)
+                # use client's thread pool if available
+                pool = getattr(self.client_worker, "thread_pool", None)
+                if pool is not None:
+                    pool.start(task)
+                else:
+                    # fallback to creating a small pool
+                    qp = QThreadPool()
+                    qp.start(task)
+            except Exception:
+                # best-effort: fallback to synchronous call
+                with contextlib.suppress(Exception):
+                    self.client_worker.connect_to_server()
+
+        # Listen for final server_connected/server_disconnected to hide spinner
+        try:
+            self.client_worker.server_connected.connect(
+                lambda ok: self.status_bar.server_connector._server_spinner.setVisible(
+                    False
+                )
+            )
+            self.client_worker.server_disconnected.connect(
+                lambda ok: self.status_bar.server_connector._server_spinner.setVisible(
+                    False
+                )
+            )
+        except Exception:
+            pass
 
     # --- Extracted signal connection helpers (keeps _connect_signals small) ---
     def _connect_command_bar_signals(self):
@@ -367,63 +369,54 @@ class BioViewMonitor(QMainWindow):
             self.client_worker.discover_servers
         )
 
-        # Cancel scan (best-effort)
-        if getattr(self.status_bar, "network_scan_cancel_requested", None):
-            with contextlib.suppress(Exception):
-                self.status_bar.network_scan_cancel_requested.connect(
-                    self.client_worker.cancel_scan
-                )
+        # Cancel scan
+        self.status_bar.network_scan_cancel_requested.connect(
+            self.client_worker.cancel_scan
+        )
 
-        # Discover devices
-        if getattr(self.status_bar, "server_discover_requested", None):
-            self.status_bar.server_discover_requested.connect(
-                self.client_worker.discover_devices
-            )
+        # Update selected server
+        self.status_bar.selected_server_changed.connect(
+            self.client_worker.change_selected_server
+        )
 
-        # Disconnect request: try direct slot, fallback to request_disconnect if available
-        if getattr(self.status_bar, "server_disconnection_requested", None):
-            with contextlib.suppress(Exception):
-                # Prefer an explicit request_disconnect wrapper so the client can
-                # mark the disconnect as manual and avoid auto-reconnect.
-                if hasattr(self.client_worker, "request_disconnect"):
-                    self.status_bar.server_disconnection_requested.connect(
-                        self.client_worker.request_disconnect
-                    )
-                else:
-                    self.status_bar.server_disconnection_requested.connect(
-                        self.client_worker.disconnect_from_server
-                    )
-            # fallback
-            with contextlib.suppress(Exception):
-                # no-op fallback handled above
-                pass
+        # Server connection request
+        self.status_bar.server_connection_requested.connect(
+            self.client_worker.connect_to_server
+        )
 
-        # Server connection requests: prefer client's request_connect slot when present
-        if getattr(self.status_bar, "server_connection_requested", None):
-            if hasattr(self.client_worker, "request_connect"):
-                try:
-                    self.status_bar.server_connection_requested.connect(
-                        self.client_worker.request_connect
-                    )
-                except Exception:
-                    # fallback to local handler if connecting to client's slot fails
-                    self.status_bar.server_connection_requested.connect(
-                        self._handle_server_connection_request
-                    )
-            else:
-                self.status_bar.server_connection_requested.connect(
-                    self._handle_server_connection_request
-                )
+        # Server disconnection request
+        self.status_bar.server_disconnection_requested.connect(
+            self.client_worker.disconnect_from_server
+        )
+
+        # Device discovery request
+        self.status_bar.discover_devices_requested.connect(
+            self.client_worker.discover_devices
+        )
 
     def _handle_devices_discovered(self, devices_map: dict):
         """Update status bar device panel when client reports discovered devices."""
         if not devices_map:
             return
+
+        # Enforce strict group->device mapping for the status bar. Reject other shapes.
+        if not is_dict_of_dicts(devices_map):
+            self.log_display_panel.log_message(
+                "warning",
+                "Received devices payload with invalid shape; expected dict-of-dicts, ignoring",
+            )
+            return
+
         try:
-            self.devices = devices_map
-            # Ask status bar to replace device panel
+            # device_states is expected to be group->device->{config,state}
+            self.device_states = devices_map
+            self._trace(
+                "debug", f"Devices discovered: groups={list(devices_map.keys())}"
+            )
             if getattr(self.status_bar, "update_devices", None):
+                # Forward discovery payload to status bar
                 self.status_bar.update_devices(devices_map)
+                self._trace("debug", "StatusBar.update_devices called")
         except Exception as e:
             self.log_display_panel.log_message("error", f"Failed to update devices: {e}")
 
@@ -463,9 +456,15 @@ class BioViewMonitor(QMainWindow):
     # Command Bar helper functions
     def on_device_connection_requested(self):
         if self.client_worker:
-            for device_id in self.devices:
-                self.status_bar.update_device_state(device_id, DeviceStatus.CONNECTING)
-                self.client_worker.connect_device(device_id=device_id)
+            # Request server to connect all initialized devices
+            # Update UI to show CONNECTING state for all known devices
+            for group in self.device_states.values():
+                for device_id in group:
+                    self.status_bar.update_device_state(
+                        device_id, DeviceStatus.CONNECTING
+                    )
+            # Request device connection; UI will be updated via device_connected signals
+            self.client_worker.connect_device()
 
     def update_save_state(self):
         self.saving_status = True
@@ -522,24 +521,63 @@ class BioViewMonitor(QMainWindow):
             self.log_display_panel.log_message("warning", "Unable to update status bar")
         self.log_display_panel.log_message("warning", "Disconnected from server")
 
-    def on_device_connected(self, device_id):
-        if device_id is not None:
-            self.devices[device_id]["state"] = DeviceStatus.CONNECTED
-            self.status_bar.update_device_state(device_id, DeviceStatus.CONNECTED)
+    def on_device_connected(self, device_id, success=True):
+        self._trace(
+            "debug",
+            f"on_device_connected called with device_id={device_id} success={success}",
+        )
+        if device_id is None:
+            # All devices connected
+            for group_id, group in self.device_states.items():
+                for device_id in group:
+                    new_state = (
+                        DeviceStatus.CONNECTED if success else DeviceStatus.DISCONNECTED
+                    )
+                    self.device_states[group_id][device_id]["state"] = new_state
+                    self.status_bar.update_device_state(device_id, new_state)
         else:
-            # In this case all devices were requested for connection
-            for device_id in self.devices:
-                self.devices[device_id]["state"] = DeviceStatus.CONNECTED
-                self.status_bar.update_device_state(device_id, DeviceStatus.CONNECTED)
+            # Single device connected (device_id is the canonical id)
+            # Update device_states mapping when possible
+            for group_id, group in self.device_states.items():
+                if device_id in group:
+                    self.device_states[group_id][device_id]["state"] = (
+                        DeviceStatus.CONNECTED if success else DeviceStatus.DISCONNECTED
+                    )
+                    break
+            # Update status bar regardless
+            self.status_bar.update_device_state(
+                device_id,
+                DeviceStatus.CONNECTED if success else DeviceStatus.DISCONNECTED,
+            )
+            self._trace("info", f"Device connected: {device_id}")
 
         # Check if all are connected and if so, disable UI buttons
         self.update_buttons()
 
-    def on_device_disconnected(self):
-        # Disconnect devices
-        for device_id in self.devices:
-            self.devices[device_id]["state"] = DeviceStatus.DISCONNECTED
-            self.status_bar.update_device_state(device_id, DeviceStatus.DISCONNECTED)
+    def on_device_disconnected(self, device_id=None, success=True):
+        self._trace(
+            "debug",
+            f"on_device_disconnected called device_id={device_id} success={success}",
+        )
+        if device_id is None:
+            # Disconnect devices (all)
+            for group_id, group in self.device_states.items():
+                for device_id in group:
+                    self.device_states[group_id][device_id][
+                        "state"
+                    ] = DeviceStatus.DISCONNECTED
+                    self.status_bar.update_device_state(
+                        device_id, DeviceStatus.DISCONNECTED
+                    )
+        else:
+            for group_id, group in self.device_states.items():
+                if device_id in group:
+                    self.device_states[group_id][device_id][
+                        "state"
+                    ] = DeviceStatus.DISCONNECTED
+                    break
+            with contextlib.suppress(Exception):
+                self.status_bar.update_device_state(device_id, DeviceStatus.DISCONNECTED)
 
         self.update_buttons()
 
@@ -547,12 +585,19 @@ class BioViewMonitor(QMainWindow):
         """Handle a failed device connection attempt by updating UI state."""
         if device_id is None:
             # If None, assume all failed
-            for did in self.devices:
-                self.devices[did]["state"] = DeviceStatus.DISCONNECTED
-                self.status_bar.update_device_state(did, DeviceStatus.DISCONNECTED)
+            for group_id, group in self.device_states.items():
+                for did in group:
+                    self.device_states[group_id][did][
+                        "state"
+                    ] = DeviceStatus.DISCONNECTED
+                    self.status_bar.update_device_state(did, DeviceStatus.DISCONNECTED)
         else:
-            if device_id in self.devices:
-                self.devices[device_id]["state"] = DeviceStatus.DISCONNECTED
+            for group_id, group in self.device_states.items():
+                if device_id in group:
+                    self.device_states[group_id][device_id][
+                        "state"
+                    ] = DeviceStatus.DISCONNECTED
+                    break
             # Update status bar regardless
             with contextlib.suppress(Exception):
                 self.status_bar.update_device_state(device_id, DeviceStatus.DISCONNECTED)
@@ -564,10 +609,14 @@ class BioViewMonitor(QMainWindow):
         pass
 
     def update_buttons(self):
+        # Consider all devices connected only if none are DISCONNECTED
         connected = True
-        for device_dict in self.devices.values():
-            if device_dict["state"] == DeviceStatus.DISCONNECTED:
-                connected = False
+        for group in self.device_states.values():
+            for device_dict in group.values():
+                if device_dict.get("state") == DeviceStatus.DISCONNECTED:
+                    connected = False
+                    break
+            if not connected:
                 break
 
         if connected:

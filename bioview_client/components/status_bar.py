@@ -1,9 +1,8 @@
 import contextlib
-import socket
 from typing import Dict, List
 
 import qtawesome as qta
-from bioview_common import DeviceStatus
+from bioview_common import Configuration, DeviceStatus
 from bioview_common.protocol.status import ClientStatus
 from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPen
@@ -18,39 +17,37 @@ from PyQt6.QtWidgets import (
 )
 
 from bioview_client.constants.theme import CONNECTION_STATE_COLORS, get_qcolor
+from bioview_client.utils import is_dict_of_dicts
 
 
 class ServerConnector(QWidget):
-    """GUI Component which displays available/connected servers and provides for an option to swap out among servers.
-    Server connection state is emitted back to the main app for further co-ordination.
+    """GUI Component which displays available/connected servers and provides
+    an option to swap out among servers. Server connection state is emitted
+    back to the main app for further co-ordination.
     """
 
+    # Server-specific signals
     network_scan_requested = pyqtSignal()
     network_scan_cancel_requested = pyqtSignal()
-    server_connection_requested = pyqtSignal(dict)
+
+    selected_server_changed = pyqtSignal(int)  # Pass selected server index
+
+    server_connection_requested = pyqtSignal()
     server_disconnection_requested = pyqtSignal()
-    # Request that the central StatusBar update server-related UI state.
-    # Emitting a ClientStatus here ensures all button state changes happen
-    # in StatusBar.set_server_status and nowhere else.
-    server_status_change_requested = pyqtSignal(object)
-    # Emitted when the user requests device discovery on the currently selected server
+
+    # Device-specific signals
     discover_devices_requested = pyqtSignal()
+
+    # Unified UI updates for state
+    server_connection_state_updated = pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-
-        # Track servers
-        self.selected_server = {}
-        self.discovered_servers = []
-
         # Internal state
         self._scanning = False
 
         # Setup UI
         self.init_ui()
-
-        # Show local network info
-        self.local_ip, self.network_ip, self.hostname = self.get_local_network_info()
 
     def init_ui(self):
         """Setup the user interface"""
@@ -60,13 +57,11 @@ class ServerConnector(QWidget):
 
         # Scan button (toggles to cancel while scanning)
         self.scan_btn = QPushButton()
-        try:
-            # store icons so we can swap instead of stacking
-            self._scan_icon = qta.icon("fa6s.search", color=get_qcolor("blue"))
-            self._stop_icon = qta.icon("fa6s.stop", color=get_qcolor("red"))
-            self.scan_btn.setIcon(self._scan_icon)
-        except Exception:
-            self.scan_btn.setText("🔍")
+        self._scan_icon = qta.icon("fa5s.search", color=get_qcolor("blue"))
+        self._stop_icon = qta.icon("fa6s.circle-stop", color=get_qcolor("red"))
+
+        self.scan_btn.setIcon(self._scan_icon)
+
         self.scan_btn.setToolTip("Scan network for BioView servers")
         self.scan_btn.clicked.connect(self.scan_network)
         control_layout.addWidget(self.scan_btn)
@@ -125,21 +120,13 @@ class ServerConnector(QWidget):
         # begin scan
         self._scanning = True
         # swap icon to stop glyph (replace existing icon)
-        try:
-            if hasattr(self, "_stop_icon"):
-                self.scan_btn.setIcon(self._stop_icon)
-            else:
-                self.scan_btn.setIcon(qta.icon("fa6s.stop", color=get_qcolor("red")))
-        except Exception:
-            with contextlib.suppress(Exception):
-                self.scan_btn.setText("⏹")
+        self.scan_btn.setIcon(self._stop_icon)
 
-        # Clear choices and show progress; centralize button enablement
-        # through the StatusBar.set_server_status API.
+        # Clear past results
         self.server_dropdown.clear()
 
         # Request central UI to enter SCANNING state
-        self.server_status_change_requested.emit(ClientStatus.SCANNING)
+        self.server_connection_state_updated.emit(ClientStatus.SCANNING)
         self.scan_progress_bar.setVisible(True)
 
         # Ask handler to start scanning
@@ -152,26 +139,19 @@ class ServerConnector(QWidget):
         """On completion of network scan, handler passes along list of discovered servers"""
         # stop scanning visuals
         self._scanning = False
-        try:
-            if hasattr(self, "_scan_icon"):
-                self.scan_btn.setIcon(self._scan_icon)
-            else:
-                self.scan_btn.setIcon(qta.icon("fa6s.search", color=get_qcolor("blue")))
-        except Exception:
-            with contextlib.suppress(Exception):
-                self.scan_btn.setText("🔍")
+
+        self.scan_btn.setIcon(self._scan_icon)
         self.scan_progress_bar.setVisible(False)
 
         # populate dropdown only if we have results
         if discovered_servers is None or len(discovered_servers) == 0:
             self.server_dropdown.setEnabled(False)
-            self.discovered_servers = []
+
             # Ask the central StatusBar to update all button state
-            self.server_status_change_requested.emit(ClientStatus.SERVER_DISCONNECTED)
+            self.server_connection_state_updated.emit(ClientStatus.SERVER_DISCONNECTED)
             return
 
         # Save discovered servers and populate by hostname when available
-        self.discovered_servers = discovered_servers
         self.server_dropdown.clear()
         for server in discovered_servers:
             hostname = server.get("hostname") or ""
@@ -184,55 +164,20 @@ class ServerConnector(QWidget):
 
         # enable connect only when we have choices -- centralize via StatusBar
         self.server_dropdown.setEnabled(True)
-        # Notify the StatusBar about the available-but-not-connected state
-        self.server_status_change_requested.emit(ClientStatus.SERVER_DISCONNECTED)
 
-    def on_server_selected(self, server_index):
-        if server_index < len(self.discovered_servers):
-            self.selected_server = self.discovered_servers[server_index]
+        # Notify the StatusBar about the available-but-not-connected state
+        self.server_connection_state_updated.emit(ClientStatus.SERVER_DISCONNECTED)
+
+    def on_server_selected(self, index):
+        self.selected_server_changed.emit(index)
 
     def connect_to_server(self):
-        """Ask handler to connect to server"""
-        if self.selected_server:
-            # Use .emit to emit a PyQt signal (don't call the signal like a function)
-            self.server_connection_requested.emit(self.selected_server)
-        else:
-            # self.status ("Invalid server selected.")
-            return
-
-    # UI state is controlled centrally by StatusBar; the handler should
-    # emit a real CLIENT status update which will be applied via
-    # StatusBar.set_server_status. Avoid local optimistic changes here.
+        self.server_connection_requested.emit()
 
     def disconnect_from_server(self):
-        """Disconnect from the data server"""
         # Emit the request for the handler to disconnect
         self.server_disconnection_requested.emit()
-
-        # Ask the central StatusBar to reflect a disconnected server state.
-        self.server_status_change_requested.emit(ClientStatus.SERVER_DISCONNECTED)
-
-    def get_local_network_info(self):
-        """Get local network information for display"""
-        try:
-            # Get local IP
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.connect(("8.8.8.8", 80))
-            local_ip = sock.getsockname()[0]
-            sock.close()
-
-            # Extract network
-            ip_parts = local_ip.split(".")
-            network = ".".join(ip_parts[:3]) + ".0/24"
-
-            # Get hostname
-            hostname = socket.gethostname()
-
-            return local_ip, network, hostname
-        except Exception:
-            return None, None, None
-
-    # Legacy text-based update method removed. Use set_server_status(ClientStatus) instead.
+        self.server_connection_state_updated.emit(ClientStatus.SERVER_DISCONNECTED)
 
     def discover_devices(self):
         """Emit a signal requesting device discovery from the handler."""
@@ -342,6 +287,8 @@ class DeviceStatusWidget(QWidget):
 class DeviceStatusPanel(QWidget):
     def __init__(self, devices):
         super().__init__()
+        # devices: dict keyed by device_id -> { 'display_name': str, 'config':..., 'state': DeviceStatus }
+        # store a shallow copy
         self.devices = devices.copy()
         self.device_widgets = {}
 
@@ -350,33 +297,57 @@ class DeviceStatusPanel(QWidget):
         self.layout.setContentsMargins(0, 0, 0, 0)
         self.layout.setSpacing(15)
 
-        # Add device widgets
-        for device_name, device_map in self.devices.items():
-            device_state = device_map["state"]
-            self.add_device(device_name, device_state)
+        # Add device widgets (keys are device ids)
+        for device_id, device_map in self.devices.items():
+            device_state = device_map.get("state", DeviceStatus.DISCONNECTED)
+            display_label = device_map.get("display_name", device_id)
+            self.add_device(device_id, device_state, display_label)
 
         self.setLayout(self.layout)
 
     # Handle theme changes
     def _update_icons(self):
-        for device_name, device_state in self.devices.items():
-            self.device_widgets[device_name].update_state(device_state)
+        for device_id, device_map in self.devices.items():
+            try:
+                state = device_map.get("state", DeviceStatus.DISCONNECTED)
+                self.device_widgets[device_id].update_state(state)
+            except Exception:
+                # best-effort
+                pass
 
     def event(self, event):
         if event.type() == QEvent.Type.ApplicationPaletteChange:
             self._update_icons()
         return super().event(event)
 
-    def add_device(self, device_name, device_state=DeviceStatus.DISCONNECTED):
-        device_widget = DeviceStatusWidget(device_name, device_state)
-        self.device_widgets[device_name] = device_widget
+    def add_device(
+        self,
+        device_id,
+        device_state=DeviceStatus.DISCONNECTED,
+        display_label: str = None,
+    ):
+        """Add a device widget keyed by device_id but showing display_label."""
+        label = display_label or device_id
+        device_widget = DeviceStatusWidget(label, device_state)
+        self.device_widgets[device_id] = device_widget
         self.layout.addWidget(device_widget)
-        self.devices[device_name] = device_state
+        # ensure devices map stores a consistent dict
+        self.devices[device_id] = {"display_name": label, "state": device_state}
 
     def update_device_state(self, device_name, new_state):
+        # device_name here is the device_id (canonical key)
+        # no-op: tracing removed
+
         if device_name in self.device_widgets:
             self.device_widgets[device_name].update_state(new_state)
-            self.devices[device_name] = new_state
+            # update internal map state
+            try:
+                self.devices[device_name]["state"] = new_state
+            except Exception:
+                self.devices[device_name] = {
+                    "display_name": device_name,
+                    "state": new_state,
+                }
 
     def remove_device(self, device_name):
         if device_name in self.device_widgets:
@@ -384,7 +355,8 @@ class DeviceStatusPanel(QWidget):
             self.layout.removeWidget(widget)
             widget.deleteLater()
             del self.device_widgets[device_name]
-            del self.devices[device_name]
+            with contextlib.suppress(Exception):
+                del self.devices[device_name]
 
 
 class StatusBar(QStatusBar):
@@ -415,6 +387,12 @@ class StatusBar(QStatusBar):
         self._forward_signals()
         self._forward_callbacks()
 
+        # Connect signals
+        # Update UI to reflect connection state
+        self.server_connector.server_connection_state_updated.connect(
+            lambda status: self.set_server_status(status)
+        )
+
     def _forward_signals(self):
         # Map and expose signals from the embedded ServerConnector so external
         # code can connect to them via StatusBar.
@@ -424,6 +402,9 @@ class StatusBar(QStatusBar):
         self.network_scan_cancel_requested = (
             self.server_connector.network_scan_cancel_requested
         )
+
+        self.selected_server_changed = self.server_connector.selected_server_changed
+
         self.server_connection_requested = (
             self.server_connector.server_connection_requested
         )
@@ -432,22 +413,16 @@ class StatusBar(QStatusBar):
         )
 
         # Device discovery request
-        self.server_discover_requested = self.server_connector.discover_devices_requested
-
-        # Centralized server status change requests from the connector
-        # are forwarded to the StatusBar.set_server_status method so that
-        # all button state updates remain in one place.
-        with contextlib.suppress(Exception):
-            self.server_connector.server_status_change_requested.connect(
-                lambda status: self.set_server_status(status)
-            )
+        self.discover_devices_requested = (
+            self.server_connector.discover_devices_requested
+        )
 
         # Expose device update helper from the panel
         self.update_device_state = self.device_status_panel.update_device_state
 
     def set_server_status(self, status: ClientStatus):
         """Centralize server-related UI updates based on ClientStatus."""
-        try:
+        with contextlib.suppress(Exception):
             if status == ClientStatus.SERVER_CONNECTED:
                 self.server_connector.connection_label.setText("Status: Connected")
                 self.server_connector.connection_label.setStyleSheet(
@@ -477,71 +452,75 @@ class StatusBar(QStatusBar):
                 has_choices = self.server_connector.server_dropdown.count() > 0
                 self.server_connector.connect_btn.setEnabled(has_choices)
                 self.server_connector.disconnect_btn.setEnabled(False)
-        except Exception:
-            # Best-effort: avoid UI exceptions
-            pass
 
     def _forward_callbacks(self):
         self.on_scan_complete = self.server_connector.on_scan_complete
         self.update_scan_progress = self.server_connector.update_scan_progress
 
     def update_devices(self, devices: dict):
-        """Replace the device panel with the discovered devices mapping."""
+        """Replace the device panel using a strict group->device mapping.
+
+        Expected input: dict where keys are group ids and values are dicts mapping
+        device_id -> <config|status>. Any other shape is rejected.
+        Inner values may be a Configuration/dict (declared configs) or a status
+        value (string/int) returned from server discovery. The method flattens
+        the mapping to device_name -> {'config': ..., 'state': DeviceStatus} and
+        rebuilds the device panel.
+        """
+        # Reject non-dict-of-dicts inputs to keep behavior predictable
+        if not is_dict_of_dicts(devices):
+            self.parent().log_message.emit(
+                "warning", "update_devices expects a dict-of-dicts; ignoring"
+            )
+            return
+
         try:
-            # If empty or None devices passed, preserve existing device list.
-            if not devices:
-                return
-            # Detect discovery result shape and delegate handling
-            first_val = None
-            try:
-                first_val = next(iter(devices.values()))
-            except Exception:
-                first_val = None
+            # Build flat device mapping keyed by device_id for DeviceStatusPanel
+            flat_devices = {}
+            for device_dict in devices.values():
+                if not isinstance(device_dict, dict):
+                    continue
+                for device_id, val in device_dict.items():
+                    # Determine display name from config if present
+                    display_name = device_id
+                    config_val = {}
+                    state_val = None
 
-            if isinstance(first_val, list):
-                self._handle_discovery_style_devices(devices)
-                return
+                    if isinstance(val, Configuration):
+                        try:
+                            display_name = val.get_param("name", device_id)
+                        except Exception:
+                            display_name = device_id
+                        config_val = val
+                    elif isinstance(val, dict):
+                        display_name = val.get("name", device_id)
+                        config_val = val
+                        state_val = val.get("state") if "state" in val else None
+                    else:
+                        # treat val as a status indicator
+                        state_val = val
 
-            # Otherwise assume devices is a per-device mapping and rebuild panel
+                    # Normalize state to DeviceStatus
+                    try:
+                        state = DeviceStatus(state_val)
+                    except Exception:
+                        state = DeviceStatus.DISCONNECTED
+
+                    flat_devices[device_id] = {
+                        "display_name": display_name,
+                        "config": config_val,
+                        "state": state,
+                    }
+
+            # Replace the device panel
             old = self.device_status_panel
             self._layout.removeWidget(old)
             old.deleteLater()
+            self._rebuild_devices_panel(flat_devices)
         except Exception:
-            pass
-
-        # Build the panel from provided devices (these should come from configs)
-        self._rebuild_devices_panel(devices)
-
-    def _handle_discovery_style_devices(self, devices: dict):
-        """Handle discovery-style payloads: group -> list of device dicts."""
-        # Build set of discovered device names from payload. The payload
-        # may not include a 'name' field, so attempt to match by name when present;
-        # otherwise use group:index naming.
-        discovered_names = set()
-        for group, dev_list in devices.items():
-            if not isinstance(dev_list, list):
-                continue
-            for idx, dev in enumerate(dev_list):
-                name = None
-                try:
-                    if isinstance(dev, dict):
-                        name = dev.get("name")
-                except Exception:
-                    name = None
-                if not name:
-                    name = f"{group}:{idx}"
-                discovered_names.add(name)
-
-        # Update existing widgets: mark discovered ones CONNECTED, else DISCONNECTED
-        for device_name, widget in list(self.device_status_panel.device_widgets.items()):
-            new_state = (
-                DeviceStatus.CONNECTED
-                if device_name in discovered_names
-                else DeviceStatus.DISCONNECTED
-            )
-            widget.update_state(new_state)
-            # mirror into panel state map
-            self.device_status_panel.devices[device_name] = new_state
+            # Best-effort: do not raise from UI update
+            with contextlib.suppress(Exception):
+                self.parent().log_message.emit("error", "Failed to update device panel")
 
     def _rebuild_devices_panel(self, devices: dict):
         """Create a fresh DeviceStatusPanel from provided per-device mapping."""

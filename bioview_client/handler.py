@@ -111,6 +111,7 @@ class DeviceDiscoverWorker(QRunnable):
     def run(self):
         try:
             devices = {}
+
             # Device discovery can be slow on server side; use a longer timeout and
             # do not disconnect the control socket on timeout so the client remains connected.
             response = self.client_ref.send_control_command(
@@ -122,13 +123,21 @@ class DeviceDiscoverWorker(QRunnable):
                 timeout=30.0,
                 disconnect_on_error=False,
             )
-            if response and response.get("type") == Response.SUCCESS.value:
-                payload = (
-                    response.get("payload", {}) if isinstance(response, dict) else {}
+
+            if response and isinstance(response, dict):
+                rtype = response.get("type")
+                payload = response.get("payload", {})
+                if rtype == Response.DEVICE_DISCOVERY_COMPLETED.value:
+                    devices = payload.get("devices", {})
+
+            # Validate for correctness of format
+            if not is_dict_of_dicts(devices):
+                self.client_ref.log_message.emit(
+                    "debug",
+                    f"Invalid device format received: {devices}. Expected dict-of-dicts.",
                 )
-                # payload['devices'] is expected to be a dict mapping backend->list
-                devices = payload.get("devices", {})
-            # emit list (possibly empty)
+                devices = {}
+
             self.signals.finished.emit(devices)
         except Exception:
             # On error, emit empty list
@@ -226,7 +235,7 @@ class Client(QThread):
         # Now, while we understand devices in the form of groups, we keep track of
         # states for individual devices for clearer presentation in the UI
         self.device_states = {}
-        for group_id, group_dict in group_configs.items():
+        for group_id, group_dict in self.group_configs.items():
             self.device_states[group_id] = {}
 
             for device_id, device_cfg in group_dict.items():
@@ -303,21 +312,22 @@ class Client(QThread):
             # Connect control socket (serialize with lock to avoid races)
             with self._control_lock:
                 if self.control_socket:
-                    with contextlib.suppress(Exception):
-                        self.control_socket.close()
+                    self.control_socket.close()
 
                 self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.control_socket.settimeout(5.0)
                 self.control_socket.connect(
                     (self.selected_server["address"], self.control_port)
                 )
+
             self.control_connected = True
-            self.log_message.emit("debug", "Connected control socket")
             self.status = ClientStatus.SERVER_CONNECTED
             return True
+
         except Exception as e:
             self.log_message.emit("error", f"Control connection failed: {e}")
             self.control_connected = False
+            self.control_socket = None
             return False
 
     def connect_data(self) -> bool:
@@ -337,7 +347,6 @@ class Client(QThread):
             self.data_socket.settimeout(5.0)
             self.data_socket.connect((self.selected_server["address"], self.data_port))
             self.data_connected = True
-            self.log_message.emit("debug", "Connected data socket")
             return True
         except Exception as e:
             self.log_message.emit("error", f"Data connection failed: {e}")
@@ -550,6 +559,14 @@ class Client(QThread):
 
         return sanitized
 
+    def change_selected_server(self, index: int):
+        if self.discovered_servers is None or len(self.discovered_servers) == 0:
+            self.selected_server = {}
+        elif index < 0 or index >= len(self.discovered_servers):
+            self.selected_server = self.discovered_servers[0]
+        else:
+            self.selected_server = self.discovered_servers[index]
+
     def connect_to_server(self):
         if self.selected_server == {}:
             self.log_message.emit(
@@ -590,7 +607,7 @@ class Client(QThread):
                 self.selected_server.update(server_info)
 
             self.control_connected = True
-            self.log_message.emit("debug", "Authenticated with control server")
+            # authenticated
 
             # Connect to data server - close pre-existing connections (guard close)
             if self.data_socket:
@@ -602,7 +619,7 @@ class Client(QThread):
             self.data_socket.connect((self.selected_server["address"], self.data_port))
             self.data_connected = True
 
-            self.log_message.emit("debug", "Connected to data server")
+            # data server connected
 
             # Emit status
             self.status = ClientStatus.SERVER_CONNECTED
@@ -683,38 +700,6 @@ class Client(QThread):
     ### Device Commands
 
     ### General functions
-    def _build_supported_cmd_values(self) -> set:
-        """Return a tolerant set of supported command string representations."""
-        values = set()
-        try:
-            for c in SUPPORTED_COMMANDS:
-                if hasattr(c, "value") and isinstance(c.value, str):
-                    values.add(c.value)
-                    values.add(c.value.lower())
-                if hasattr(c, "name") and isinstance(c.name, str):
-                    values.add(c.name)
-                    values.add(c.name.lower())
-                values.add(str(c))
-                values.add(str(c).lower())
-        except Exception:
-            values.add(str(SUPPORTED_COMMANDS))
-        return values
-
-    def _normalize_command_type(self, command_type) -> tuple:
-        """Return (cmd_value, json_type) for incoming command_type."""
-        if hasattr(command_type, "value") and isinstance(command_type.value, str):
-            cmd_value = command_type.value
-        elif hasattr(command_type, "name") and isinstance(command_type.name, str):
-            cmd_value = command_type.name
-        else:
-            cmd_value = str(command_type)
-
-        # json_type: what we put in the outgoing JSON (prefer .value when available)
-        json_type = (
-            command_type.value if hasattr(command_type, "value") else str(command_type)
-        )
-        return cmd_value, json_type
-
     def _send_and_receive(self, command_data: bytes, timeout: float = None) -> bytes:
         """Send command_data and receive response under the control lock.
 
@@ -727,8 +712,11 @@ class Client(QThread):
                     prev_timeout = self.control_socket.gettimeout()
                     self.control_socket.settimeout(timeout)
 
+                # removed detailed send trace
+
                 self.control_socket.send(command_data)
                 response_data = self.control_socket.recv(MAX_BUFFER_SIZE)
+                # removed detailed recv trace
             finally:
                 with contextlib.suppress(Exception):
                     if timeout is not None and self.control_socket is not None:
@@ -748,16 +736,17 @@ class Client(QThread):
             self.error_occurred.emit("Not connected to control server")
             return None
 
-        supported_cmd_values = self._build_supported_cmd_values()
-        cmd_value, json_type = self._normalize_command_type(command_type)
-
-        if cmd_value not in supported_cmd_values and cmd_value.lower() not in {
-            s.lower() for s in supported_cmd_values
-        }:
-            self.error_occurred.emit("Invalid command sent")
+        if (
+            not isinstance(command_type, Command)
+            or command_type.name not in SUPPORTED_COMMANDS
+        ):
+            self.error_occurred.emit(
+                f"Invalid command sent: {command_type} \n Supported commands are: {SUPPORTED_COMMANDS}"
+            )
             return None
 
-        command = {"type": json_type, "payload": params or {}}
+        # Ensure params are JSON-serializable (convert Configuration objects etc.)
+        command = {"type": command_type.value, "payload": params or {}}
 
         try:
             command_data = json.dumps(command).encode("utf-8")
@@ -765,7 +754,14 @@ class Client(QThread):
 
             if not response_data:
                 return None
-            return json.loads(response_data.decode("utf-8"))
+
+            resp = None
+            try:
+                resp = json.loads(response_data.decode("utf-8"))
+            except Exception:
+                self.log_message.emit("error", "Failed to parse control response")
+
+            return resp
 
         except socket.timeout as e:
             # For long-running ops like discovery, caller may opt to not disconnect on timeout
@@ -783,7 +779,6 @@ class Client(QThread):
             return None
 
     def discover_devices(self):
-        """Start device discovery in background and return immediately."""
         # Avoid starting another discovery while one is active
         if self._discovering_devices:
             self.log_message.emit("warn", "Device discovery already in progress")
@@ -806,23 +801,34 @@ class Client(QThread):
             discovery command payload. If no groups were specified, all available devices are
             returned, without being formatted into groups.
             """
-            try:
-                if is_dict_of_dicts(discovered):
-                    # We have groups that are discovered, so we parse accordingly
-                    for group_id, device_dicts in discovered.items():
-                        for device_id, device_status in device_dicts.items():
-                            self.device_states[group_id][device_id][
-                                "state"
-                            ] = DeviceStatus(device_status)
-                else:
-                    # Log all discovered devices for debugging in UI
-                    self.log_message.emit(
-                        "info", f"No devices specified. Available devices: {discovered}"
-                    )
-            finally:
-                # Emit discovery finished signal with current device states
-                self.devices_discovered.emit(self.device_states)
-                self._discovering_devices = False
+            # We have groups that are discovered, so we parse accordingly
+            for group_id, device_dicts in discovered.items():
+                # Ensure group exists in local state map
+                if group_id not in self.device_states:
+                    self.device_states[group_id] = {}
+
+                for device_id, device_status in device_dicts.items():
+                    # Ensure device entry exists with expected keys
+                    if device_id not in self.device_states[group_id]:
+                        self.device_states[group_id][device_id] = {
+                            "group": group_id,
+                            "id": device_id,
+                            "config": {},
+                            "state": DeviceStatus.DISCONNECTED,
+                        }
+
+                    # Safely convert status to DeviceStatus enum if possible
+                    try:
+                        new_state = DeviceStatus(device_status)
+                    except Exception:
+                        # Fallback to DISCONNECTED for unknown values
+                        new_state = DeviceStatus.DISCONNECTED
+
+                    self.device_states[group_id][device_id]["state"] = new_state
+
+            # Emit discovery finished signal with current device states
+            self.devices_discovered.emit(self.device_states)
+            self._discovering_devices = False
 
         worker.signals.finished.connect(_on_finished)
         self.thread_pool.start(worker)
@@ -834,24 +840,56 @@ class Client(QThread):
                 "Cannot connect to device while device discovery is in progress"
             )
             return False
-        self.log_message.emit("info", "Connecting...")
-        response = self.send_control_command(Command.CONNECT_DEVICES, {"id": device_id})
+        self.log_message.emit("info", "Connecting all discovered devices...")
+        # Request server to connect all initialized devices; no per-device payload
+        # Use a longer timeout for potentially slow device connect operations
+        response = self.send_control_command(
+            Command.CONNECT_DEVICES, timeout=30.0, disconnect_on_error=False
+        )
+        # Handle new device lifecycle response types
+        if response and isinstance(response, dict):
+            rtype = response.get("type")
+            payload = response.get("payload", {})
 
-        if response and response.get("type") == Response.SUCCESS.value:
-            self.log_message.emit("info", "Device connected successfully")
-            self.device_connected.emit(device_id)
+            devices = payload.get("devices", {})
+            for device_id in devices:
+                for group_id, group in self.device_states.items():
+                    if device_id not in group:
+                        continue
+
+                    match rtype:
+                        case Response.DEVICE_CONNECTING.value:
+                            self.device_states[group_id][device_id][
+                                "state"
+                            ] = DeviceStatus.CONNECTING
+                            self.device_connected.emit(device_id, False)
+
+                        case Response.DEVICE_CONNECTED.value:
+                            self.device_states[group_id][device_id][
+                                "state"
+                            ] = DeviceStatus.CONNECTED
+                            self.device_connected.emit(device_id, True)
+
+                        case Response.DEVICE_DISCONNECTED.value:
+                            self.device_states[group_id][device_id][
+                                "state"
+                            ] = DeviceStatus.DISCONNECTED
+                            self.device_disconnected.emit(device_id, True)
+
+                    break
+
             return True
+
+        # If we reach here, it's an error
+        if response and isinstance(response, dict):
+            payload = response.get("payload", {})
+            error_msg = payload.get("message", "Unknown error")
         else:
-            if response and isinstance(response, dict):
-                payload = (
-                    response.get("payload", {}) if isinstance(response, dict) else {}
-                )
-                error_msg = payload.get("message", "Unknown error")
-            else:
-                error_msg = "No response"
-            self.error_occurred.emit(f"Device connection failed: {error_msg}")
-            self.device_connection_failed.emit(device_id)
-            return False
+            error_msg = "No response"
+
+        self.error_occurred.emit(f"Device connection failed: {error_msg}")
+        self.device_connection_failed.emit(device_id)
+        return False
 
     def disconnect_device(self):
         """Disconnect from device"""
