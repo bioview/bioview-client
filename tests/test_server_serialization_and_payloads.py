@@ -54,7 +54,7 @@ def handshake_and_get_server_info(host, port):
     s.settimeout(3.0)
     s.connect((host, port))
     syn = {
-        "type": Command.CONNECT_SERVER.value,
+        "type": Command.CONNECT_SERVER.name,
         "payload": {
             "hostname": "pytest",
             "app_name": "pytest",
@@ -67,7 +67,7 @@ def handshake_and_get_server_info(host, port):
     challenge_msg = json.loads(challenge_raw)
     challenge = challenge_msg["payload"]["challenge"]
     token = compute_token(challenge, APP_VERSION)
-    auth = {"type": Command.AUTHENTICATE_CLIENT.value, "payload": {"token": token}}
+    auth = {"type": Command.AUTHENTICATE_CLIENT.name, "payload": {"token": token}}
     s.send(json.dumps(auth).encode("utf-8"))
     final = s.recv(8192).decode("utf-8")
     s.close()

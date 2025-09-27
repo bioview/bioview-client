@@ -73,12 +73,11 @@ class BioViewMonitor(QMainWindow):
         self.autoconnect = autoconnect
 
         # Check for valid configurations, else prompt user.
-        # Return in a standardized format
-        common_cfg, group_cfgs = self._resolve_initial_configs(
+        # UI and backend store it in Configuration objects,
+        # while handlers store as dict/json.
+        self.common_config, self.group_configs = self._resolve_initial_configs(
             common_config, group_configs
         )
-        self.common_config = self._convert_dict_to_configuration(common_cfg)
-        self.group_configs = self._convert_group_configs(group_cfgs)
 
         # Store device names and states - since that's all the UI needs
         # Use group->device mapping in self.device_states
@@ -104,8 +103,14 @@ class BioViewMonitor(QMainWindow):
 
         # Set up UI
         self._init_ui()
+
         # Client is setup with handlers passed along
-        self._setup_client()
+        self.client_worker = Client(
+            common_config=self.common_config, group_configs=self.group_configs
+        )
+        self._connect_client_signals()
+        self.client_worker.start_client()
+
         # Connect UI calls - including logging
         self._connect_signals()
 
@@ -173,11 +178,17 @@ class BioViewMonitor(QMainWindow):
         self.status_bar = StatusBar(self)
         self.setStatusBar(self.status_bar)
 
-    # --- Configuration helpers (extracted to reduce __init__ complexity) ---
+    # If initial configurations do not exist, ask using inputs
     def _resolve_initial_configs(self, common_config, group_configs):
-        """Return tuple (common_cfg, device_cfgs) after possibly prompting user."""
+        """
+        We initially receive configurations in JSON/dict format. These need
+        to be sanitized (if applicable). Hence, we load them into a
+        configuration object format. For the handler, however, we keep them
+        as dictionaries for easy serialization.
+        """
         if not common_config or not group_configs:
             dialog = ConfigurationPrompt()
+            # Will provide configurations as dict objects
             configurations = None
 
             if dialog.exec() == QDialog.DialogCode.Accepted:
@@ -190,21 +201,11 @@ class BioViewMonitor(QMainWindow):
                 common_cfg = DEFAULT_COMMON_CONFIGURATION
                 group_cfgs = {}
         else:
-            common_cfg = common_config
-            group_cfgs = group_configs
+            common_cfg = Configuration.from_dict(common_config)
+            group_cfgs = self._convert_group_configs(group_configs)
 
+        # At this stage, we have sanitized Configuration objects
         return common_cfg, group_cfgs
-
-    def _convert_dict_to_configuration(self, common_cfg: Dict | Configuration):
-        """Convert common config dict into a Configuration when possible."""
-        if isinstance(common_cfg, Configuration):
-            return common_cfg
-        if isinstance(common_cfg, dict):
-            try:
-                return Configuration.from_dict(common_cfg)
-            except Exception:
-                return common_cfg
-        return common_cfg
 
     def _convert_group_configs(self, group_cfgs: Dict):
         if not is_dict_of_dicts(group_cfgs):
@@ -214,23 +215,9 @@ class BioViewMonitor(QMainWindow):
         for group_id, device_dict in group_cfgs.items():
             converted[group_id] = {}
             for device_id, device_cfg in device_dict.items():
-                converted[group_id][device_id] = self._convert_dict_to_configuration(
-                    device_cfg
-                )
+                converted[group_id][device_id] = Configuration.from_dict(device_cfg)
 
         return converted
-
-    def _setup_client(self):
-        """Connect to client and wire UI handlers."""
-        self._create_client_worker()
-        self._connect_client_signals()
-        self.client_worker.start_client()
-
-    def _create_client_worker(self):
-        """Create the Client worker instance."""
-        self.client_worker = Client(
-            common_config=self.common_config, group_configs=self.group_configs
-        )
 
     def _connect_client_signals(self):
         """Connect client signals to UI handlers."""
@@ -247,13 +234,10 @@ class BioViewMonitor(QMainWindow):
         )
 
         # Device control signals
-        self.client_worker.device_connected.connect(self.on_device_connected)
-        self.client_worker.device_disconnected.connect(self.on_device_disconnected)
-        # Notify UI when a device connection attempt fails
-        if hasattr(self.client_worker, "device_connection_failed"):
-            self.client_worker.device_connection_failed.connect(
-                self.on_device_connection_failed
-            )
+        self.client_worker.device_init_succeeded.connect(self.on_device_connected)
+        self.client_worker.device_disconnect_succeeded.connect(
+            self.on_device_disconnected
+        )
         self.client_worker.streaming_started.connect(self.on_streaming_started)
         self.client_worker.streaming_stopped.connect(self.on_streaming_stopped)
 
@@ -261,15 +245,7 @@ class BioViewMonitor(QMainWindow):
         self.client_worker.devices_discovered.connect(self._handle_devices_discovered)
 
         # General info signals
-        self.client_worker.error_occurred.connect(
-            lambda msg: self.log_display_panel.log_message("error", msg)
-        )
         self.client_worker.log_message.connect(self.log_display_panel.log_message)
-
-    # removed temporary stdout print hook
-
-    # Legacy device pre-population helpers removed. The UI will only be
-    # updated from discovery responses to prevent showing stale configurations.
 
     def _connect_signals(self):
         """
@@ -337,7 +313,7 @@ class BioViewMonitor(QMainWindow):
 
     # --- Extracted signal connection helpers (keeps _connect_signals small) ---
     def _connect_command_bar_signals(self):
-        self.command_bar.connect_devices.connect(self.on_device_connection_requested)
+        self.command_bar.initialize_devices.connect(self.on_device_init_requested)
         self.command_bar.start_streaming.connect(self.client_worker.start_streaming)
         self.command_bar.stop_streaming.connect(self.client_worker.stop_streaming)
         self.command_bar.enable_data_saving.connect(self.update_save_state)
@@ -410,13 +386,10 @@ class BioViewMonitor(QMainWindow):
         try:
             # device_states is expected to be group->device->{config,state}
             self.device_states = devices_map
-            self._trace(
-                "debug", f"Devices discovered: groups={list(devices_map.keys())}"
-            )
+
             if getattr(self.status_bar, "update_devices", None):
                 # Forward discovery payload to status bar
                 self.status_bar.update_devices(devices_map)
-                self._trace("debug", "StatusBar.update_devices called")
         except Exception as e:
             self.log_display_panel.log_message("error", f"Failed to update devices: {e}")
 
@@ -454,7 +427,7 @@ class BioViewMonitor(QMainWindow):
             self.settings_panel.update_source("remove", source)
 
     # Command Bar helper functions
-    def on_device_connection_requested(self):
+    def on_device_init_requested(self):
         if self.client_worker:
             # Request server to connect all initialized devices
             # Update UI to show CONNECTING state for all known devices
@@ -464,7 +437,7 @@ class BioViewMonitor(QMainWindow):
                         device_id, DeviceStatus.CONNECTING
                     )
             # Request device connection; UI will be updated via device_connected signals
-            self.client_worker.connect_device()
+            self.client_worker.initialize_devices()
 
     def update_save_state(self):
         self.saving_status = True
@@ -477,39 +450,21 @@ class BioViewMonitor(QMainWindow):
             self.instruction_dialog.toggle_ui(self.enable_instructions)
 
     # Client worker helper functions
-    def on_server_connected(self, connected=True):
+    def on_server_connected(self):
         """Handle server connection"""
-        # connected is a boolean emitted by client_worker.server_connected
-        if connected:
-            # Centralize UI updates via ServerStatus
-            self.log_display_panel.log_message("info", "Connected to server")
+        # Centralize UI updates via ServerStatus
+        self.log_display_panel.log_message("info", "Connected to server")
 
-            try:
-                self.status_bar.set_server_status(ClientStatus.SERVER_CONNECTED)
-            except Exception:
-                self.log_display_panel.log_message(
-                    "warning", "Unable to update status bar"
-                )
-                self.status_bar.set_server_status(ClientStatus.SERVER_CONNECTED)
+        try:
+            self.status_bar.set_server_status(ClientStatus.SERVER_CONNECTED)
+        except Exception:
+            self.log_display_panel.log_message("warning", "Unable to update status bar")
+            self.status_bar.set_server_status(ClientStatus.SERVER_CONNECTED)
 
-            # Auto-ping
-            if self.client_worker:
-                self.client_worker.ping_server()
-
-            # Ensure UI buttons reflect connected state (defensive)
-            with contextlib.suppress(Exception):
-                # still ensure discover button enabled
-                self.status_bar.server_connector.discover_btn.setEnabled(True)
-
-        else:
-            try:
-                self.status_bar.set_server_status(ClientStatus.SERVER_DISCONNECTED)
-            except Exception:
-                self.log_display_panel.log_message(
-                    "warning", "Unable to update status bar"
-                )
-
-            self.log_display_panel.log_message("warning", "Failed to connect to server")
+        # Ensure UI buttons reflect connected state (defensive)
+        with contextlib.suppress(Exception):
+            # still ensure discover button enabled
+            self.status_bar.server_connector.discover_btn.setEnabled(True)
 
         # TODO: Populate display sources by querying server
 
@@ -522,10 +477,6 @@ class BioViewMonitor(QMainWindow):
         self.log_display_panel.log_message("warning", "Disconnected from server")
 
     def on_device_connected(self, device_id, success=True):
-        self._trace(
-            "debug",
-            f"on_device_connected called with device_id={device_id} success={success}",
-        )
         if device_id is None:
             # All devices connected
             for group_id, group in self.device_states.items():
@@ -549,16 +500,11 @@ class BioViewMonitor(QMainWindow):
                 device_id,
                 DeviceStatus.CONNECTED if success else DeviceStatus.DISCONNECTED,
             )
-            self._trace("info", f"Device connected: {device_id}")
 
         # Check if all are connected and if so, disable UI buttons
         self.update_buttons()
 
     def on_device_disconnected(self, device_id=None, success=True):
-        self._trace(
-            "debug",
-            f"on_device_disconnected called device_id={device_id} success={success}",
-        )
         if device_id is None:
             # Disconnect devices (all)
             for group_id, group in self.device_states.items():
@@ -672,8 +618,9 @@ if __name__ == "__main__":
             try:
                 # Load config
                 group_cfg = load_json_file(file_path)
-                # Since a group name won't be provided by default, use filename stem
-                # as base group id and ensure uniqueness
+
+                # Since a group name won't be provided by default, use
+                # filename stem as base group id and ensure uniqueness
                 stem = Path(file_path).stem or "group"
                 group_id = stem
                 suffix = 1
@@ -704,6 +651,7 @@ if __name__ == "__main__":
     qdarktheme.setup_theme(theme="auto")
 
     # Create and show main window with parsed configs and flags
+    # NOTE: Every config passed is JSON/dict format.
     window = BioViewMonitor(
         group_configs=cli_group_configs,
         common_config=cli_common_config,
@@ -712,41 +660,13 @@ if __name__ == "__main__":
     )
     window.show()
 
-    # Optionally trigger autodiscover. If autoconnect is requested, only attempt
-    # connection after the scan completes (one-time handler).
+    # If auto-discover, trigger the call
     if window.autodiscover and window.client_worker:
-        try:
-            if window.autoconnect:
+        handler = window.client_worker
+        handler.discover_servers()
 
-                def _on_scan_complete(servers):
-                    try:
-                        # servers is a list of discovered server info dicts. If any found,
-                        # pick the first and set it as the selected server so
-                        # connect_to_server() will not re-run discovery.
-                        if servers and isinstance(servers, list) and len(servers) > 0:
-                            with contextlib.suppress(Exception):
-                                window.client_worker.selected_server = servers[0]
-
-                        # attempt connect once (will skip discovery if selected_server set)
-                        with contextlib.suppress(Exception):
-                            window.client_worker.connect_to_server()
-
-                    finally:
-                        # disconnect this handler to avoid repeated attempts
-                        with contextlib.suppress(Exception):
-                            window.client_worker.server_scan_completed.disconnect(
-                                _on_scan_complete
-                            )
-
-                window.client_worker.server_scan_completed.connect(_on_scan_complete)
-
-            window.client_worker.discover_servers()
-        except Exception:
-            pass
-    elif window.autoconnect and window.client_worker:
-        # If autodiscover is disabled but autoconnect requested, attempt connect
-        # directly (this will perform an internal discover if needed).
-        with contextlib.suppress(Exception):
-            window.client_worker.connect_to_server()
+        if window.autoconnect and len(handler.discovered_servers) > 0:
+            handler.change_selected_server(0)
+            handler.connect_to_server()
 
     sys.exit(app.exec())

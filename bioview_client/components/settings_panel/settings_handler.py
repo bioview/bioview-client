@@ -5,7 +5,7 @@ from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import QTabWidget
 
 from .common_settings import CommonSettingsPanel
-from .device_settings import DeviceSettingsPanel
+from .device_settings import get_device_settings_panel
 
 
 class SettingsPanel(QTabWidget):
@@ -47,17 +47,21 @@ class SettingsPanel(QTabWidget):
             if isinstance(device_group_config, dict):
                 for device_id, device_cfg in device_group_config.items():
                     tab_label = f"{device_group_id}/{device_id}"
-                    dev_panel = DeviceSettingsPanel(device_cfg)
-                    self.device_settings_panel[tab_label] = dev_panel
-                    self.addTab(dev_panel, tab_label)
-                    dev_panel.log_event.connect(self.send_to_log)
+                    dev_panel = get_device_settings_panel(device_cfg)
+
+                    if dev_panel:
+                        self.device_settings_panel[tab_label] = dev_panel
+                        self.addTab(dev_panel, tab_label)
+                        dev_panel.log_event.connect(self.send_to_log)
             else:
                 # single device entry
                 tab_label = device_group_id
-                dev_panel = DeviceSettingsPanel(device_group_config)
-                self.device_settings_panel[tab_label] = dev_panel
-                self.addTab(dev_panel, tab_label)
-                dev_panel.log_event.connect(self.send_to_log)
+                dev_panel = get_device_settings_panel(device_group_config)
+
+                if dev_panel:
+                    self.device_settings_panel[tab_label] = dev_panel
+                    self.addTab(dev_panel, tab_label)
+                    dev_panel.log_event.connect(self.send_to_log)
 
         # Add styling
         self.setTabPosition(QTabWidget.TabPosition.South)

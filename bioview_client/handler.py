@@ -22,19 +22,18 @@ import socket
 import struct
 import threading
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 import numpy as np
 from bioview_common import (
     AUTH_TIMEOUT,
     CONTROL_PORT,
     DATA_PORT,
-    MAX_BUFFER_SIZE,
     RESPONSE_TIMEOUT,
-    SUPPORTED_COMMANDS,
     AuthenticationError,
     ClientStatus,
     Command,
+    Configuration,
     DataSource,
     DeviceStatus,
     Response,
@@ -43,7 +42,13 @@ from bioview_common import (
 )
 from PyQt6.QtCore import QObject, QRunnable, QThread, QThreadPool, pyqtSignal, pyqtSlot
 
-from bioview_client.utils import is_dict_of_dicts, parse_and_validate_response
+from bioview_client.utils import (
+    get_challenge_response,
+    group_config_to_dict,
+    is_dict_of_dicts,
+    parse_and_validate_response,
+    send_command,
+)
 
 
 class ScanWorkerSignals(QObject):
@@ -57,7 +62,7 @@ class DeviceDiscoverSignals(QObject):
 
 
 class ScanWorker(QRunnable):
-    def __init__(self, ip, control_port, timeout=0.5):
+    def __init__(self, ip, control_port, timeout=2):
         super().__init__()
         self.ip = ip
         self.control_port = control_port
@@ -66,37 +71,23 @@ class ScanWorker(QRunnable):
 
     def run(self):
         # Probe the control port on the target IP and emit a server info dict or None
+        server_info = None
+
         with contextlib.suppress(Exception):
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(self.timeout)
             s.connect((self.ip, self.control_port))
-            try:
-                # Send a lightweight ping command and wait for a response
-                ping = json.dumps(
-                    {"type": Command.PING_SERVER.value, "payload": {}}
-                ).encode("utf-8")
-                with contextlib.suppress(Exception):
-                    s.send(ping)
-                    data = s.recv(4096)
-                    if data:
-                        try:
-                            resp = parse_and_validate_response(data.decode("utf-8"))
-                            payload = (
-                                resp.get("payload", {}) if isinstance(resp, dict) else {}
-                            )
-                            server_info = payload.get("server_info", {})
-                        except Exception:
-                            server_info = {}
-                        server_info["address"] = self.ip
-                        self.signals.result.emit(server_info if server_info else None)
-                        return
-            finally:
-                with contextlib.suppress(Exception):
-                    s.close()
 
-        # Default: emit None when no server found or on error
-        with contextlib.suppress(Exception):
-            self.signals.result.emit(None)
+            # Request discovery and wait for a valid response
+            response = send_command(sock=s, command=Command.DISCOVER_SERVERS)
+
+            resp_type, resp_payload = parse_and_validate_response(response)
+            if resp_type == Response.SUCCESS.name:
+                server_info = resp_payload
+
+        # Finally, emit
+        s.close()
+        self.signals.result.emit(server_info)
 
 
 class DeviceDiscoverWorker(QRunnable):
@@ -112,35 +103,29 @@ class DeviceDiscoverWorker(QRunnable):
         try:
             devices = {}
 
-            # Device discovery can be slow on server side; use a longer timeout and
-            # do not disconnect the control socket on timeout so the client remains connected.
-            response = self.client_ref.send_control_command(
-                Command.DISCOVER_DEVICES,
+            # Device discovery can be slow on server side; use a longer timeout
+            self.client_ref.control_conn.setblocking(False)
+            response = send_command(
+                sock=self.client_ref.control_conn,
+                command=Command.DISCOVER_DEVICES,
                 params={
                     "config": self.client_ref.common_config or {},
                     "groups": self.client_ref.group_configs or {},
                 },
-                timeout=30.0,
-                disconnect_on_error=False,
             )
 
-            if response and isinstance(response, dict):
-                rtype = response.get("type")
-                payload = response.get("payload", {})
-                if rtype == Response.DEVICE_DISCOVERY_COMPLETED.value:
-                    devices = payload.get("devices", {})
+            resp_type, resp_payload = parse_and_validate_response(response)
+            if resp_type == Response.SUCCESS.name:
+                device_discovery_status = resp_payload.get("discovery_status", {})
 
             # Validate for correctness of format
-            if not is_dict_of_dicts(devices):
-                self.client_ref.log_message.emit(
-                    "debug",
-                    f"Invalid device format received: {devices}. Expected dict-of-dicts.",
-                )
-                devices = {}
+            if not is_dict_of_dicts(device_discovery_status):
+                raise ValueError(f"Invalid device format received: {devices}")
 
-            self.signals.finished.emit(devices)
-        except Exception:
-            # On error, emit empty list
+            self.signals.finished.emit(device_discovery_status)
+        except Exception as e:
+            # On error, emit empty dict
+            self.client_ref.log_message.emit("error", f"Device discovery failed: {e}")
             self.signals.finished.emit({})
 
 
@@ -155,20 +140,18 @@ class Client(QThread):
     server_status = pyqtSignal(dict)
 
     # Device control signals
-    device_connected = pyqtSignal(str, bool)
-    device_disconnected = pyqtSignal(str, bool)
-    # Emitted when a device connection attempt fails; provides device_id
-    device_connection_failed = pyqtSignal(str)
+    # Since all failure signals only need logging, we do
+    # not add explicit signals for failure, only success
+    devices_discovered = pyqtSignal(dict)
+    device_init_succeeded = pyqtSignal(dict)
+    device_status_updated = pyqtSignal(dict)
+    device_disconnect_succeeded = pyqtSignal()
+
+    # Streaming states
     streaming_started = pyqtSignal(bool)
     streaming_stopped = pyqtSignal(bool)
 
-    # Device info signals
-    devices_discovered = pyqtSignal(dict)
-    device_discovery_started = pyqtSignal()
-    device_discovery_finished = pyqtSignal(list)
-
     # General info signals
-    error_occurred = pyqtSignal(str)
     log_message = pyqtSignal(str, str)
 
     # Data signals for graphical output
@@ -184,7 +167,7 @@ class Client(QThread):
         resp_timeout: int = RESPONSE_TIMEOUT,
     ):
         super().__init__()
-        self.app_info = get_app_info()
+        self.info = get_app_info()
         self.auth_timeout = auth_timeout
         self.resp_timeout = resp_timeout
 
@@ -202,23 +185,17 @@ class Client(QThread):
 
         self.data_socket = None
         self.control_socket = None
-        self.control_connected = False
-        self.authenticated = False
 
         self.status = ClientStatus.DEFAULT
         self.data_connected = False
 
         # Thread pool for background tasks (scanning, device discovery)
         self.thread_pool = QThreadPool()
-        self.thread_pool.setMaxThreadCount(20)
+        self.thread_pool.setMaxThreadCount(255)
         self._cancel_scan = False
 
         # Device discovery state
         self._discovering_devices = False
-
-        # If user requested an explicit/intentional disconnect, set this flag
-        # so the background run-loop does not attempt to auto-reconnect.
-        self._manual_disconnect = False
 
         # Lock to serialize control (and related socket) operations to avoid races
         # between send/recv and close operations from different threads.
@@ -228,10 +205,18 @@ class Client(QThread):
         self.running = False
 
         # Keep track of common configuration
-        self.common_config = common_config or {}
+        # NOTE: We convert to dict here
+        self.common_config = {}
+
+        if common_config:
+            if isinstance(common_config, Configuration):
+                self.common_config = common_config.to_dict()
+            elif isinstance(common_config, dict):
+                self.common_config = common_config
 
         # Keep track of device configuration and states
-        self.group_configs = group_configs or {}
+        self.group_configs = group_config_to_dict(group_configs) if group_configs else {}
+
         # Now, while we understand devices in the form of groups, we keep track of
         # states for individual devices for clearer presentation in the UI
         self.device_states = {}
@@ -249,119 +234,40 @@ class Client(QThread):
     # Thread handling
     def run(self):
         self.log_message.emit("info", "Starting client handler...")
+
+        num_failures = 0
         while self.running:
-            # Honor an explicit user-requested disconnect: do not auto-reconnect
-            # while this flag is set. A subsequent user connect request must
-            # clear this flag (see request_connect).
-            if getattr(self, "_manual_disconnect", False):
-                time.sleep(0.1)
-                continue
-            if self.status != ClientStatus.SERVER_CONNECTED:
-                if self.connect_control():
-                    # note: control socket connected but not necessarily authenticated
-                    self.server_connected.emit(True)
-                else:
-                    time.sleep(2)
-                    continue
-            if self.status == ClientStatus.STREAMING and not self.data_connected:
-                # Only connect data socket if authenticated with control channel
-                if self.authenticated:
-                    self.connect_data()
-                else:
-                    time.sleep(0.1)
-                    continue
-            time.sleep(0.1)
+            # Periodically ping server if connected
+            if self.status == ClientStatus.SERVER_CONNECTED:
+                try:
+                    resp = send_command(self.control_socket, Command.PING_SERVER)
+                    resp_type, _ = parse_and_validate_response(resp)
 
-    ### Server commands
-    def ping_server(self):
-        """Test server connectivity"""
-        response = self.send_control_command(Command.PING_SERVER)
+                    if resp_type != Response.SUCCESS.name:
+                        num_failures += 1
+                        raise ConnectionAbortedError(
+                            f"Invalid ping response code: {resp_type}"
+                        )
+                except Exception as e:
+                    # Connection has closed. Reset if ping fails more than 3 times.
+                    self.log_message.emit("error", f"Server ping failed: {e}")
+                    if num_failures >= 3:
+                        self.disconnect_from_server()
+                        num_failures = 0
 
-        if response and response.get("type") == Response.INFO.value:
-            payload = response.get("payload", {})
-            server_info = (
-                payload.get("server_info", {}) if isinstance(payload, dict) else {}
-            )
-            sanitized = self._sanitize_server_info(
-                server_info, self.selected_server.get("address", "unknown")
-            )
-            # Ping success is noisy; log as debug to avoid cluttering info logs
-            self.log_message.emit(
-                "debug",
-                f"Server ping successful - {sanitized.get('hostname')}",
-            )
-            return True
-        else:
-            self.log_message.emit("error", "Server ping failed")
-            return False
+            time.sleep(5)  # Ping every 5 seconds or so
 
-    def connect_control(self) -> bool:
-        """Attempt to establish control and data socket connections to the selected server.
+            # TODO: ADD ANYTHING ELSE FUNCTIONALITY WISE
 
-        Returns True if control connection established, False otherwise.
-        """
-        try:
-            # If we already have a control socket and it's flagged connected, return True
-            if self.control_connected and self.control_socket:
-                return True
-
-            # Ensure selected_server exists
-            if not self.selected_server:
-                return False
-
-            # Connect control socket (serialize with lock to avoid races)
-            with self._control_lock:
-                if self.control_socket:
-                    self.control_socket.close()
-
-                self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.control_socket.settimeout(5.0)
-                self.control_socket.connect(
-                    (self.selected_server["address"], self.control_port)
-                )
-
-            self.control_connected = True
-            self.status = ClientStatus.SERVER_CONNECTED
-            return True
-
-        except Exception as e:
-            self.log_message.emit("error", f"Control connection failed: {e}")
-            self.control_connected = False
-            self.control_socket = None
-            return False
-
-    def connect_data(self) -> bool:
-        """Attempt to connect the data socket to the server's data port."""
-        try:
-            if self.data_connected and self.data_socket:
-                return True
-
-            if not self.selected_server:
-                return False
-
-            if self.data_socket:
-                with contextlib.suppress(Exception):
-                    self.data_socket.close()
-
-            self.data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.data_socket.settimeout(5.0)
-            self.data_socket.connect((self.selected_server["address"], self.data_port))
-            self.data_connected = True
-            return True
-        except Exception as e:
-            self.log_message.emit("error", f"Data connection failed: {e}")
-            self.data_connected = False
-            return False
-
-    ### Server scan using QThreadPool
+    # Discover servers in parallel
     def discover_servers(self):
-        """Parallel server scanning using QThreadPool"""
         self.status = ClientStatus.SCANNING
-        self._cancel_scan = False
         self.discovered_servers = []
 
-        total_ips = 254
+        # Track transient state for early stopping
+        self._cancel_scan = False
         self._completed_scans = 0
+        total_ips = 254  # Currently we are only scanning IPv4
         self._last_update_time = time.time()
 
         def handle_result(found):
@@ -376,20 +282,19 @@ class Client(QThread):
                 self.server_scan_progress.emit(progress)
                 self._last_update_time = now
 
-            # Collect servers if found (ScanWorker emits a dict or None)
             # Ensure we received a dict
             if found and isinstance(found, dict):
                 # Avoid duplicates
-                addr = found.get("address")
+                addr = found.get("ip")
+
                 if addr and not any(
-                    s.get("address") == addr for s in self.discovered_servers
+                    s.get("ip") == addr for s in self.discovered_servers
                 ):
                     self.discovered_servers.append(found)
 
             if self._completed_scans == total_ips:
                 self.status = ClientStatus.DEFAULT
                 # discovery results updated
-
                 self.server_scan_completed.emit(self.discovered_servers)
 
         for i in range(1, 255):
@@ -406,158 +311,61 @@ class Client(QThread):
         self.thread_pool.clear()
 
     # Authentication check for initial connection to server
-    def authenticate_with_server(
-        self,
-        server_address: Tuple[str, int],  # (address, control port)
-        server_socket: socket.socket,
-    ) -> Dict[str, Any]:
+    def _authenticate_with_server(self, server_socket: socket.socket) -> Dict[str, Any]:
         """
-        Perform handshake with server.
-        Returns server info if successful, raises AuthenticationError if failed.
+        !WARNING: May throw exception
         """
-        server_ip = server_address[0]
+        server_socket.settimeout(self.auth_timeout)
 
-        try:
-            server_socket.settimeout(self.auth_timeout)
+        # Step 1: Broadcast client info to server and get response
+        response = send_command(
+            sock=server_socket,
+            command=Command.CONNECT_SERVER,
+            params={"client_info": self.info, "timestamp": time.time()},
+        )
 
-            # Step 1: Broadcast client info to server (syn)
-            client_syn = {
-                "type": Command.CONNECT_SERVER.value,
-                "payload": {
-                    "hostname": self.app_info["hostname"],
-                    "app_name": self.app_info["app_name"],
-                    "app_version": self.app_info["app_version"],
-                    "timestamp": time.time(),
-                },
-            }
+        resp_type, resp_payload = parse_and_validate_response(response)
 
-            server_socket.send(json.dumps(client_syn).encode("utf-8"))
+        # Step 2a: Check if connection was refused
+        if resp_type == Response.CONNECTION_REFUSED.name:
+            message = resp_payload.get("message", "Connection refused by server")
+            raise AuthenticationError(f"Connection refused by server: {message}")
 
-            # Step 2: Receive server challenge or connection refusal (ack)
-            response_type, response_payload = self._recv_and_validate_response(
-                server_socket, expected_type=Response.SERVER_CHALLENGE.value
-            )
+        # Step 2b: Check if server provided a challenge
+        if resp_type == Response.SERVER_CHALLENGE.name:
+            challenge = resp_payload.get("challenge", None)
 
-            # Extract server hostname info
-            server_hostname = response_payload.get("hostname", server_ip)
-
-            # Check if connection was refused
-            if response_type == Response.CONNECTION_REFUSED.value:
-                message = response_payload.get("message", "Connection refused by server")
-                raise AuthenticationError(
-                    f"Connection refused by {server_hostname}: {message}"
-                )
-
-            # Authenticate server using challenge
-            challenge = response_payload.get("challenge")
             if not challenge:
                 raise AuthenticationError("Server did not provide authentication token")
 
-            auth_token = self._get_challenge_response(challenge)
-            client_response_dict = {
-                "type": Command.AUTHENTICATE_CLIENT.value,
-                "payload": {"token": auth_token, "timestamp": time.time()},
-            }
-            server_socket.send(json.dumps(client_response_dict).encode("utf-8"))
+            auth_token = get_challenge_response(challenge)
 
-            auth_result_type, auth_result_payload = self._recv_and_validate_response(
-                server_socket, expected_type=None
+            auth_response = send_command(
+                sock=server_socket,
+                command=Command.AUTHENTICATE_CLIENT,
+                params={"token": auth_token, "timestamp": time.time()},
             )
 
-            # normalize auth_result_type for expected success/failure
-            auth_type_norm = (
-                auth_result_type.lower()
-                if isinstance(auth_result_type, str)
-                else str(auth_result_type).lower()
+            # Check results
+            auth_resp_type, auth_resp_payload = parse_and_validate_response(
+                auth_response
             )
-            if auth_type_norm not in {
-                Response.AUTHENTICATION_SUCCESS.value.lower(),
-                Response.AUTHENTICATION_FAILURE.value.lower(),
-            }:
+
+            if auth_resp_type == Response.AUTHENTICATION_SUCCESS.name:
+                server_info = auth_resp_payload.get("server_info", {})
+
+                # Update status
+                self.status = ClientStatus.SERVER_CONNECTED
+
+                self.log_message.emit(
+                    "info", f"Successfully connected to {server_info.get('hostname')}"
+                )
+            else:
                 raise AuthenticationError(
-                    f"Unexpected auth response type: {auth_result_type}"
+                    f'Server authentication failed: {auth_resp_payload.get("message", "")}'
                 )
 
-            server_info = auth_result_payload.get("server_info", {})
-            sanitized = self._sanitize_server_info(server_info, server_ip)
-
-            self.authenticated = True
-            self.log_message.emit(
-                "info", f"Successfully connected to {sanitized.get('hostname')}"
-            )
-            return sanitized
-
-        except socket.timeout:
-            self.log_message.emit("error", "Authentication timeout")
-            raise AuthenticationError("Authentication timeout") from None
-        except AuthenticationError:
-            raise
-        except Exception as e:
-            self.log_message.emit("error", f"Client authentication error: {e}")
-            raise AuthenticationError(f"Authentication failed: {str(e)}") from None
-
-    def _get_challenge_response(self, challenge: str) -> str:
-        """Compute the response token for a given challenge.
-
-        Uses SHA-256 over the canonical string "{challenge}:{app_version}" where
-        app_version is taken from the client app info (or falls back to APP_VERSION).
-        """
-        try:
-            # Prefer the packaged app version from app_info
-            app_version = None
-            try:
-                app_version = self.app_info.get("app_version")
-            except Exception:
-                app_version = None
-
-            if not app_version:
-                # import here to avoid circular imports at module load
-                from bioview_common import APP_VERSION
-
-                app_version = str(APP_VERSION)
-
-            import hashlib
-
-            m = hashlib.sha256()
-            m.update(f"{challenge}:{app_version}".encode())
-            return m.hexdigest()
-        except Exception:
-            # As a fallback, return an empty token to force auth failure rather than crash
-            return ""
-
-    def _recv_and_validate_response(
-        self, server_socket: socket.socket, expected_type=None
-    ):
-        """Receive raw data from server socket and validate it using network helper.
-
-        Converts parsing/validation errors into AuthenticationError for callers.
-        Returns (response_type, response_payload).
-        """
-        try:
-            raw = server_socket.recv(4096).decode("utf-8")
-        except Exception as e:
-            raise AuthenticationError(f"Failed to receive response: {e}") from e
-
-        try:
-            return parse_and_validate_response(raw, response_type=expected_type)
-        except Exception as e:
-            # Map any parsing/validation error to AuthenticationError for caller clarity
-            raise AuthenticationError(f"Invalid response from server: {e}") from e
-
-    def _sanitize_server_info(self, server_info: dict, fallback_ip: str) -> dict:
-        """Ensure server_info dict contains JSON-serializable primitives and hostname fallback."""
-        sanitized = {}
-        for k, v in (server_info or {}).items():
-            try:
-                json.dumps({k: v})
-                sanitized[k] = v
-            except Exception:
-                sanitized[k] = str(v)
-
-        if "hostname" not in sanitized or not sanitized.get("hostname"):
-            sanitized["hostname"] = fallback_ip
-
-        return sanitized
+            return server_info
 
     def change_selected_server(self, index: int):
         if self.discovered_servers is None or len(self.discovered_servers) == 0:
@@ -568,15 +376,16 @@ class Client(QThread):
             self.selected_server = self.discovered_servers[index]
 
     def connect_to_server(self):
+        if len(self.discovered_servers) == 0:
+            self.discover_servers()
+
         if self.selected_server == {}:
             self.log_message.emit(
                 "warn",
                 "No server selected. Automatically connecting to an available server.",
             )
-            self.discover_servers()
             if len(self.discovered_servers) == 0:
                 self.log_message.emit("error", "No valid servers available.")
-                self.server_connected.emit(False)
                 return
             else:
                 self.selected_server = self.discovered_servers[0]
@@ -592,56 +401,45 @@ class Client(QThread):
                         self.control_socket.close()
 
                 self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.control_socket.settimeout(5.0)
+                self.control_socket.settimeout(self.resp_timeout)
                 self.control_socket.connect(
-                    (self.selected_server["address"], self.control_port)
+                    (self.selected_server["ip"], self.control_port)
                 )
 
             # Perform authentication handshake over the connected control socket
-            server_info = self.authenticate_with_server(
-                (self.selected_server["address"], self.control_port), self.control_socket
-            )
+            server_info = self._authenticate_with_server(self.control_socket)
 
-            # Update selected_server with returned server_info
+            # Update selected_server with returned info
             if server_info:
-                self.selected_server.update(server_info)
-
-            self.control_connected = True
-            # authenticated
-
-            # Connect to data server - close pre-existing connections (guard close)
-            if self.data_socket:
-                with contextlib.suppress(Exception):
+                # Connect data - close pre-existing connections
+                if self.data_socket:
                     self.data_socket.close()
 
-            self.data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.data_socket.settimeout(5.0)
-            self.data_socket.connect((self.selected_server["address"], self.data_port))
-            self.data_connected = True
+                self.data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.data_socket.settimeout(5.0)
+                self.data_socket.connect((self.selected_server["ip"], self.data_port))
 
-            # data server connected
+                # Update server info
+                self.selected_server.update(server_info)
 
-            # Emit status
+            # Once everything succeeds, update the status
             self.status = ClientStatus.SERVER_CONNECTED
             self.server_connected.emit(True)
-            # After successful connect, request device discovery asynchronously
-            # so we don't block UI. Background worker will emit discovery signals.
-            try:
-                # Start background discovery (DeviceDiscoverWorker is used by discover_devices)
-                self.discover_devices()
-            except Exception:
-                # Best-effort: don't fail the connection flow if discovery cannot start
-                self.log_message.emit(
-                    "debug", "Background device discovery could not be started"
-                )
-        except AuthenticationError as e:
-            self.status = ClientStatus.DEFAULT
-            self.log_message.emit("error", f"Authentication failed: {e}")
-            self.server_connected.emit(False)
+
         except Exception as e:
+            # Reset status
             self.status = ClientStatus.DEFAULT
+
+            # Reset sockets
+            with contextlib.suppress(Exception):
+                self.control_socket.close()
+            self.control_socket = None
+            with contextlib.suppress(Exception):
+                self.data_socket.close()
+            self.data_socket = None
+
+            # Log message in UI
             self.log_message.emit("error", f"Server connection failed: {e}")
-            self.server_connected.emit(False)
 
     def disconnect_from_server(self):
         # Acquire lock while closing control socket to avoid closing under concurrent send/recv
@@ -656,128 +454,16 @@ class Client(QThread):
                     self.data_socket.close()
                 self.data_socket = None
 
-            self.control_connected = False
-            self.data_connected = False
-
         self.status = ClientStatus.SERVER_DISCONNECTED
+
         try:
             self.server_disconnected.emit(True)
         except Exception:
             self.server_disconnected.emit()
+
         self.log_message.emit("info", "Disconnected from server")
 
-    # Public convenience API for UI-driven requests --------------------------------
-    def request_disconnect(self):
-        """User-requested disconnect: mark as manual to avoid auto-reconnect.
-
-        This wrapper ensures that a disconnect initiated by the UI will not be
-        immediately undone by the client's background run-loop trying to
-        re-establish the control socket.
-        """
-        with contextlib.suppress(Exception):
-            self._manual_disconnect = True
-
-        # Perform normal disconnect cleanup
-        self.disconnect_from_server()
-
-    def request_connect(self, server_info: dict = None):
-        """User-requested connect: clear manual-disconnect flag and attempt connection.
-
-        If a server_info dict is provided it becomes the selected server
-        before initiating the connection.
-        """
-        with contextlib.suppress(Exception):
-            # Clear manual disconnect so run-loop may reconnect if needed
-            self._manual_disconnect = False
-
-        if server_info:
-            self.selected_server = server_info
-
-        # Attempt an immediate connection
-        with contextlib.suppress(Exception):
-            self.connect_to_server()
-
     ### Device Commands
-
-    ### General functions
-    def _send_and_receive(self, command_data: bytes, timeout: float = None) -> bytes:
-        """Send command_data and receive response under the control lock.
-
-        This helper temporarily sets socket timeout if requested and restores it.
-        """
-        with self._control_lock:
-            prev_timeout = None
-            try:
-                if timeout is not None and self.control_socket is not None:
-                    prev_timeout = self.control_socket.gettimeout()
-                    self.control_socket.settimeout(timeout)
-
-                # removed detailed send trace
-
-                self.control_socket.send(command_data)
-                response_data = self.control_socket.recv(MAX_BUFFER_SIZE)
-                # removed detailed recv trace
-            finally:
-                with contextlib.suppress(Exception):
-                    if timeout is not None and self.control_socket is not None:
-                        self.control_socket.settimeout(prev_timeout)
-
-        return response_data
-
-    def send_control_command(
-        self,
-        command_type,
-        params=None,
-        timeout: float = None,
-        disconnect_on_error: bool = True,
-    ):
-        """Send control command to server"""
-        if not self.control_connected:
-            self.error_occurred.emit("Not connected to control server")
-            return None
-
-        if (
-            not isinstance(command_type, Command)
-            or command_type.name not in SUPPORTED_COMMANDS
-        ):
-            self.error_occurred.emit(
-                f"Invalid command sent: {command_type} \n Supported commands are: {SUPPORTED_COMMANDS}"
-            )
-            return None
-
-        # Ensure params are JSON-serializable (convert Configuration objects etc.)
-        command = {"type": command_type.value, "payload": params or {}}
-
-        try:
-            command_data = json.dumps(command).encode("utf-8")
-            response_data = self._send_and_receive(command_data, timeout=timeout)
-
-            if not response_data:
-                return None
-
-            resp = None
-            try:
-                resp = json.loads(response_data.decode("utf-8"))
-            except Exception:
-                self.log_message.emit("error", "Failed to parse control response")
-
-            return resp
-
-        except socket.timeout as e:
-            # For long-running ops like discovery, caller may opt to not disconnect on timeout
-            self.error_occurred.emit(f"Control communication error: {e}")
-            if disconnect_on_error:
-                with contextlib.suppress(Exception):
-                    self.disconnect_from_server()
-            return None
-        except Exception as e:
-            self.error_occurred.emit(f"Control communication error: {e}")
-            # Ensure we close sockets safely (unless caller disabled it)
-            if disconnect_on_error:
-                with contextlib.suppress(Exception):
-                    self.disconnect_from_server()
-            return None
-
     def discover_devices(self):
         # Avoid starting another discovery while one is active
         if self._discovering_devices:
@@ -786,7 +472,6 @@ class Client(QThread):
 
         self.log_message.emit("info", "Discovering devices...")
         self._discovering_devices = True
-        self.device_discovery_started.emit()
 
         worker = DeviceDiscoverWorker(self)
 
@@ -794,7 +479,9 @@ class Client(QThread):
             """
             Server response for discovered groups follows the same convention as handler, i.e.
             'group_id': {
-                'device_id': DeviceStatus
+                'device_id': {
+                    'status': DeviceStatus
+                }
             }
 
             Note that the server will only return devices for groups that were requested in the
@@ -833,105 +520,98 @@ class Client(QThread):
         worker.signals.finished.connect(_on_finished)
         self.thread_pool.start(worker)
 
-    def connect_device(self, device_id=None):
-        """Connect to device"""
+    def initialize_devices(self):
+        """
+        Send a command to initialize all discovered devices.
+        """
+
         if getattr(self, "_discovering_devices", False):
-            self.error_occurred.emit(
-                "Cannot connect to device while device discovery is in progress"
+            self.log_message.emit(
+                "warning",
+                "Cannot connect to device while device discovery is in progress",
             )
-            return False
+            return
+
         self.log_message.emit("info", "Connecting all discovered devices...")
-        # Request server to connect all initialized devices; no per-device payload
-        # Use a longer timeout for potentially slow device connect operations
-        response = self.send_control_command(
-            Command.CONNECT_DEVICES, timeout=30.0, disconnect_on_error=False
+
+        # Request server to connect all initialized devices
+        self.control_socket.settimeout(30)  # Higher timeout for device discovery
+
+        response = send_command(
+            sock=self.control_socket,
+            command=Command.INITIALIZE_DEVICES,
+            params={"device_groups": self.group_configs},
         )
-        # Handle new device lifecycle response types
-        if response and isinstance(response, dict):
-            rtype = response.get("type")
-            payload = response.get("payload", {})
 
-            devices = payload.get("devices", {})
-            for device_id in devices:
-                for group_id, group in self.device_states.items():
-                    if device_id not in group:
-                        continue
+        resp_type, resp_payload = parse_and_validate_response(response)
 
-                    match rtype:
-                        case Response.DEVICE_CONNECTING.value:
-                            self.device_states[group_id][device_id][
-                                "state"
-                            ] = DeviceStatus.CONNECTING
-                            self.device_connected.emit(device_id, False)
+        # Payload will have two dicts, "discovered_devices" and "connection_states"
+        if resp_type == Response.ERROR.name:
+            # If nothing really worked
+            msg = resp_payload.get("message", "")
+            self.log_message.emit("error", f"Device connection failed: {msg}")
+        else:
+            # If something worked, we will get two items in payload
+            discovered_device_dict = resp_payload.get("discovered_devices", {})
+            group_connection_states = resp_payload.get("connection_states", {})
 
-                        case Response.DEVICE_CONNECTED.value:
+            if discovered_device_dict == {}:
+                # Error
+                self.log_message.emit("error", "No devices discovered")
+                return
+
+            for group_id, group_dict in discovered_device_dict.items():
+                for device_id, device_dict in group_dict.items():
+                    if device_dict["state"] == DeviceStatus.UNAVAILABLE.name:
+                        self.device_states[group_id][device_id][
+                            "state"
+                        ] = DeviceStatus.UNAVAILABLE
+                    else:
+                        # If available, check for connected state
+                        if (
+                            group_connection_states[group_id]
+                            == DeviceStatus.CONNECTED.name
+                        ):
                             self.device_states[group_id][device_id][
                                 "state"
                             ] = DeviceStatus.CONNECTED
-                            self.device_connected.emit(device_id, True)
-
-                        case Response.DEVICE_DISCONNECTED.value:
+                        else:
                             self.device_states[group_id][device_id][
                                 "state"
-                            ] = DeviceStatus.DISCONNECTED
-                            self.device_disconnected.emit(device_id, True)
+                            ] = DeviceStatus.AVAILABLE
 
-                    break
-
-            return True
-
-        # If we reach here, it's an error
-        if response and isinstance(response, dict):
-            payload = response.get("payload", {})
-            error_msg = payload.get("message", "Unknown error")
-        else:
-            error_msg = "No response"
-
-        self.error_occurred.emit(f"Device connection failed: {error_msg}")
-        self.device_connection_failed.emit(device_id)
-        return False
+            self.device_init_succeeded.emit(self.device_states)
 
     def disconnect_device(self):
-        """Disconnect from device"""
-        self.log_message.emit("info", "Disconnecting device...")
+        self.log_message.emit("info", "Disconnecting devices...")
 
-        # Stop streaming first
-        if self.status == ClientStatus.STREAMING:
+        # Stop streaming first is currently going
+        if self.status is ClientStatus.STREAMING:
             self.stop_streaming()
 
-        response = self.send_control_command(Command.DISCONNECT_DEVICES)
+        response = send_command(Command.DISCONNECT_DEVICES)
+        resp_type, resp_payload = parse_and_validate_response(response)
 
-        if response and response.get("type") == Response.SUCCESS.value:
-            self.log_message.emit("info", "Device disconnected")
-            self.device_disconnected.emit()
-            return True
+        if resp_type == Response.SUCCESS.name:
+            self.log_message.emit("info", "Devices disconnected")
+            self.device_disconnect_succeeded.emit()
         else:
-            if response and isinstance(response, dict):
-                payload = (
-                    response.get("payload", {}) if isinstance(response, dict) else {}
-                )
-                error_msg = payload.get("message", "Unknown error")
-            else:
-                error_msg = "No response"
-            self.error_occurred.emit(f"Disconnect failed: {error_msg}")
-            return False
+            msg = resp_payload.get("message", "")
+            self.log_message.emit("error", f"Disconnect failed: {msg}")
 
+    # Data streaming handlers
     def start_streaming(self):
-        """Start real-time data streaming (device-level streaming).
-
-        Sends a START command over the control channel and updates client state.
-        The background run loop will attempt to connect the data socket if needed.
-        """
         if getattr(self, "_discovering_devices", False):
-            self.error_occurred.emit(
-                "Cannot start streaming while device discovery is in progress"
+            self.log_message.emit(
+                "warning", "Cannot start streaming while device discovery is in progress"
             )
             return False
 
-        self.log_message.emit("info", "Starting data streaming...")
-        response = self.send_control_command(Command.START_STREAMING)
+        self.log_message.emit("info", "Attempting to start data streaming...")
+        response = send_command(Command.START_STREAMING)
+        resp_type, resp_payload = parse_and_validate_response(response)
 
-        if response and response.get("type") == Response.SUCCESS.value:
+        if resp_type == Response.SUCCESS.name:
             # Enter streaming state; data socket will be connected by run() or here
             self.status = ClientStatus.STREAMING
             self.log_message.emit("info", "Data streaming started")
@@ -944,91 +624,68 @@ class Client(QThread):
                         )
                         self.data_socket.settimeout(5.0)
                         self.data_socket.connect(
-                            (self.selected_server.get("address"), self.data_port)
+                            (self.selected_server.get("ip"), self.data_port)
                         )
                     self.data_connected = True
             except Exception as e:
                 self.log_message.emit("error", f"Data connection failed: {e}")
 
             self.streaming_started.emit(True)
-            return True
         else:
-            if response and isinstance(response, dict):
-                payload = (
-                    response.get("payload", {}) if isinstance(response, dict) else {}
-                )
-                error_msg = payload.get("message", "Unknown error")
-            else:
-                error_msg = "No response"
-            self.error_occurred.emit(f"Failed to start streaming: {error_msg}")
-            return False
+            msg = resp_payload.get("message", "")
+            self.log_message.emit("error", f"Failed to start streaming: {msg}")
 
     def stop_streaming(self):
-        """Stop data streaming from device(s)."""
         if getattr(self, "_discovering_devices", False):
-            self.error_occurred.emit(
-                "Cannot stop streaming while device discovery is in progress"
+            self.log_message.emit(
+                "warning", "Cannot stop streaming while device discovery is in progress"
             )
             return False
 
         self.log_message.emit("info", "Stopping data streaming...")
 
-        response = self.send_control_command(Command.STOP_STREAMING)
+        response = send_command(Command.STOP_STREAMING)
+        resp_type, resp_payload = parse_and_validate_response(response)
 
-        # Close/cleanup data socket regardless of control response
+        if resp_type == Response.ERROR.name:
+            msg = f'Failed to stop streaming: {resp_payload.get('message', '')}'
+            self.log_message.emit("error", msg)
+
+        # Stop receiving data regardless
         if self.data_socket:
             with contextlib.suppress(Exception):
                 self.data_socket.close()
             self.data_socket = None
             self.data_connected = False
 
-        # Update status back to connected server
+        # Update status back to connected, non-streaming server
         self.status = ClientStatus.SERVER_CONNECTED
-
-        if response and response.get("type") == Response.SUCCESS.value:
-            self.log_message.emit("info", "Data streaming stopped")
-            self.streaming_stopped.emit(True)
-            return True
-        else:
-            if response and isinstance(response, dict):
-                payload = (
-                    response.get("payload", {}) if isinstance(response, dict) else {}
-                )
-                error_msg = payload.get("message", "Unknown error")
-            else:
-                error_msg = "No response"
-            self.error_occurred.emit(f"Failed to stop streaming: {error_msg}")
-            return False
 
     def configure_device(self, device_id, config):
         """Configure device parameters"""
         if getattr(self, "_discovering_devices", False):
-            self.error_occurred.emit(
-                "Cannot configure device while device discovery is in progress"
+            self.log_message.emit(
+                "warning",
+                "Cannot configure device while device discovery is in progress",
             )
             return False
 
         self.log_message.emit("info", "Configuring device: {device_id}")
-        response = self.send_control_command(
+        response = send_command(
             Command.UPDATE_RUNNING_PARAMETER, {"id": device_id, "config": config}
         )
 
-        if response and response.get("type") == Response.SUCCESS.value:
-            self.log_message.emit("info", "Device configured successfully")
+        resp_type, resp_payload = parse_and_validate_response(response)
+
+        if resp_type == Response.SUCCESS.name:
+            self.log_message.emit("debug", "Successfully updated device parameter")
+            # TODO: Let UI know to update things correctly.
             return True
         else:
-            if response and isinstance(response, dict):
-                payload = (
-                    response.get("payload", {}) if isinstance(response, dict) else {}
-                )
-                error_msg = payload.get("message", "Unknown error")
-            else:
-                error_msg = "No response"
-            self.error_occurred.emit(f"Configuration failed: {error_msg}")
+            msg = resp_payload.get("message", "")
+            self.log_message.emit("debug", f"Failed to update parameter: {msg}")
+            # TODO: Update UI
             return False
-
-    def update_params(self, config):
-        pass
 
     # Client function for PyQt loops
     def start_client(self):
@@ -1041,7 +698,6 @@ class Client(QThread):
         self.running = False
         self.disconnect_from_server()
         self.quit()
-        self.wait()
 
     ### Helpers
     def get_display_sources(self):

@@ -154,13 +154,16 @@ class ServerConnector(QWidget):
         # Save discovered servers and populate by hostname when available
         self.server_dropdown.clear()
         for server in discovered_servers:
-            hostname = server.get("hostname") or ""
-            address = server.get("address") or ""
-            if hostname and hostname != address:
-                name = f"{hostname} ({address})"
-            else:
-                name = address or hostname or str(server)
-            self.server_dropdown.addItem(name)
+            display_name = server.get("hostname", None)
+
+            if not display_name:
+                # Fallback to IP
+                display_name = server.get("ip", None)
+
+            if not display_name:
+                display_name = "Dummy Server"
+
+            self.server_dropdown.addItem(display_name)
 
         # enable connect only when we have choices -- centralize via StatusBar
         self.server_dropdown.setEnabled(True)

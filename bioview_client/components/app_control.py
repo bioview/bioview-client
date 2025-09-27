@@ -8,7 +8,7 @@ from bioview_client.constants import get_qcolor
 
 class AppControlPanel(QGroupBox):
     # Define signals to emit changes to connection status
-    connect_devices = pyqtSignal()
+    initialize_devices = pyqtSignal()
     start_streaming = pyqtSignal()
     stop_streaming = pyqtSignal()
     enable_data_saving = pyqtSignal(bool)
@@ -22,10 +22,12 @@ class AppControlPanel(QGroupBox):
         layout = QHBoxLayout()
 
         # Connect Button
-        self.connect_button = QPushButton("Connect")
-        self.connect_button.setIcon(qta.icon("fa6s.house", color=get_qcolor("purple")))
-        self.connect_button.clicked.connect(self.on_connect_clicked)
-        layout.addWidget(self.connect_button)
+        self.initialize_button = QPushButton("Initialize")
+        self.initialize_button.setIcon(
+            qta.icon("fa6s.house", color=get_qcolor("purple"))
+        )
+        self.initialize_button.clicked.connect(self.on_initialize_clicked)
+        layout.addWidget(self.initialize_button)
 
         # Start Button
         self.start_button = QPushButton("Start")
@@ -80,12 +82,13 @@ class AppControlPanel(QGroupBox):
         return super().event(event)
 
     def update_button_states(self, device_status):
+        # TODO: Update to deal with connection status - bring from main monitor
         if device_status == DeviceStatus.NOINIT:
-            self.connect_button.setEnabled(True)
+            self.initialize_button.setEnabled(True)
             self.gain_balance_button.setEnabled(False)
 
         elif device_status == DeviceStatus.CONNECTING:
-            self.connect_button.setEnabled(False)
+            self.initialize_button.setEnabled(False)
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(False)
 
@@ -93,7 +96,7 @@ class AppControlPanel(QGroupBox):
             self.start_button.setEnabled(True)
             self.stop_button.setEnabled(False)
             self.save_checkbox.setEnabled(True)
-            self.connect_button.setEnabled(False)
+            self.initialize_button.setEnabled(False)
 
         elif device_status == DeviceStatus.STREAMING:
             self.start_button.setEnabled(False)
@@ -102,7 +105,7 @@ class AppControlPanel(QGroupBox):
             self.gain_balance_button.setEnabled(True)
 
         elif device_status == DeviceStatus.DISCONNECTED:
-            self.connect_button.setEnabled(True)
+            self.initialize_button.setEnabled(True)
             self.start_button.setEnabled(False)
             self.save_checkbox.setEnabled(True)
             self.stop_button.setEnabled(False)
@@ -112,8 +115,8 @@ class AppControlPanel(QGroupBox):
             # TODO: Log error
             pass
 
-    def on_connect_clicked(self):
-        self.connect_devices.emit()
+    def on_initialize_clicked(self):
+        self.initialize_devices.emit()
 
     def on_start_clicked(self):
         self.start_streaming.emit()

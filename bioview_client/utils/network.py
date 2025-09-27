@@ -1,66 +1,60 @@
 import json
 from typing import List
 
-from bioview_common import SUPPORTED_RESPONSES, ValidationError, validate_message_format
+from bioview_common import (
+    MAX_BUFFER_SIZE,
+    SUPPORTED_COMMANDS,
+    SUPPORTED_RESPONSES,
+    Command,
+    ValidationError,
+    log_print,
+)
 
 
-def _build_supported_values():
-    """Return a set of possible string forms for SUPPORTED_RESPONSES for tolerant matching."""
-    vals = set()
+def send_command(
+    sock, command, params=None, logger=None, buffer_size: int = MAX_BUFFER_SIZE
+):
+    """
+    Sends a command and returns a response.
+    """
+    if not isinstance(command, Command) or command.name not in SUPPORTED_COMMANDS:
+        log_print(logger, "error", f"Invalid command: {command}")
+        return None
+
     try:
-        for r in SUPPORTED_RESPONSES:
-            if hasattr(r, "name"):
-                vals.add(r.name)
-                vals.add(r.name.lower())
-            if hasattr(r, "value") and isinstance(r.value, str):
-                vals.add(r.value)
-                vals.add(r.value.lower())
-            vals.add(str(r))
-            vals.add(str(r).lower())
-    except Exception:
-        v = SUPPORTED_RESPONSES
-        vals.add(v)
-        if isinstance(v, str):
-            vals.add(v.lower())
-    return vals
+        command_dict = {"type": command.name, "payload": params or {}}
+        command_json = json.dumps(command_dict).encode("utf-8")
+        sock.send(command_json)
+    except Exception as e:
+        msg = f"Error occurred while sending command: {e}"
+        log_print(logger, "error", msg, fallback=True)
+        return None
+
+    # If we are here, a valid command has been sent. Wait for response
+    response = sock.recv(buffer_size)
+
+    return response
 
 
-def parse_and_validate_response(data: str, response_type=None) -> List:
+def parse_and_validate_response(data: str) -> List:
     if not data:
         raise ValidationError("Server returned no response")
 
     try:
-        message = json.loads(data)
+        message = json.loads(data.decode("utf-8"))
     except json.JSONDecodeError as e:
         raise ValidationError("Invalid JSON format") from e
 
-    # Validate message structure
-    required_fields = ["type", "payload"]
-    if not validate_message_format(message, required_fields):
-        raise ValidationError("Message missing required fields")
-
     # Validate response type
-    received_type = message.get("type")
-    supported_values = _build_supported_values()
-    recv_norm = (
-        received_type.lower()
-        if isinstance(received_type, str)
-        else str(received_type).lower()
-    )
-    if recv_norm not in {s.lower() for s in supported_values}:
-        raise ValidationError(f"Unsupported response: {received_type}")
-
-    # If a specific expected response_type was provided, verify it matches
-    if response_type and response_type != received_type:
-        raise ValidationError(
-            f"Incorrect response type: {received_type}. Expected: {response_type}"
-        )
+    resp_type = message.get("type", None)
+    if not resp_type or resp_type not in SUPPORTED_RESPONSES:
+        raise ValidationError(f"Invalid response: {resp_type}")
 
     # Validate payload is a dictionary
-    received_payload = message.get("payload")
-    if not isinstance(received_payload, dict):
+    resp_payload = message.get("payload")
+    if not isinstance(resp_payload, dict):
         raise ValidationError(
-            f"payload must be a dict but got {type(received_payload)} instead"
+            f"payload must be a dict but got {type(resp_payload)} instead"
         )
 
-    return received_type, received_payload
+    return resp_type, resp_payload
