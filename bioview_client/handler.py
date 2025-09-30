@@ -100,13 +100,12 @@ class DeviceDiscoverWorker(QRunnable):
 
     @pyqtSlot()
     def run(self):
+        device_discovery_status = {}
         try:
-            devices = {}
-
             # Device discovery can be slow on server side; use a longer timeout
-            self.client_ref.control_conn.setblocking(False)
+            self.client_ref.control_socket.settimeout(30)
             response = send_command(
-                sock=self.client_ref.control_conn,
+                sock=self.client_ref.control_socket,
                 command=Command.DISCOVER_DEVICES,
                 params={
                     "config": self.client_ref.common_config or {},
@@ -115,12 +114,15 @@ class DeviceDiscoverWorker(QRunnable):
             )
 
             resp_type, resp_payload = parse_and_validate_response(response)
+
             if resp_type == Response.SUCCESS.name:
                 device_discovery_status = resp_payload.get("discovery_status", {})
 
             # Validate for correctness of format
             if not is_dict_of_dicts(device_discovery_status):
-                raise ValueError(f"Invalid device format received: {devices}")
+                raise ValueError(
+                    f"Invalid device format received: {device_discovery_status}"
+                )
 
             self.signals.finished.emit(device_discovery_status)
         except Exception as e:
@@ -235,29 +237,16 @@ class Client(QThread):
     def run(self):
         self.log_message.emit("info", "Starting client handler...")
 
-        num_failures = 0
         while self.running:
-            # Periodically ping server if connected
-            if self.status == ClientStatus.SERVER_CONNECTED:
-                try:
-                    resp = send_command(self.control_socket, Command.PING_SERVER)
-                    resp_type, _ = parse_and_validate_response(resp)
-
-                    if resp_type != Response.SUCCESS.name:
-                        num_failures += 1
-                        raise ConnectionAbortedError(
-                            f"Invalid ping response code: {resp_type}"
-                        )
-                except Exception as e:
-                    # Connection has closed. Reset if ping fails more than 3 times.
-                    self.log_message.emit("error", f"Server ping failed: {e}")
-                    if num_failures >= 3:
-                        self.disconnect_from_server()
-                        num_failures = 0
-
-            time.sleep(5)  # Ping every 5 seconds or so
-
-            # TODO: ADD ANYTHING ELSE FUNCTIONALITY WISE
+            try:
+                # A tiny, non-essential message to test the connection.
+                if self.status is ClientStatus.SERVER_CONNECTED:
+                    self.control_socket.sendall(b"\x00")
+            except (OSError, ConnectionResetError, BrokenPipeError):
+                # These exceptions mean the connection is closed.
+                self.disconnect_from_server()
+            finally:
+                time.sleep(10)  # Check every few seconds
 
     # Discover servers in parallel
     def discover_servers(self):
@@ -401,6 +390,7 @@ class Client(QThread):
                         self.control_socket.close()
 
                 self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.control_socket.setblocking(False)
                 self.control_socket.settimeout(self.resp_timeout)
                 self.control_socket.connect(
                     (self.selected_server["ip"], self.control_port)
@@ -416,6 +406,7 @@ class Client(QThread):
                     self.data_socket.close()
 
                 self.data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.data_socket.setblocking(False)
                 self.data_socket.settimeout(5.0)
                 self.data_socket.connect((self.selected_server["ip"], self.data_port))
 
@@ -535,7 +526,8 @@ class Client(QThread):
         self.log_message.emit("info", "Connecting all discovered devices...")
 
         # Request server to connect all initialized devices
-        self.control_socket.settimeout(30)  # Higher timeout for device discovery
+        self.control_socket.settimeout(150)
+        # Higher timeout since loading image to FPGA takes time
 
         response = send_command(
             sock=self.control_socket,
@@ -562,9 +554,9 @@ class Client(QThread):
 
             for group_id, group_dict in discovered_device_dict.items():
                 for device_id, device_dict in group_dict.items():
-                    if device_dict["state"] == DeviceStatus.UNAVAILABLE.name:
+                    if device_dict["status"] == DeviceStatus.UNAVAILABLE.name:
                         self.device_states[group_id][device_id][
-                            "state"
+                            "status"
                         ] = DeviceStatus.UNAVAILABLE
                     else:
                         # If available, check for connected state
@@ -573,11 +565,11 @@ class Client(QThread):
                             == DeviceStatus.CONNECTED.name
                         ):
                             self.device_states[group_id][device_id][
-                                "state"
+                                "status"
                             ] = DeviceStatus.CONNECTED
                         else:
                             self.device_states[group_id][device_id][
-                                "state"
+                                "status"
                             ] = DeviceStatus.AVAILABLE
 
             self.device_init_succeeded.emit(self.device_states)

@@ -2,8 +2,7 @@ import contextlib
 from typing import Dict, List
 
 import qtawesome as qta
-from bioview_common import Configuration, DeviceStatus
-from bioview_common.protocol.status import ClientStatus
+from bioview_common import ClientStatus, DeviceStatus
 from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPen
 from PyQt6.QtWidgets import (
@@ -17,7 +16,6 @@ from PyQt6.QtWidgets import (
 )
 
 from bioview_client.constants.theme import CONNECTION_STATE_COLORS, get_qcolor
-from bioview_client.utils import is_dict_of_dicts
 
 
 class ServerConnector(QWidget):
@@ -203,9 +201,9 @@ class StatusIndicator(QWidget):
     - STREAMING -> solid blue
     """
 
-    def __init__(self, state: DeviceStatus = DeviceStatus.DISCONNECTED, size: int = 12):
+    def __init__(self, status: DeviceStatus = DeviceStatus.DISCONNECTED, size: int = 12):
         super().__init__()
-        self.state = state
+        self.status = status
         self.size = size
         self.setFixedSize(size, size)
 
@@ -216,13 +214,13 @@ class StatusIndicator(QWidget):
         self._blink_timer.timeout.connect(self._on_blink)
 
         # Initialize
-        self.update_state(state)
+        self.update_status(status)
 
-    def update_state(self, state: DeviceStatus):
-        self.state = state
+    def update_status(self, status: DeviceStatus):
+        self.status = status
 
         # Start/stop blinking for CONNECTING
-        if self.state == DeviceStatus.CONNECTING:
+        if self.status == DeviceStatus.CONNECTING:
             if not self._blink_timer.isActive():
                 self._blink_on = True
                 self._blink_timer.start()
@@ -244,10 +242,10 @@ class StatusIndicator(QWidget):
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
             # Base color from theme mapping (QColor)
-            base_color = CONNECTION_STATE_COLORS.get(self.state, get_qcolor("red"))
+            base_color = CONNECTION_STATE_COLORS.get(self.status, get_qcolor("red"))
 
             # For CONNECTING state, hide when blink is off
-            if self.state == DeviceStatus.CONNECTING and not self._blink_on:
+            if self.status == DeviceStatus.CONNECTING and not self._blink_on:
                 return
 
             painter.setBrush(base_color)
@@ -263,10 +261,10 @@ class StatusIndicator(QWidget):
 
 
 class DeviceStatusWidget(QWidget):
-    def __init__(self, device_name, device_state=DeviceStatus.DISCONNECTED):
+    def __init__(self, device_name, device_status=DeviceStatus.DISCONNECTED):
         super().__init__()
         self.device_name = device_name
-        self.device_state = device_state
+        self.device_status = device_status
 
         # Create horizontal layout
         layout = QHBoxLayout()
@@ -274,7 +272,7 @@ class DeviceStatusWidget(QWidget):
         layout.setSpacing(5)
 
         self.label = QLabel(device_name)
-        self.indicator = StatusIndicator(device_state)
+        self.indicator = StatusIndicator(device_status)
 
         # Add widgets to layout
         layout.addWidget(self.label)
@@ -282,17 +280,20 @@ class DeviceStatusWidget(QWidget):
 
         self.setLayout(layout)
 
-    def update_state(self, new_state):
-        self.device_state = new_state
-        self.indicator.update_state(new_state)
+    def update_status(self, new_status):
+        self.device_status = new_status
+        self.indicator.update_status(new_status)
 
 
 class DeviceStatusPanel(QWidget):
-    def __init__(self, devices):
+    def __init__(self, device_status: Dict):
         super().__init__()
-        # devices: dict keyed by device_id -> { 'display_name': str, 'config':..., 'state': DeviceStatus }
-        # store a shallow copy
-        self.devices = devices.copy()
+        """
+        device_status is of form -
+        group_id: {
+            device_id: DeviceStatus
+        }
+        """
         self.device_widgets = {}
 
         # Create horizontal layout for all devices
@@ -301,87 +302,70 @@ class DeviceStatusPanel(QWidget):
         self.layout.setSpacing(15)
 
         # Add device widgets (keys are device ids)
-        for device_id, device_map in self.devices.items():
-            device_state = device_map.get("state", DeviceStatus.DISCONNECTED)
-            display_label = device_map.get("display_name", device_id)
-            self.add_device(device_id, device_state, display_label)
+        for group_id, group_items in device_status.items():
+            for item_id, item_state in group_items.items():
+                self.add_device(group_id, item_id, item_state)
 
         self.setLayout(self.layout)
 
     # Handle theme changes
     def _update_icons(self):
         for device_id, device_map in self.devices.items():
-            try:
-                state = device_map.get("state", DeviceStatus.DISCONNECTED)
-                self.device_widgets[device_id].update_state(state)
-            except Exception:
-                # best-effort
-                pass
+            with contextlib.suppress(Exception):
+                status = device_map.get("status", DeviceStatus.DISCONNECTED)
+                self.device_widgets[device_id] = status
 
     def event(self, event):
         if event.type() == QEvent.Type.ApplicationPaletteChange:
             self._update_icons()
         return super().event(event)
 
-    def add_device(
-        self,
-        device_id,
-        device_state=DeviceStatus.DISCONNECTED,
-        display_label: str = None,
-    ):
-        """Add a device widget keyed by device_id but showing display_label."""
-        label = display_label or device_id
-        device_widget = DeviceStatusWidget(label, device_state)
-        self.device_widgets[device_id] = device_widget
+    def add_device(self, group_id, device_id, device_status=DeviceStatus.DISCONNECTED):
+        key = f"[{group_id}]:{device_id}"
+
+        device_widget = DeviceStatusWidget(device_id, device_status)
+        self.device_widgets[key] = device_widget
         self.layout.addWidget(device_widget)
-        # ensure devices map stores a consistent dict
-        self.devices[device_id] = {"display_name": label, "state": device_state}
 
-    def update_device_state(self, device_name, new_state):
-        # device_name here is the device_id (canonical key)
-        # no-op: tracing removed
+    def update_device_status(self, group_id, device_id, new_status):
+        key = f"[{group_id}]:{device_id}"
+        widget = self.device_widgets.get(key, None)
 
-        if device_name in self.device_widgets:
-            self.device_widgets[device_name].update_state(new_state)
-            # update internal map state
-            try:
-                self.devices[device_name]["state"] = new_state
-            except Exception:
-                self.devices[device_name] = {
-                    "display_name": device_name,
-                    "state": new_state,
-                }
+        if widget:
+            widget.update_status(new_status)
 
-    def remove_device(self, device_name):
-        if device_name in self.device_widgets:
-            widget = self.device_widgets[device_name]
+    def remove_device(self, group_id, device_id):
+        key = f"[{group_id}]:{device_id}"
+        if key in self.device_widgets:
+            widget = self.device_widgets[key]
             self.layout.removeWidget(widget)
             widget.deleteLater()
-            del self.device_widgets[device_name]
-            with contextlib.suppress(Exception):
-                del self.devices[device_name]
+            del self.device_widgets[key]
 
 
 class StatusBar(QStatusBar):
     network_scan_requested = pyqtSignal()
 
-    def __init__(self, parent=...):
+    def __init__(self, device_status: Dict = None, parent=...):
         super().__init__(parent)
 
         # Use a QWidget with a layout to group widgets
         self.container = QWidget()
         self._layout = QHBoxLayout(self.container)
         self._layout.setContentsMargins(0, 0, 0, 0)
+
         self.server_connector = ServerConnector()
         self._layout.addWidget(
             self.server_connector, alignment=Qt.AlignmentFlag.AlignLeft
         )
         self._layout.addStretch()
 
-        self.device_status_panel = DeviceStatusPanel(devices={})
+        self.device_status_panel = DeviceStatusPanel(device_status=device_status)
+
         self._layout.addWidget(
             self.device_status_panel, alignment=Qt.AlignmentFlag.AlignRight
         )
+
         self.container.setLayout(self._layout)
 
         self.addPermanentWidget(self.container, stretch=1)
@@ -390,7 +374,6 @@ class StatusBar(QStatusBar):
         self._forward_signals()
         self._forward_callbacks()
 
-        # Connect signals
         # Update UI to reflect connection state
         self.server_connector.server_connection_state_updated.connect(
             lambda status: self.set_server_status(status)
@@ -421,7 +404,7 @@ class StatusBar(QStatusBar):
         )
 
         # Expose device update helper from the panel
-        self.update_device_state = self.device_status_panel.update_device_state
+        self.update_device_status = self.device_status_panel.update_device_status
 
     def set_server_status(self, status: ClientStatus):
         """Centralize server-related UI updates based on ClientStatus."""
@@ -460,75 +443,5 @@ class StatusBar(QStatusBar):
         self.on_scan_complete = self.server_connector.on_scan_complete
         self.update_scan_progress = self.server_connector.update_scan_progress
 
-    def update_devices(self, devices: dict):
-        """Replace the device panel using a strict group->device mapping.
-
-        Expected input: dict where keys are group ids and values are dicts mapping
-        device_id -> <config|status>. Any other shape is rejected.
-        Inner values may be a Configuration/dict (declared configs) or a status
-        value (string/int) returned from server discovery. The method flattens
-        the mapping to device_name -> {'config': ..., 'state': DeviceStatus} and
-        rebuilds the device panel.
-        """
-        # Reject non-dict-of-dicts inputs to keep behavior predictable
-        if not is_dict_of_dicts(devices):
-            self.parent().log_message.emit(
-                "warning", "update_devices expects a dict-of-dicts; ignoring"
-            )
-            return
-
-        try:
-            # Build flat device mapping keyed by device_id for DeviceStatusPanel
-            flat_devices = {}
-            for device_dict in devices.values():
-                if not isinstance(device_dict, dict):
-                    continue
-                for device_id, val in device_dict.items():
-                    # Determine display name from config if present
-                    display_name = device_id
-                    config_val = {}
-                    state_val = None
-
-                    if isinstance(val, Configuration):
-                        try:
-                            display_name = val.get_param("name", device_id)
-                        except Exception:
-                            display_name = device_id
-                        config_val = val
-                    elif isinstance(val, dict):
-                        display_name = val.get("name", device_id)
-                        config_val = val
-                        state_val = val.get("state") if "state" in val else None
-                    else:
-                        # treat val as a status indicator
-                        state_val = val
-
-                    # Normalize state to DeviceStatus
-                    try:
-                        state = DeviceStatus(state_val)
-                    except Exception:
-                        state = DeviceStatus.DISCONNECTED
-
-                    flat_devices[device_id] = {
-                        "display_name": display_name,
-                        "config": config_val,
-                        "state": state,
-                    }
-
-            # Replace the device panel
-            old = self.device_status_panel
-            self._layout.removeWidget(old)
-            old.deleteLater()
-            self._rebuild_devices_panel(flat_devices)
-        except Exception:
-            # Best-effort: do not raise from UI update
-            with contextlib.suppress(Exception):
-                self.parent().log_message.emit("error", "Failed to update device panel")
-
-    def _rebuild_devices_panel(self, devices: dict):
-        """Create a fresh DeviceStatusPanel from provided per-device mapping."""
-        self.device_status_panel = DeviceStatusPanel(devices=devices)
-        self._layout.addWidget(
-            self.device_status_panel, alignment=Qt.AlignmentFlag.AlignRight
-        )
-        self.update_device_state = self.device_status_panel.update_device_state
+    def update_device_status(self, group_id, device_id, new_status):
+        self.device_status_panel.update_device_status(group_id, device_id, new_status)

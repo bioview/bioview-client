@@ -1,5 +1,5 @@
 import qtawesome as qta
-from bioview_common import DeviceStatus
+from bioview_common import ClientStatus
 from PyQt6.QtCore import QEvent, pyqtSignal
 from PyQt6.QtWidgets import QCheckBox, QGroupBox, QHBoxLayout, QPushButton
 
@@ -69,7 +69,9 @@ class AppControlPanel(QGroupBox):
 
     # Handle theme changes
     def _update_icons(self):
-        self.connect_button.setIcon(qta.icon("fa6s.house", color=get_qcolor("purple")))
+        self.initialize_button.setIcon(
+            qta.icon("fa6s.house", color=get_qcolor("purple"))
+        )
         self.start_button.setIcon(qta.icon("fa6s.play", color=get_qcolor("green")))
         self.stop_button.setIcon(qta.icon("fa6s.stop", color=get_qcolor("red")))
         self.gain_balance_button.setIcon(
@@ -81,39 +83,49 @@ class AppControlPanel(QGroupBox):
             self._update_icons()
         return super().event(event)
 
-    def update_button_states(self, device_status):
-        # TODO: Update to deal with connection status - bring from main monitor
-        if device_status == DeviceStatus.NOINIT:
-            self.initialize_button.setEnabled(True)
-            self.gain_balance_button.setEnabled(False)
+    def update_button_states(self, client_status: ClientStatus):
+        match client_status:
+            case ClientStatus.DEFAULT:
+                self.initialize_button.setEnabled(False)
+                self.start_button.setEnabled(False)
+                self.stop_button.setEnabled(False)
+                self.save_checkbox.setEnabled(False)
+                self.gain_balance_button.setEnabled(False)
 
-        elif device_status == DeviceStatus.CONNECTING:
-            self.initialize_button.setEnabled(False)
-            self.start_button.setEnabled(False)
-            self.stop_button.setEnabled(False)
+            case ClientStatus.SERVER_CONNECTED:
+                self.initialize_button.setEnabled(True)
+                self.start_button.setEnabled(False)
+                self.stop_button.setEnabled(False)
+                self.save_checkbox.setEnabled(True)
+                self.gain_balance_button.setEnabled(False)
 
-        elif device_status == DeviceStatus.CONNECTED:
-            self.start_button.setEnabled(True)
-            self.stop_button.setEnabled(False)
-            self.save_checkbox.setEnabled(True)
-            self.initialize_button.setEnabled(False)
+            case ClientStatus.DEVICES_DISCOVERED:
+                self.initialize_button.setEnabled(True)
+                self.start_button.setEnabled(False)
+                self.stop_button.setEnabled(False)
+                self.save_checkbox.setEnabled(True)
+                self.gain_balance_button.setEnabled(False)
 
-        elif device_status == DeviceStatus.STREAMING:
-            self.start_button.setEnabled(False)
-            self.stop_button.setEnabled(True)
-            self.save_checkbox.setEnabled(False)
-            self.gain_balance_button.setEnabled(True)
+            case ClientStatus.DEVICES_CONNECTED:
+                self.initialize_button.setEnabled(False)
+                self.start_button.setEnabled(True)
+                self.stop_button.setEnabled(False)
+                self.save_checkbox.setEnabled(True)
+                self.gain_balance_button.setEnabled(True)
 
-        elif device_status == DeviceStatus.DISCONNECTED:
-            self.initialize_button.setEnabled(True)
-            self.start_button.setEnabled(False)
-            self.save_checkbox.setEnabled(True)
-            self.stop_button.setEnabled(False)
-            self.gain_balance_button.setEnabled(False)
+            case ClientStatus.STREAMING:
+                self.initialize_button.setEnabled(False)
+                self.start_button.setEnabled(False)
+                self.stop_button.setEnabled(True)
+                self.save_checkbox.setEnabled(False)
+                self.gain_balance_button.setEnabled(True)
 
-        else:
-            # TODO: Log error
-            pass
+            case ClientStatus.SERVER_DISCONNECTED:
+                self.initialize_button.setEnabled(False)
+                self.start_button.setEnabled(False)
+                self.save_checkbox.setEnabled(False)
+                self.stop_button.setEnabled(False)
+                self.gain_balance_button.setEnabled(False)
 
     def on_initialize_clicked(self):
         self.initialize_devices.emit()

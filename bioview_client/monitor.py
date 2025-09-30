@@ -11,8 +11,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List
 
-from bioview_common import Configuration, DataSource, DeviceStatus
-from bioview_common.protocol.status import ClientStatus
+from bioview_common import ClientStatus, Configuration, DataSource, DeviceStatus
 from PyQt6.QtCore import QRunnable, QThreadPool, pyqtSlot
 from PyQt6.QtGui import QGuiApplication, QIcon
 from PyQt6.QtWidgets import (
@@ -80,8 +79,15 @@ class BioViewMonitor(QMainWindow):
         )
 
         # Store device names and states - since that's all the UI needs
-        # Use group->device mapping in self.device_states
-        self.device_states: Dict[str, Dict] = {}
+        self.device_status: Dict[str, Dict] = {}
+        for group_id, group_dict in self.group_configs.items():
+            tmp = {}
+            for item_id in group_dict:
+                if item_id == "metadata":
+                    continue
+                tmp[item_id] = DeviceStatus.NOINIT
+
+            self.device_status[group_id] = tmp
 
         # Keep track for display sources
         if not self.common_config.get_param("display_sources", None):
@@ -110,6 +116,7 @@ class BioViewMonitor(QMainWindow):
         )
         self._connect_client_signals()
         self.client_worker.start_client()
+        self.command_bar.update_button_states(self.client_worker.status)
 
         # Connect UI calls - including logging
         self._connect_signals()
@@ -123,6 +130,7 @@ class BioViewMonitor(QMainWindow):
     def _init_ui(self):
         # Define main wndow
         self.setWindowTitle("BioView Data Monitor")
+        # TODO: Make path agnostic
         iconDir = Path(__file__).resolve().parent.parent / "docs" / "assets" / "icon.png"
 
         self.setWindowIcon(QIcon(str(iconDir)))
@@ -175,7 +183,7 @@ class BioViewMonitor(QMainWindow):
         central_widget.setLayout(main_layout)
 
         # Status Bar
-        self.status_bar = StatusBar(self)
+        self.status_bar = StatusBar(device_status=self.device_status, parent=self)
         self.setStatusBar(self.status_bar)
 
     # If initial configurations do not exist, ask using inputs
@@ -200,9 +208,9 @@ class BioViewMonitor(QMainWindow):
             else:
                 common_cfg = DEFAULT_COMMON_CONFIGURATION
                 group_cfgs = {}
-        else:
-            common_cfg = Configuration.from_dict(common_config)
-            group_cfgs = self._convert_group_configs(group_configs)
+
+        common_cfg = Configuration.from_dict(common_config)
+        group_cfgs = self._convert_group_configs(group_configs)
 
         # At this stage, we have sanitized Configuration objects
         return common_cfg, group_cfgs
@@ -212,10 +220,33 @@ class BioViewMonitor(QMainWindow):
             return {}
 
         converted: Dict[str, Dict] = {}
-        for group_id, device_dict in group_cfgs.items():
+
+        for group_id, group_items in group_cfgs.items():
             converted[group_id] = {}
-            for device_id, device_cfg in device_dict.items():
+            device_ids = [k for k in group_items if k != "metadata"]
+
+            # Populate metadata for further use
+            meta = group_items.get("metadata", {})
+            meta["group_id"] = group_id
+
+            for device_id in device_ids:
+                device_cfg = group_items[device_id]
                 converted[group_id][device_id] = Configuration.from_dict(device_cfg)
+
+                # TODO: Make this less jank
+                # Populate device_type using first device
+                if "device_type" not in meta:
+                    meta["device_type"] = converted[group_id][device_id].get_param(
+                        "device_type"
+                    )
+
+                # Populate samp_rate using first device
+                if "samp_rate" not in meta:
+                    meta["samp_rate"] = converted[group_id][device_id].get_param(
+                        "samp_rate"
+                    )
+
+            converted[group_id]["metadata"] = meta
 
         return converted
 
@@ -234,14 +265,14 @@ class BioViewMonitor(QMainWindow):
         )
 
         # Device control signals
-        self.client_worker.device_init_succeeded.connect(self.on_device_connected)
-        self.client_worker.device_disconnect_succeeded.connect(
-            self.on_device_disconnected
+        self.client_worker.device_init_succeeded.connect(
+            self.update_status_bar_and_buttons
         )
-        self.client_worker.streaming_started.connect(self.on_streaming_started)
-        self.client_worker.streaming_stopped.connect(self.on_streaming_stopped)
-
-        # Devices discovered -> update status bar device panel
+        self.client_worker.device_disconnect_succeeded.connect(
+            self.update_status_bar_and_buttons
+        )
+        self.client_worker.streaming_started.connect(self.update_status_bar_and_buttons)
+        self.client_worker.streaming_stopped.connect(self.update_status_bar_and_buttons)
         self.client_worker.devices_discovered.connect(self._handle_devices_discovered)
 
         # General info signals
@@ -251,10 +282,6 @@ class BioViewMonitor(QMainWindow):
         """
         Connect signals from all UI components to respective calls in client worker
         """
-        if self.client_worker is None:
-            self._setup_client()
-
-        # Defer to smaller helpers to reduce cognitive complexity for linters
         self._connect_command_bar_signals()
         self._connect_settings_panel_signals()
         self._connect_plot_grid_signals()
@@ -385,7 +412,7 @@ class BioViewMonitor(QMainWindow):
 
         try:
             # device_states is expected to be group->device->{config,state}
-            self.device_states = devices_map
+            self.device_status = devices_map
 
             if getattr(self.status_bar, "update_devices", None):
                 # Forward discovery payload to status bar
@@ -428,16 +455,18 @@ class BioViewMonitor(QMainWindow):
 
     # Command Bar helper functions
     def on_device_init_requested(self):
-        if self.client_worker:
-            # Request server to connect all initialized devices
-            # Update UI to show CONNECTING state for all known devices
-            for group in self.device_states.values():
-                for device_id in group:
-                    self.status_bar.update_device_state(
-                        device_id, DeviceStatus.CONNECTING
-                    )
-            # Request device connection; UI will be updated via device_connected signals
-            self.client_worker.initialize_devices()
+        if not self.client_worker:
+            return
+
+        # Update UI to show CONNECTING state for all known devices
+        for group_id, group in self.device_status.items():
+            for device_id in group:
+                self.status_bar.update_device_status(
+                    group_id, device_id, DeviceStatus.CONNECTING
+                )
+
+        # Request server to connect all initialized devices
+        self.client_worker.initialize_devices()
 
     def update_save_state(self):
         self.saving_status = True
@@ -451,8 +480,6 @@ class BioViewMonitor(QMainWindow):
 
     # Client worker helper functions
     def on_server_connected(self):
-        """Handle server connection"""
-        # Centralize UI updates via ServerStatus
         self.log_display_panel.log_message("info", "Connected to server")
 
         try:
@@ -461,114 +488,28 @@ class BioViewMonitor(QMainWindow):
             self.log_display_panel.log_message("warning", "Unable to update status bar")
             self.status_bar.set_server_status(ClientStatus.SERVER_CONNECTED)
 
-        # Ensure UI buttons reflect connected state (defensive)
-        with contextlib.suppress(Exception):
-            # still ensure discover button enabled
-            self.status_bar.server_connector.discover_btn.setEnabled(True)
+        self.status_bar.server_connector.discover_btn.setEnabled(True)
+
+        self.command_bar.update_button_states(self.client_worker.status)
 
         # TODO: Populate display sources by querying server
 
     def on_server_disconnected(self):
-        """Handle server disconnection"""
         try:
             self.status_bar.set_server_status(ClientStatus.SERVER_DISCONNECTED)
         except Exception:
             self.log_display_panel.log_message("warning", "Unable to update status bar")
+
+        self.command_bar.update_button_states(self.client_worker.status)
         self.log_display_panel.log_message("warning", "Disconnected from server")
 
-    def on_device_connected(self, device_id, success=True):
-        if device_id is None:
-            # All devices connected
-            for group_id, group in self.device_states.items():
-                for device_id in group:
-                    new_state = (
-                        DeviceStatus.CONNECTED if success else DeviceStatus.DISCONNECTED
-                    )
-                    self.device_states[group_id][device_id]["state"] = new_state
-                    self.status_bar.update_device_state(device_id, new_state)
-        else:
-            # Single device connected (device_id is the canonical id)
-            # Update device_states mapping when possible
-            for group_id, group in self.device_states.items():
-                if device_id in group:
-                    self.device_states[group_id][device_id]["state"] = (
-                        DeviceStatus.CONNECTED if success else DeviceStatus.DISCONNECTED
-                    )
-                    break
-            # Update status bar regardless
-            self.status_bar.update_device_state(
-                device_id,
-                DeviceStatus.CONNECTED if success else DeviceStatus.DISCONNECTED,
-            )
+    def update_status_bar_and_buttons(self, device_status: Dict):
+        for group_id, group in device_status.items():
+            for device_id, new_status in group.items():
+                self.status_bar.update_device_status(group_id, device_id, new_status)
 
-        # Check if all are connected and if so, disable UI buttons
-        self.update_buttons()
-
-    def on_device_disconnected(self, device_id=None, success=True):
-        if device_id is None:
-            # Disconnect devices (all)
-            for group_id, group in self.device_states.items():
-                for device_id in group:
-                    self.device_states[group_id][device_id][
-                        "state"
-                    ] = DeviceStatus.DISCONNECTED
-                    self.status_bar.update_device_state(
-                        device_id, DeviceStatus.DISCONNECTED
-                    )
-        else:
-            for group_id, group in self.device_states.items():
-                if device_id in group:
-                    self.device_states[group_id][device_id][
-                        "state"
-                    ] = DeviceStatus.DISCONNECTED
-                    break
-            with contextlib.suppress(Exception):
-                self.status_bar.update_device_state(device_id, DeviceStatus.DISCONNECTED)
-
-        self.update_buttons()
-
-    def on_device_connection_failed(self, device_id: str):
-        """Handle a failed device connection attempt by updating UI state."""
-        if device_id is None:
-            # If None, assume all failed
-            for group_id, group in self.device_states.items():
-                for did in group:
-                    self.device_states[group_id][did][
-                        "state"
-                    ] = DeviceStatus.DISCONNECTED
-                    self.status_bar.update_device_state(did, DeviceStatus.DISCONNECTED)
-        else:
-            for group_id, group in self.device_states.items():
-                if device_id in group:
-                    self.device_states[group_id][device_id][
-                        "state"
-                    ] = DeviceStatus.DISCONNECTED
-                    break
-            # Update status bar regardless
-            with contextlib.suppress(Exception):
-                self.status_bar.update_device_state(device_id, DeviceStatus.DISCONNECTED)
-
-    def on_streaming_started(self):
-        pass
-
-    def on_streaming_stopped(self):
-        pass
-
-    def update_buttons(self):
-        # Consider all devices connected only if none are DISCONNECTED
-        connected = True
-        for group in self.device_states.values():
-            for device_dict in group.values():
-                if device_dict.get("state") == DeviceStatus.DISCONNECTED:
-                    connected = False
-                    break
-            if not connected:
-                break
-
-        if connected:
-            self.command_bar.update_button_states(DeviceStatus.CONNECTED)
-        else:
-            self.command_bar.update_button_states(DeviceStatus.DISCONNECTED)
+        client_status = self.client_worker.status
+        self.command_bar.update_button_states(client_status)
 
 
 if __name__ == "__main__":
