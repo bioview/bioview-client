@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ main, slp-ui-updates ]
+    branches: [ main ]
   pull_request:
-    branches: [ main, slp-ui-updates ]
+    branches: [ main ]
 
 jobs:
   test:
