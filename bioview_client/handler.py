@@ -40,8 +40,9 @@ from bioview_common import (
     get_app_info,
     get_ip,
 )
-from PyQt6.QtCore import QObject, QRunnable, QThread, QThreadPool, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QThread, QThreadPool, pyqtSignal
 
+from bioview_client.helpers import DeviceInitWorker, ScanWorker
 from bioview_client.utils import (
     get_challenge_response,
     group_config_to_dict,
@@ -49,86 +50,6 @@ from bioview_client.utils import (
     parse_and_validate_response,
     send_command,
 )
-
-
-class ScanWorkerSignals(QObject):
-    # Emit a server info dict when a BioView server is discovered, or None otherwise
-    result = pyqtSignal(object)
-
-
-class DeviceDiscoverSignals(QObject):
-    # Emit a list of devices when discovery completes
-    finished = pyqtSignal(dict)
-
-
-class ScanWorker(QRunnable):
-    def __init__(self, ip, control_port, timeout=2):
-        super().__init__()
-        self.ip = ip
-        self.control_port = control_port
-        self.timeout = timeout
-        self.signals = ScanWorkerSignals()
-
-    def run(self):
-        # Probe the control port on the target IP and emit a server info dict or None
-        server_info = None
-
-        with contextlib.suppress(Exception):
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(self.timeout)
-            s.connect((self.ip, self.control_port))
-
-            # Request discovery and wait for a valid response
-            response = send_command(sock=s, command=Command.DISCOVER_SERVERS)
-
-            resp_type, resp_payload = parse_and_validate_response(response)
-            if resp_type == Response.SUCCESS.name:
-                server_info = resp_payload
-
-        # Finally, emit
-        s.close()
-        self.signals.result.emit(server_info)
-
-
-class DeviceDiscoverWorker(QRunnable):
-    """Background worker to request device discovery without blocking the UI."""
-
-    def __init__(self, client_ref):
-        super().__init__()
-        self.client_ref = client_ref
-        self.signals = DeviceDiscoverSignals()
-
-    @pyqtSlot()
-    def run(self):
-        device_discovery_status = {}
-        try:
-            # Device discovery can be slow on server side; use a longer timeout
-            self.client_ref.control_socket.settimeout(30)
-            response = send_command(
-                sock=self.client_ref.control_socket,
-                command=Command.DISCOVER_DEVICES,
-                params={
-                    "config": self.client_ref.common_config or {},
-                    "groups": self.client_ref.group_configs or {},
-                },
-            )
-
-            resp_type, resp_payload = parse_and_validate_response(response)
-
-            if resp_type == Response.SUCCESS.name:
-                device_discovery_status = resp_payload.get("discovery_status", {})
-
-            # Validate for correctness of format
-            if not is_dict_of_dicts(device_discovery_status):
-                raise ValueError(
-                    f"Invalid device format received: {device_discovery_status}"
-                )
-
-            self.signals.finished.emit(device_discovery_status)
-        except Exception as e:
-            # On error, emit empty dict
-            self.client_ref.log_message.emit("error", f"Device discovery failed: {e}")
-            self.signals.finished.emit({})
 
 
 class Client(QThread):
@@ -230,7 +151,7 @@ class Client(QThread):
                     "group": group_id,
                     "id": device_id,
                     "config": device_cfg,
-                    "state": DeviceStatus.DISCONNECTED,
+                    "status": DeviceStatus.DISCONNECTED,
                 }
 
     # Thread handling
@@ -390,8 +311,7 @@ class Client(QThread):
                         self.control_socket.close()
 
                 self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.control_socket.setblocking(False)
-                self.control_socket.settimeout(self.resp_timeout)
+                self.control_socket.settimeout(5.0)
                 self.control_socket.connect(
                     (self.selected_server["ip"], self.control_port)
                 )
@@ -406,8 +326,7 @@ class Client(QThread):
                     self.data_socket.close()
 
                 self.data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.data_socket.setblocking(False)
-                self.data_socket.settimeout(5.0)
+                self.data_socket.settimeout(5)
                 self.data_socket.connect((self.selected_server["ip"], self.data_port))
 
                 # Update server info
@@ -455,18 +374,24 @@ class Client(QThread):
         self.log_message.emit("info", "Disconnected from server")
 
     ### Device Commands
-    def discover_devices(self):
+    def initialize_devices(self, only_discover: bool = False):
         # Avoid starting another discovery while one is active
         if self._discovering_devices:
             self.log_message.emit("warn", "Device discovery already in progress")
             return
 
-        self.log_message.emit("info", "Discovering devices...")
         self._discovering_devices = True
 
-        worker = DeviceDiscoverWorker(self)
+        if only_discover:
+            cmd = Command.DISCOVER_DEVICES
+            self.log_message.emit("debug", "Discovering devices...")
+        else:
+            cmd = Command.INITIALIZE_DEVICES
+            self.log_message.emit("debug", "Initializing devices...")
 
-        def _on_finished(discovered):
+        worker = DeviceInitWorker(client_ref=self, command=cmd)
+
+        def _on_finished(group_status_dict):
             """
             Server response for discovered groups follows the same convention as handler, i.e.
             'group_id': {
@@ -478,101 +403,30 @@ class Client(QThread):
             Note that the server will only return devices for groups that were requested in the
             discovery command payload. If no groups were specified, all available devices are
             returned, without being formatted into groups.
+
+            Thus, we can directly update the stored states with the provided states.
             """
-            # We have groups that are discovered, so we parse accordingly
-            for group_id, device_dicts in discovered.items():
-                # Ensure group exists in local state map
-                if group_id not in self.device_states:
-                    self.device_states[group_id] = {}
+            if not group_status_dict or not is_dict_of_dicts(group_status_dict):
+                self._discovering_devices = False
+                self.log_message.emit(
+                    "warning", f"Invalid response: {group_status_dict}."
+                )
+                return
 
-                for device_id, device_status in device_dicts.items():
-                    # Ensure device entry exists with expected keys
-                    if device_id not in self.device_states[group_id]:
-                        self.device_states[group_id][device_id] = {
-                            "group": group_id,
-                            "id": device_id,
-                            "config": {},
-                            "state": DeviceStatus.DISCONNECTED,
-                        }
+            self.device_states = group_status_dict
 
-                    # Safely convert status to DeviceStatus enum if possible
-                    try:
-                        new_state = DeviceStatus(device_status)
-                    except Exception:
-                        # Fallback to DISCONNECTED for unknown values
-                        new_state = DeviceStatus.DISCONNECTED
+            # Update state and emit appropriate signal
+            if only_discover:
+                self.status = ClientStatus.DEVICES_DISCOVERED
+                self.devices_discovered.emit(self.device_states)
+            else:
+                self.status = ClientStatus.DEVICES_CONNECTED
+                self.device_init_succeeded.emit(self.device_states)
 
-                    self.device_states[group_id][device_id]["state"] = new_state
-
-            # Emit discovery finished signal with current device states
-            self.devices_discovered.emit(self.device_states)
             self._discovering_devices = False
 
         worker.signals.finished.connect(_on_finished)
         self.thread_pool.start(worker)
-
-    def initialize_devices(self):
-        """
-        Send a command to initialize all discovered devices.
-        """
-
-        if getattr(self, "_discovering_devices", False):
-            self.log_message.emit(
-                "warning",
-                "Cannot connect to device while device discovery is in progress",
-            )
-            return
-
-        self.log_message.emit("info", "Connecting all discovered devices...")
-
-        # Request server to connect all initialized devices
-        self.control_socket.settimeout(150)
-        # Higher timeout since loading image to FPGA takes time
-
-        response = send_command(
-            sock=self.control_socket,
-            command=Command.INITIALIZE_DEVICES,
-            params={"device_groups": self.group_configs},
-        )
-
-        resp_type, resp_payload = parse_and_validate_response(response)
-
-        # Payload will have two dicts, "discovered_devices" and "connection_states"
-        if resp_type == Response.ERROR.name:
-            # If nothing really worked
-            msg = resp_payload.get("message", "")
-            self.log_message.emit("error", f"Device connection failed: {msg}")
-        else:
-            # If something worked, we will get two items in payload
-            discovered_device_dict = resp_payload.get("discovered_devices", {})
-            group_connection_states = resp_payload.get("connection_states", {})
-
-            if discovered_device_dict == {}:
-                # Error
-                self.log_message.emit("error", "No devices discovered")
-                return
-
-            for group_id, group_dict in discovered_device_dict.items():
-                for device_id, device_dict in group_dict.items():
-                    if device_dict["status"] == DeviceStatus.UNAVAILABLE.name:
-                        self.device_states[group_id][device_id][
-                            "status"
-                        ] = DeviceStatus.UNAVAILABLE
-                    else:
-                        # If available, check for connected state
-                        if (
-                            group_connection_states[group_id]
-                            == DeviceStatus.CONNECTED.name
-                        ):
-                            self.device_states[group_id][device_id][
-                                "status"
-                            ] = DeviceStatus.CONNECTED
-                        else:
-                            self.device_states[group_id][device_id][
-                                "status"
-                            ] = DeviceStatus.AVAILABLE
-
-            self.device_init_succeeded.emit(self.device_states)
 
     def disconnect_device(self):
         self.log_message.emit("info", "Disconnecting devices...")

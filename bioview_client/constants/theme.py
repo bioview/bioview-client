@@ -1,5 +1,4 @@
 import logging
-from typing import Dict, Tuple
 
 import darkdetect
 from bioview_common import DeviceStatus
@@ -56,9 +55,19 @@ def get_color_by_idx(idx=0):
     return get_color_tuple(list(COLOR_SCHEME.keys())[idx])
 
 
-CONNECTION_STATE_COLORS: Dict[DeviceStatus, Tuple] = {
-    DeviceStatus.DISCONNECTED: get_qcolor("red"),
-    DeviceStatus.CONNECTING: get_qcolor("yellow"),
-    DeviceStatus.STREAMING: get_qcolor("blue"),
-    DeviceStatus.CONNECTED: get_qcolor("green"),
-}
+def get_connection_status_color(status):
+    match status:
+        case DeviceStatus.NOINIT:
+            return get_qcolor("mainBg")  # TODO: Replace with neutral
+        case DeviceStatus.AVAILABLE:
+            return get_qcolor("yellow")
+        case DeviceStatus.UNAVAILABLE:
+            return get_qcolor("red")
+        case DeviceStatus.CONNECTING:
+            return get_qcolor("mint")
+        case DeviceStatus.CONNECTED:
+            return get_qcolor("green")
+        case DeviceStatus.STREAMING:
+            return get_qcolor("teal")
+        case DeviceStatus.DISCONNECTED:
+            return get_qcolor("yellow")

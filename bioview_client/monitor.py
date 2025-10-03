@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Dict, List
 
 from bioview_common import ClientStatus, Configuration, DataSource, DeviceStatus
-from PyQt6.QtCore import QRunnable, QThreadPool, pyqtSlot
 from PyQt6.QtGui import QGuiApplication, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
@@ -295,50 +294,22 @@ class BioViewMonitor(QMainWindow):
         if self.client_worker:
             self.client_worker.selected_server = server_info
 
-            # Update UI immediately to show connecting state: enable spinner visually
-            # No UI spinner in ServerConnector; proceed to connect
-
-            # Run the actual connect in background so UI remains responsive
-            class _ConnectTask(QRunnable):
-                def __init__(self, client_ref):
-                    super().__init__()
-                    self.client_ref = client_ref
-
-                @pyqtSlot()
-                def run(self):
-                    self.client_ref.connect_to_server()
-
-            try:
-                task = _ConnectTask(self.client_worker)
-                # use client's thread pool if available
-                pool = getattr(self.client_worker, "thread_pool", None)
-                if pool is not None:
-                    pool.start(task)
-                else:
-                    # fallback to creating a small pool
-                    qp = QThreadPool()
-                    qp.start(task)
-            except Exception:
-                # best-effort: fallback to synchronous call
-                with contextlib.suppress(Exception):
-                    self.client_worker.connect_to_server()
+            with contextlib.suppress(Exception):
+                self.client_worker.connect_to_server()
 
         # Listen for final server_connected/server_disconnected to hide spinner
-        try:
+        with contextlib.suppress(Exception):
             self.client_worker.server_connected.connect(
-                lambda ok: self.status_bar.server_connector._server_spinner.setVisible(
+                lambda _: self.status_bar.server_connector._server_spinner.setVisible(
                     False
                 )
             )
             self.client_worker.server_disconnected.connect(
-                lambda ok: self.status_bar.server_connector._server_spinner.setVisible(
+                lambda _: self.status_bar.server_connector._server_spinner.setVisible(
                     False
                 )
             )
-        except Exception:
-            pass
 
-    # --- Extracted signal connection helpers (keeps _connect_signals small) ---
     def _connect_command_bar_signals(self):
         self.command_bar.initialize_devices.connect(self.on_device_init_requested)
         self.command_bar.start_streaming.connect(self.client_worker.start_streaming)
@@ -394,7 +365,7 @@ class BioViewMonitor(QMainWindow):
 
         # Device discovery request
         self.status_bar.discover_devices_requested.connect(
-            self.client_worker.discover_devices
+            lambda: self.client_worker.initialize_devices(True)
         )
 
     def _handle_devices_discovered(self, devices_map: dict):
@@ -410,15 +381,8 @@ class BioViewMonitor(QMainWindow):
             )
             return
 
-        try:
-            # device_states is expected to be group->device->{config,state}
-            self.device_status = devices_map
-
-            if getattr(self.status_bar, "update_devices", None):
-                # Forward discovery payload to status bar
-                self.status_bar.update_devices(devices_map)
-        except Exception as e:
-            self.log_display_panel.log_message("error", f"Failed to update devices: {e}")
+        self.device_status = devices_map
+        self.update_status_bar_and_buttons(devices_map)
 
     def closeEvent(self, event):
         """Handle application close"""
@@ -506,6 +470,11 @@ class BioViewMonitor(QMainWindow):
     def update_status_bar_and_buttons(self, device_status: Dict):
         for group_id, group in device_status.items():
             for device_id, new_status in group.items():
+                if device_id == "metadata":
+                    continue
+
+                if not isinstance(new_status, DeviceStatus):
+                    new_status = DeviceStatus(new_status)
                 self.status_bar.update_device_status(group_id, device_id, new_status)
 
         client_status = self.client_worker.status

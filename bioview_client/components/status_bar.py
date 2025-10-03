@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from bioview_client.constants.theme import CONNECTION_STATE_COLORS, get_qcolor
+from bioview_client.constants.theme import get_connection_status_color, get_qcolor
 
 
 class ServerConnector(QWidget):
@@ -242,7 +242,7 @@ class StatusIndicator(QWidget):
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
             # Base color from theme mapping (QColor)
-            base_color = CONNECTION_STATE_COLORS.get(self.status, get_qcolor("red"))
+            base_color = get_connection_status_color(self.status)
 
             # For CONNECTING state, hide when blink is off
             if self.status == DeviceStatus.CONNECTING and not self._blink_on:
