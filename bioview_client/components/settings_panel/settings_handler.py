@@ -43,8 +43,9 @@ class SettingsPanel(QTabWidget):
 
         # Group configs are Dicts of device configuration dicts
         for device_group_id, device_group_config in group_configs.items():
-            # device_group_config will always be a dictionary since we always have metadata
-            # If group contains multiple devices, create a tab per device with label 'group/device'
+            # device_group_config will always be a dictionary since we always have
+            # metadata as a key item. If group contains multiple devices, create a
+            # tab per device with label 'group/device'
             for item_key, item_dict in device_group_config.items():
                 if item_key == "metadata":
                     continue
@@ -79,7 +80,5 @@ class SettingsPanel(QTabWidget):
             """
         )
 
-        # TODO: assign devices to specific groups
-
-    def send_to_log(self):
-        pass
+    def send_to_log(self, level, msg):
+        self.log_event.emit(level, msg)

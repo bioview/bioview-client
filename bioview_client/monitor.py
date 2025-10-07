@@ -1,7 +1,10 @@
 """
-BioView Monitor can be launched via CLI, with/without configuration JSONs pre-specified. They may also be launched using GUI without any specified configuration.
-In case no valid configuration files are found, the app will prompt the user to provide configuration JSONs.
-Regardless on any configurations, the UI will load with appropriate components/default values
+BioView Monitor can be launched via CLI, with/without configuration
+JSONs pre-specified. They may also be launched using GUI without any
+specified configuration. In case no valid configuration files are
+found, the app will prompt the user to provide configuration JSONs.
+Regardless of any configurations, the UI will load with appropriate
+components/default values
 """
 import argparse
 import contextlib
@@ -51,11 +54,9 @@ class BioViewMonitor(QMainWindow):
         A dictionary containing common configuration parameters. If None, the application
         will prompt the user for configurations via a dialog.
     autodiscover: bool
-        If True, the application will automatically scan for available servers on startup.
-        Default is True.
+        If True, automatically scan for available servers on startup. Default is True.
     autoconnect: bool
-        If True, the application will attempt to connect to the first discovered server
-        after autodiscovery. Default is False.
+        If True, attempt to connect to the first discovered server. Default is False.
     """
 
     def __init__(
@@ -156,6 +157,7 @@ class BioViewMonitor(QMainWindow):
         controls_layout.addWidget(self.command_bar, stretch=1)
 
         self.settings_panel = SettingsPanel(self.common_config, self.group_configs)
+
         controls_layout.addWidget(self.settings_panel, stretch=3)
 
         top_layout.addLayout(controls_layout, stretch=3)
@@ -270,9 +272,13 @@ class BioViewMonitor(QMainWindow):
         self.client_worker.device_disconnect_succeeded.connect(
             self.update_status_bar_and_buttons
         )
-        self.client_worker.streaming_started.connect(self.update_status_bar_and_buttons)
-        self.client_worker.streaming_stopped.connect(self.update_status_bar_and_buttons)
-        self.client_worker.devices_discovered.connect(self._handle_devices_discovered)
+        self.client_worker.streaming_started.connect(
+            lambda x: self._handle_streaming_status_changed(x)
+        )
+        self.client_worker.streaming_stopped.connect(
+            lambda x: self._handle_streaming_status_changed(not x)
+        )
+        self.client_worker.devices_discovered.connect(self.update_status_bar_and_buttons)
 
         # General info signals
         self.client_worker.log_message.connect(self.log_display_panel.log_message)
@@ -283,7 +289,6 @@ class BioViewMonitor(QMainWindow):
         """
         self._connect_command_bar_signals()
         self._connect_settings_panel_signals()
-        self._connect_plot_grid_signals()
         self._connect_statusbar_signals()
 
     def _handle_server_connection_request(self, server_info: dict):
@@ -296,19 +301,6 @@ class BioViewMonitor(QMainWindow):
 
             with contextlib.suppress(Exception):
                 self.client_worker.connect_to_server()
-
-        # Listen for final server_connected/server_disconnected to hide spinner
-        with contextlib.suppress(Exception):
-            self.client_worker.server_connected.connect(
-                lambda _: self.status_bar.server_connector._server_spinner.setVisible(
-                    False
-                )
-            )
-            self.client_worker.server_disconnected.connect(
-                lambda _: self.status_bar.server_connector._server_spinner.setVisible(
-                    False
-                )
-            )
 
     def _connect_command_bar_signals(self):
         self.command_bar.initialize_devices.connect(self.on_device_init_requested)
@@ -331,10 +323,8 @@ class BioViewMonitor(QMainWindow):
         if getattr(self.settings_panel, "remove_data_source", None):
             self.settings_panel.remove_data_source.connect(self.remove_plot_source)
 
-        # logging hookup
+        # Connect logging
         self.settings_panel.log_event.connect(self.log_display_panel.log_message)
-
-    def _connect_plot_grid_signals(self):
         self.plot_grid.log_event.connect(self.log_display_panel.log_message)
 
     def _connect_statusbar_signals(self):
@@ -377,12 +367,26 @@ class BioViewMonitor(QMainWindow):
         if not is_dict_of_dicts(devices_map):
             self.log_display_panel.log_message(
                 "warning",
-                "Received devices payload with invalid shape; expected dict-of-dicts, ignoring",
+                "Received device map was not formatted correctly and was ignored.",
             )
             return
 
         self.device_status = devices_map
         self.update_status_bar_and_buttons(devices_map)
+
+    def _handle_streaming_status_changed(self, is_streaming: bool):
+        status = DeviceStatus.STREAMING if is_streaming else DeviceStatus.CONNECTED
+
+        for group_id, group in self.device_status.items():
+            for device_id in group:
+                if device_id == "metadata":
+                    continue
+
+                self.device_status[group_id][device_id] = status
+                self.status_bar.update_device_status(group_id, device_id, status)
+
+        client_status = self.client_worker.status
+        self.command_bar.update_button_states(client_status)
 
     def closeEvent(self, event):
         """Handle application close"""
@@ -466,6 +470,9 @@ class BioViewMonitor(QMainWindow):
 
         self.command_bar.update_button_states(self.client_worker.status)
         self.log_display_panel.log_message("warning", "Disconnected from server")
+
+    def on_streaming_started(self):
+        pass
 
     def update_status_bar_and_buttons(self, device_status: Dict):
         for group_id, group in device_status.items():

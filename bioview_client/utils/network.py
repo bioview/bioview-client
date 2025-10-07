@@ -27,7 +27,7 @@ def send_command(
         sock.send(command_json)
     except Exception as e:
         msg = f"Error occurred while sending command: {e}"
-        log_print(logger, "error", msg, fallback=True)
+        log_print(logger, "error", msg)
         return None
 
     # If we are here, a valid command has been sent. Wait for response

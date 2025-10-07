@@ -161,7 +161,10 @@ class Client(QThread):
         while self.running:
             try:
                 # A tiny, non-essential message to test the connection.
-                if self.status is ClientStatus.SERVER_CONNECTED:
+                if not isinstance(self.status, ClientStatus):
+                    self.status = ClientStatus.DEFAULT
+
+                if self.status >= ClientStatus.SERVER_CONNECTED:
                     self.control_socket.sendall(b"\x00")
             except (OSError, ConnectionResetError, BrokenPipeError):
                 # These exceptions mean the connection is closed.
@@ -271,9 +274,8 @@ class Client(QThread):
                     "info", f"Successfully connected to {server_info.get('hostname')}"
                 )
             else:
-                raise AuthenticationError(
-                    f'Server authentication failed: {auth_resp_payload.get("message", "")}'
-                )
+                err = auth_resp_payload.get("message", "")
+                raise AuthenticationError(f"Server authentication failed: {err}")
 
             return server_info
 
@@ -304,7 +306,7 @@ class Client(QThread):
                 )
 
         try:
-            # Connect to control server - close pre-existing connections (guard close/connect)
+            # Connect to control server - close pre-existing connections
             with self._control_lock:
                 if self.control_socket:
                     with contextlib.suppress(Exception):
@@ -352,7 +354,7 @@ class Client(QThread):
             self.log_message.emit("error", f"Server connection failed: {e}")
 
     def disconnect_from_server(self):
-        # Acquire lock while closing control socket to avoid closing under concurrent send/recv
+        # Locks for concurrency
         with self._control_lock:
             if self.control_socket:
                 with contextlib.suppress(Exception):
@@ -393,18 +395,16 @@ class Client(QThread):
 
         def _on_finished(group_status_dict):
             """
-            Server response for discovered groups follows the same convention as handler, i.e.
+            Server response for discovered groups follows the convention -
             'group_id': {
                 'device_id': {
                     'status': DeviceStatus
                 }
             }
 
-            Note that the server will only return devices for groups that were requested in the
-            discovery command payload. If no groups were specified, all available devices are
-            returned, without being formatted into groups.
-
-            Thus, we can directly update the stored states with the provided states.
+            Note that the response will only contain keys for device groups
+            that were requested in the provided payload. If no groups were
+            specified, nothing will be printed out.
             """
             if not group_status_dict or not is_dict_of_dicts(group_status_dict):
                 self._discovering_devices = False
@@ -435,7 +435,9 @@ class Client(QThread):
         if self.status is ClientStatus.STREAMING:
             self.stop_streaming()
 
-        response = send_command(Command.DISCONNECT_DEVICES)
+        response = send_command(
+            sock=self.control_socket, command=Command.DISCONNECT_DEVICES
+        )
         resp_type, resp_payload = parse_and_validate_response(response)
 
         if resp_type == Response.SUCCESS.name:
@@ -454,7 +456,10 @@ class Client(QThread):
             return False
 
         self.log_message.emit("info", "Attempting to start data streaming...")
-        response = send_command(Command.START_STREAMING)
+        self.control_socket.settimeout(10)
+        response = send_command(
+            sock=self.control_socket, command=Command.START_STREAMING
+        )
         resp_type, resp_payload = parse_and_validate_response(response)
 
         if resp_type == Response.SUCCESS.name:
@@ -468,7 +473,7 @@ class Client(QThread):
                         self.data_socket = socket.socket(
                             socket.AF_INET, socket.SOCK_STREAM
                         )
-                        self.data_socket.settimeout(5.0)
+                        self.data_socket.settimeout(10)
                         self.data_socket.connect(
                             (self.selected_server.get("ip"), self.data_port)
                         )
@@ -477,6 +482,7 @@ class Client(QThread):
                 self.log_message.emit("error", f"Data connection failed: {e}")
 
             self.streaming_started.emit(True)
+            self.log_message.emit("debug", "Streaming started successfully")
         else:
             msg = resp_payload.get("message", "")
             self.log_message.emit("error", f"Failed to start streaming: {msg}")
@@ -488,9 +494,10 @@ class Client(QThread):
             )
             return False
 
-        self.log_message.emit("info", "Stopping data streaming...")
+        self.log_message.emit("debug", "Attempting to stop streaming...")
 
-        response = send_command(Command.STOP_STREAMING)
+        self.control_socket.settimeout(10)
+        response = send_command(sock=self.control_socket, command=Command.STOP_STREAMING)
         resp_type, resp_payload = parse_and_validate_response(response)
 
         if resp_type == Response.ERROR.name:
@@ -504,8 +511,10 @@ class Client(QThread):
             self.data_socket = None
             self.data_connected = False
 
-        # Update status back to connected, non-streaming server
-        self.status = ClientStatus.SERVER_CONNECTED
+        # Update status
+        self.status = ClientStatus.DEVICES_CONNECTED
+        self.streaming_stopped.emit(True)
+        self.log_message.emit("debug", "Streaming stopped successfully")
 
     def configure_device(self, device_id, config):
         """Configure device parameters"""
@@ -518,7 +527,9 @@ class Client(QThread):
 
         self.log_message.emit("info", "Configuring device: {device_id}")
         response = send_command(
-            Command.UPDATE_RUNNING_PARAMETER, {"id": device_id, "config": config}
+            sock=self.control_socket,
+            command=Command.UPDATE_RUNNING_PARAMETER,
+            params={"id": device_id, "config": config},
         )
 
         resp_type, resp_payload = parse_and_validate_response(response)
