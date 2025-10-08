@@ -1,4 +1,3 @@
-from .configuration import DEFAULT_COMMON_CONFIGURATION
 from .theme import (
     COLOR_SCHEME,
     get_color_by_idx,
@@ -9,7 +8,6 @@ from .theme import (
 
 
 __all__ = [
-    "DEFAULT_COMMON_CONFIGURATION",
     "COLOR_SCHEME",
     "get_color_by_idx",
     "get_color_tuple",

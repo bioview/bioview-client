@@ -17,9 +17,7 @@ This can be modified for remote operation.
 """
 
 import contextlib
-import json
 import socket
-import struct
 import threading
 import time
 from typing import Any, Dict, List
@@ -42,7 +40,7 @@ from bioview_common import (
 )
 from PyQt6.QtCore import QThread, QThreadPool, pyqtSignal
 
-from bioview_client.helpers import DeviceInitWorker, ScanWorker
+from bioview_client.helpers import DataStreamer, DeviceInitWorker, ScanWorker
 from bioview_client.utils import (
     get_challenge_response,
     group_config_to_dict,
@@ -82,7 +80,7 @@ class Client(QThread):
 
     def __init__(
         self,
-        common_config: Dict = None,
+        experiment_config: Dict = None,
         group_configs: Dict = None,
         data_port: int = DATA_PORT,
         control_port: int = CONTROL_PORT,
@@ -111,6 +109,7 @@ class Client(QThread):
 
         self.status = ClientStatus.DEFAULT
         self.data_connected = False
+        self.data_streamer = None
 
         # Thread pool for background tasks (scanning, device discovery)
         self.thread_pool = QThreadPool()
@@ -128,14 +127,15 @@ class Client(QThread):
         self.running = False
 
         # Keep track of common configuration
-        # NOTE: We convert to dict here
-        self.common_config = {}
+        self.experiment_config = None
 
-        if common_config:
-            if isinstance(common_config, Configuration):
-                self.common_config = common_config.to_dict()
-            elif isinstance(common_config, dict):
-                self.common_config = common_config
+        if experiment_config:
+            if isinstance(experiment_config, Configuration):
+                self.experiment_config = experiment_config
+            elif isinstance(experiment_config, dict):
+                self.experiment_config = Configuration.from_dict(
+                    experiment_config, "experiment"
+                )
 
         # Keep track of device configuration and states
         self.group_configs = group_config_to_dict(group_configs) if group_configs else {}
@@ -458,7 +458,12 @@ class Client(QThread):
         self.log_message.emit("info", "Attempting to start data streaming...")
         self.control_socket.settimeout(10)
         response = send_command(
-            sock=self.control_socket, command=Command.START_STREAMING
+            sock=self.control_socket,
+            command=Command.START_STREAMING,
+            params={
+                "save_config": self.experiment_config.get_save_config(),
+                "display_config": self.experiment_config.get_display_config(),
+            },
         )
         resp_type, resp_payload = parse_and_validate_response(response)
 
@@ -473,19 +478,31 @@ class Client(QThread):
                         self.data_socket = socket.socket(
                             socket.AF_INET, socket.SOCK_STREAM
                         )
-                        self.data_socket.settimeout(10)
-                        self.data_socket.connect(
-                            (self.selected_server.get("ip"), self.data_port)
-                        )
+
+                    self.data_socket.settimeout(10)
+                    self.data_socket.connect(
+                        (self.selected_server.get("ip"), self.data_port)
+                    )
                     self.data_connected = True
             except Exception as e:
                 self.log_message.emit("error", f"Data connection failed: {e}")
 
+            # Start data streamer streamer
+            self.data_streamer = DataStreamer(data_conn=self.data_socket)
+            self.data_streamer.data_received.connect(self._handle_received_data)
+            self.data_streamer.start()
+
+            # Emit success
             self.streaming_started.emit(True)
             self.log_message.emit("debug", "Streaming started successfully")
         else:
             msg = resp_payload.get("message", "")
             self.log_message.emit("error", f"Failed to start streaming: {msg}")
+
+    def _handle_received_data(self, source, data):
+        # Forwards received (source, data) to UI for display
+        # Any processing is expected to be done in DataStreamer
+        self.data_received.emit(source, data)
 
     def stop_streaming(self):
         if getattr(self, "_discovering_devices", False):
@@ -510,6 +527,10 @@ class Client(QThread):
                 self.data_socket.close()
             self.data_socket = None
             self.data_connected = False
+
+        # Stop stream worker
+        if self.data_streamer:
+            self.data_streamer.stop()
 
         # Update status
         self.status = ClientStatus.DEVICES_CONNECTED
@@ -563,86 +584,3 @@ class Client(QThread):
     def update_device_state(self, device_id) -> bool:
         """Helper function to keep track of device states internally"""
         pass
-
-
-class DataStreamer(QThread):
-    log_message = pyqtSignal(str, str)
-    data_received = pyqtSignal(np.ndarray)
-
-    def __init__(self, running, parent=None):
-        super().__init__(parent)
-        self.running = running
-
-    def run(self):
-        """Receive real-time data from server"""
-        self.log_message.emit("info", "Data receiving thread started")
-
-        while self.running:
-            try:
-                # Receive data length header
-                length_data = self._recv_exactly(4)
-                if not length_data:
-                    break
-
-                data_length = struct.unpack("!I", length_data)[0]
-
-                # Receive the actual data
-                data_bytes = self._recv_exactly(data_length)
-                if not data_bytes:
-                    break
-
-                # Deserialize the data
-                data = self._deserialize_data(data_bytes)
-
-                if data is not None:
-                    # Emit data signal for plotting
-                    self.data_received.emit(data)
-
-            except Exception as e:
-                if self.status == ClientStatus.STREAMING:
-                    self.log_message.emit("error", f"Data receiving error: {e}")
-                return
-
-        self.log_message.emit("info", "Data receiving thread stopped")
-
-    def _recv_exactly(self, num_bytes):
-        """Receive exactly num_bytes from data socket"""
-        data = b""
-        while len(data) < num_bytes:
-            try:
-                chunk = self.data_socket.recv(num_bytes - len(data))
-                if not chunk:
-                    return None
-                data += chunk
-            except Exception as e:
-                self.log_message.emit("error", f"Receiving error: {e}")
-                return None
-        return data
-
-    def _deserialize_data(self, data_bytes):
-        """Deserialize numpy data from server"""
-        try:
-            # Read header length
-            header_length = struct.unpack("!I", data_bytes[:4])[0]
-
-            # Read header
-            header_bytes = data_bytes[4 : 4 + header_length]
-            header = json.loads(header_bytes.decode("utf-8"))
-
-            # Read data
-            array_bytes = data_bytes[4 + header_length :]
-
-            # Reconstruct numpy array
-            shape = tuple(header["shape"])
-            dtype = np.dtype(header["dtype"])
-
-            data = np.frombuffer(array_bytes, dtype=dtype).reshape(shape)
-
-            return data
-
-        except Exception as e:
-            self.log_message.emit("error", f"Data deserialization error: {e}")
-            return None
-
-    def stop(self):
-        self.running = False

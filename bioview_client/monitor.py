@@ -35,7 +35,6 @@ from bioview_client.components import (
     StatusBar,
     TextDialog,
 )
-from bioview_client.constants import DEFAULT_COMMON_CONFIGURATION
 from bioview_client.handler import Client
 from bioview_client.utils import is_dict_of_dicts, load_json_file
 
@@ -50,7 +49,7 @@ class BioViewMonitor(QMainWindow):
         device group (dictionary). Key-value pairs in the device group correspond to
         device ID and device configurations respectively. If None, the application will
         prompt the user for configurations via a dialog.
-    common_config: Dict
+    experiment_config: Dict
         A dictionary containing common configuration parameters. If None, the application
         will prompt the user for configurations via a dialog.
     autodiscover: bool
@@ -62,7 +61,7 @@ class BioViewMonitor(QMainWindow):
     def __init__(
         self,
         group_configs: List[Dict] = None,
-        common_config: Dict = None,
+        experiment_config: Dict = None,
         autodiscover: bool = True,
         autoconnect: bool = False,
     ):
@@ -74,8 +73,8 @@ class BioViewMonitor(QMainWindow):
         # Check for valid configurations, else prompt user.
         # UI and backend store it in Configuration objects,
         # while handlers store as dict/json.
-        self.common_config, self.group_configs = self._resolve_initial_configs(
-            common_config, group_configs
+        self.experiment_config, self.group_configs = self._resolve_initial_configs(
+            experiment_config, group_configs
         )
 
         # Store device names and states - since that's all the UI needs
@@ -89,21 +88,17 @@ class BioViewMonitor(QMainWindow):
 
             self.device_status[group_id] = tmp
 
-        # Keep track for display sources
-        if not self.common_config.get_param("display_sources", None):
-            self.common_config.set_param("display_sources", [])
-
         self.saving_status = False
 
         # Track instruction
         self.instruction_dialog = None
-        self.enable_instructions = self.common_config.get_param(
+        self.enable_instructions = self.experiment_config.get_param(
             "enable_instructions", False
         )
 
         if (
             self.enable_instructions
-            and self.common_config.get_param("instruction_type", "audio") == "text"
+            and self.experiment_config.get_param("instruction_type", "audio") == "text"
         ):
             self.instruction_dialog = TextDialog()
 
@@ -112,7 +107,7 @@ class BioViewMonitor(QMainWindow):
 
         # Client is setup with handlers passed along
         self.client_worker = Client(
-            common_config=self.common_config, group_configs=self.group_configs
+            experiment_config=self.experiment_config, group_configs=self.group_configs
         )
         self._connect_client_signals()
         self.client_worker.start_client()
@@ -156,7 +151,7 @@ class BioViewMonitor(QMainWindow):
         self.command_bar = AppControlPanel()
         controls_layout.addWidget(self.command_bar, stretch=1)
 
-        self.settings_panel = SettingsPanel(self.common_config, self.group_configs)
+        self.settings_panel = SettingsPanel(self.experiment_config, self.group_configs)
 
         controls_layout.addWidget(self.settings_panel, stretch=3)
 
@@ -171,14 +166,14 @@ class BioViewMonitor(QMainWindow):
         self.meta_panels.addWidget(self.log_display_panel, stretch=3)
 
         # Annotation Panel
-        self.annotate_event_panel = AnnotateEventPanel(self.common_config)
+        self.annotate_event_panel = AnnotateEventPanel(self.experiment_config)
         self.meta_panels.addWidget(self.annotate_event_panel, stretch=2)
         top_layout.addLayout(self.meta_panels, stretch=2)
 
         main_layout.addLayout(top_layout)
 
         # Plot Grid
-        self.plot_grid = PlotGrid(self.common_config)
+        self.plot_grid = PlotGrid(self.experiment_config)
         main_layout.addWidget(self.plot_grid)
 
         central_widget.setLayout(main_layout)
@@ -188,14 +183,14 @@ class BioViewMonitor(QMainWindow):
         self.setStatusBar(self.status_bar)
 
     # If initial configurations do not exist, ask using inputs
-    def _resolve_initial_configs(self, common_config, group_configs):
+    def _resolve_initial_configs(self, experiment_config, group_configs):
         """
         We initially receive configurations in JSON/dict format. These need
         to be sanitized (if applicable). Hence, we load them into a
         configuration object format. For the handler, however, we keep them
         as dictionaries for easy serialization.
         """
-        if not common_config or not group_configs:
+        if not experiment_config or not group_configs:
             dialog = ConfigurationPrompt()
             # Will provide configurations as dict objects
             configurations = None
@@ -204,17 +199,17 @@ class BioViewMonitor(QMainWindow):
                 configurations = dialog.get_configurations()
 
             if configurations:
-                common_cfg = configurations.get("common", None)
+                experiment_cfg = configurations.get("experiment", None)
                 group_cfgs = configurations.get("groups", None)
             else:
-                common_cfg = DEFAULT_COMMON_CONFIGURATION
+                experiment_cfg = {}
                 group_cfgs = {}
 
-        common_cfg = Configuration.from_dict(common_config)
+        experiment_cfg = Configuration.from_dict(experiment_config, "experiment")
         group_cfgs = self._convert_group_configs(group_configs)
 
         # At this stage, we have sanitized Configuration objects
-        return common_cfg, group_cfgs
+        return experiment_cfg, group_cfgs
 
     def _convert_group_configs(self, group_cfgs: Dict):
         if not is_dict_of_dicts(group_cfgs):
@@ -499,8 +494,8 @@ if __name__ == "__main__":
         default=None,
     )
     parser.add_argument(
-        "--common",
-        help="Common configuration JSON file",
+        "--experiment",
+        help="General experiment configuration JSON file",
         default=None,
     )
     parser.add_argument(
@@ -528,7 +523,7 @@ if __name__ == "__main__":
 
     # Load JSONs
     cli_group_configs = {}
-    cli_common_config = {}
+    cli_experiment_config = {}
 
     if args.devices:
         for file_path in args.devices:
@@ -557,11 +552,11 @@ if __name__ == "__main__":
             except ValueError as e:
                 print(f"Invalid device group configuration in {file_path}: {e}")
 
-    if args.common:
+    if args.experiment:
         try:
-            cli_common_config = load_json_file(args.common)
+            cli_experiment_config = load_json_file(args.experiment)
         except Exception as e:
-            print(f"Invalid common configuration in {args.common}: {e}")
+            print(f"Invalid common configuration in {args.experiment}: {e}")
 
     qdarktheme.enable_hi_dpi()
     app = QApplication(sys.argv)
@@ -571,7 +566,7 @@ if __name__ == "__main__":
     # NOTE: Every config passed is JSON/dict format.
     window = BioViewMonitor(
         group_configs=cli_group_configs,
-        common_config=cli_common_config,
+        experiment_config=cli_experiment_config,
         autodiscover=args.autodiscover,
         autoconnect=args.autoconnect,
     )

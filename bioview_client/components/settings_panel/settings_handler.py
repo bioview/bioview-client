@@ -13,30 +13,30 @@ class SettingsPanel(QTabWidget):
 
     def __init__(
         self,
-        common_config: Configuration = None,
+        experiment_config: Configuration = None,
         group_configs: Dict[str, Dict] = None,
     ):
         super().__init__()
 
         # Add common panel if applicable
-        self.common_settings_panel = None
+        self.experiment_settings_panel = None
 
-        if common_config is not None:
-            self.common_settings_panel = CommonSettingsPanel(common_config)
-            self.addTab(self.common_settings_panel, "Settings")  # Add to UI
+        if experiment_config is not None:
+            self.experiment_settings_panel = CommonSettingsPanel(experiment_config)
+            self.addTab(self.experiment_settings_panel, "Settings")  # Add to UI
 
             # Connect signals
-            # self.common_settings_panel.parameter_changed.connect()
-            self.common_settings_panel.log_event.connect(self.send_to_log)
+            # self.experiment_settings_panel.parameter_changed.connect()
+            self.experiment_settings_panel.log_event.connect(self.send_to_log)
             self.display_duration_changed = (
-                self.common_settings_panel.display_duration_changed
+                self.experiment_settings_panel.display_duration_changed
             )
-            self.grid_layout_changed = self.common_settings_panel.grid_layout_changed
-            self.add_data_source = self.common_settings_panel.add_data_source
-            self.remove_data_source = self.common_settings_panel.remove_data_source
+            self.grid_layout_changed = self.experiment_settings_panel.grid_layout_changed
+            self.add_data_source = self.experiment_settings_panel.add_data_source
+            self.remove_data_source = self.experiment_settings_panel.remove_data_source
 
             # Connect functions
-            self.update_source = self.common_settings_panel.update_source
+            self.update_source = self.experiment_settings_panel.update_source
 
         # Create panels for connected devices
         self.device_settings_panel = {}
