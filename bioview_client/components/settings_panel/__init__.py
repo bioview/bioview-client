@@ -1,5 +1,4 @@
-from .settings_handler import SettingsPanel 
+from .settings_handler import SettingsPanel as SettingsPanel
 
-__alL__ = [
-    "SettingsPanel"
-]
+
+__alL__ = ["SettingsPanel"]

@@ -1,4 +1,5 @@
 import qtawesome as qta
+from bioview_common import Configuration, DataSource, DeviceStatus
 from PyQt6.QtCore import QEvent, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QFileDialog,
@@ -11,29 +12,23 @@ from PyQt6.QtWidgets import (
     QSpinBox,
 )
 
-from bioview_common import DeviceStatus, DataSource
-
-from bioview_client.constants import get_qcolor
 from bioview_client.components.common import CheckableComboBox
+from bioview_client.constants import get_qcolor
+
 
 class CommonSettingsPanel(QGroupBox):
     parameter_changed = pyqtSignal(str, object)
-    log_event = pyqtSignal(str, str) 
+    log_event = pyqtSignal(str, str)
     display_duration_changed = pyqtSignal(int)
     grid_layout_changed = pyqtSignal(int, int)
-    add_data_source = pyqtSignal(object)  # Changed to emit DataSource object
-    remove_data_source = pyqtSignal(object)  # Changed to emit DataSource object
+    add_data_source = pyqtSignal(DataSource)
+    remove_data_source = pyqtSignal(DataSource)
 
-    def __init__(
-        self, 
-        file_name: str,
-        save_dir: str,  
-        parent=None
-    ):
+    def __init__(self, config: Configuration, parent=None):
         super().__init__("Experiment Settings", parent)
-        
-        self.file_name = file_name
-        self.save_dir = save_dir
+
+        self.file_name = config.get_param("file_name", "")
+        self.save_dir = config.get_param("save_dir", "")
 
         self.param_inputs = {}
         self.init_ui()
@@ -110,10 +105,10 @@ class CommonSettingsPanel(QGroupBox):
         # Channel selection
         layout.addWidget(QLabel("Plot Sources"), row, 0)
         self.plot_source = CheckableComboBox()
-        
+
         # Assuming available_channels cntains DataSource objects
-        for source in self.data_sources:
-            self.plot_source.addItem(source)
+        # for source in self.data_sources:
+        #     self.plot_source.addItem(source)
 
         self.plot_source.selectionChanged.connect(self.request_channel_update)
 
@@ -163,11 +158,11 @@ class CommonSettingsPanel(QGroupBox):
         self.parameter_changed.emit(param_name, value)
 
     def update_button_states(self, device_status):
-        if device_status == DeviceStatus.STREAMING: 
+        if device_status == DeviceStatus.STREAMING:
             # Do not allow grid updates during streaming
             self.rows_input.setEnabled(False)
             self.cols_input.setEnabled(False)
-            # Do not allow changing save file path mid-streaming to avoid data loss 
+            # Do not allow changing save file path mid-streaming to avoid data loss
             self.file_name_textbox.setEnabled(False)
             self.save_path_textbox.setEnabled(False)
             self.browse_button.setEnabled(False)
