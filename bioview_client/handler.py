@@ -221,6 +221,8 @@ class Client(QThread):
         self._cancel_scan = True
         self.thread_pool.clear()
 
+        self.server_scan_completed.emit(self.discovered_servers)
+
     def _authenticate_with_server(self, server_socket: socket.socket) -> Dict[str, Any]:
         '''
         We try to authenticate ourselves with the server. In case the server closes
@@ -409,9 +411,9 @@ class Client(QThread):
             """
             if not group_status_dict or not is_dict_of_dicts(group_status_dict):
                 self._discovering_devices = False
-                self.log_message.emit(
-                    "warning", f"Invalid response: {group_status_dict}."
-                )
+
+                if len(self.group_configs) > 0: 
+                    self.log_message.emit("warning", f"Invalid response received")
                 return
 
             self.device_states = group_status_dict

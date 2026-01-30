@@ -36,7 +36,7 @@ from bioview_client.components import (
     TextDialog,
 )
 from bioview_client.handler import Client
-from bioview_client.utils import is_dict_of_dicts, load_json_file
+from bioview_client.utils import is_dict_of_dicts, read_experiment_config_file, read_device_config_files
 
 
 class BioViewMonitor(QMainWindow):
@@ -489,15 +489,16 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Launch BioView Monitor UI")
     parser.add_argument(
-        "--devices",
+        "--device-config",
         nargs="*",
-        help="List of device configuration JSON files",
-        default=None,
+        help="JSON files containing device configurations",
+        default=[],
     )
     parser.add_argument(
-        "--experiment",
-        help="General experiment configuration JSON file",
-        default=None,
+        "--experiment-config",
+        help="JSON file containing experiment configuration",
+        type=str, 
+        default='',
     )
     parser.add_argument(
         "--autodiscover",
@@ -505,14 +506,6 @@ if __name__ == "__main__":
         action="store_true",
         help="Automatically discover servers on start (default)",
     )
-    parser.add_argument(
-        "--no-autodiscover",
-        dest="autodiscover",
-        action="store_false",
-        help="Do not automatically discover servers on start",
-    )
-    parser.set_defaults(autodiscover=True)
-
     parser.add_argument(
         "--autoconnect",
         dest="autoconnect",
@@ -522,52 +515,14 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # Load JSONs
-    cli_group_configs = {}
-    cli_experiment_config = {}
-
-    if args.devices:
-        for file_path in args.devices:
-            try:
-                # Load config
-                group_cfg = load_json_file(file_path)
-
-                # Since a group name won't be provided by default, use
-                # filename stem as base group id and ensure uniqueness
-                stem = Path(file_path).stem or "group"
-                group_id = stem
-                suffix = 1
-
-                while group_id in cli_group_configs:
-                    group_id = f"{stem}_{suffix}"
-                    suffix += 1
-
-                # Ensure that group_cfg is dict_of_dicts
-                if not is_dict_of_dicts(group_cfg):
-                    raise ValueError(
-                        "Specified device group configuration must be a dict of dict"
-                    )
-
-                cli_group_configs[group_id] = group_cfg
-
-            except ValueError as e:
-                print(f"Invalid device group configuration in {file_path}: {e}")
-
-    if args.experiment:
-        try:
-            cli_experiment_config = load_json_file(args.experiment)
-        except Exception as e:
-            print(f"Invalid common configuration in {args.experiment}: {e}")
-
     qdarktheme.enable_hi_dpi()
     app = QApplication(sys.argv)
-    qdarktheme.setup_theme(theme="auto")
+    qdarktheme.setup_theme(theme="dark")
 
     # Create and show main window with parsed configs and flags
-    # NOTE: Every config passed is JSON/dict format.
     window = BioViewMonitor(
-        group_configs=cli_group_configs,
-        experiment_config=cli_experiment_config,
+        group_configs=read_device_config_files(args.device_config),
+        experiment_config=read_experiment_config_file(args.experiment_config),
         autodiscover=args.autodiscover,
         autoconnect=args.autoconnect,
     )

@@ -108,16 +108,14 @@ class ServerConnector(QWidget):
         self.setLayout(control_layout)
 
     def scan_network(self):
-        """Start network scan for servers"""
         # Toggle scanning state: if already scanning, request cancel
         if self._scanning:
-            # request cancel
+            # Request cancel
             self.network_scan_cancel_requested.emit()
             return
 
         # begin scan
         self._scanning = True
-        # swap icon to stop glyph (replace existing icon)
         self.scan_btn.setIcon(self._stop_icon)
 
         # Clear past results
@@ -185,10 +183,8 @@ class ServerConnector(QWidget):
         self.discover_devices_requested.emit()
 
     def closeEvent(self, event):
-        """Handle widget close"""
-        # Best-effort cleanup
-        with contextlib.suppress(Exception):
-            self.network_scan_cancel_requested.emit()
+        # Ensure all active scans are stopped and all connections are closed. 
+        self.network_scan_cancel_requested.emit()
         super().closeEvent(event)
 
 

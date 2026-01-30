@@ -10,9 +10,7 @@
             "request": "launch",
             "program": "${file}",
             "console": "integratedTerminal",
-            "args": ["--experiment", "C:\\Users\\Aakash\\Desktop\\common_config.json",
-                    "--devices",  "C:\\Users\\Aakash\\Desktop\\usrp_1.json",
-                    "--autoconnect"]
+            "args": ["--autoconnect"]
         }
     ]
 }
