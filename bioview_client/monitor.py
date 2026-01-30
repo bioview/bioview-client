@@ -442,7 +442,7 @@ class BioViewMonitor(QMainWindow):
             self.instruction_dialog.toggle_ui(self.enable_instructions)
 
     # Client worker helper functions
-    def on_server_connected(self):
+    def on_server_connected(self, data_sources: None):
         self.log_display_panel.log_message("info", "Connected to server")
 
         try:
@@ -454,8 +454,9 @@ class BioViewMonitor(QMainWindow):
         self.status_bar.server_connector.discover_btn.setEnabled(True)
 
         self.command_bar.update_button_states(self.client_worker.status)
-
-        # TODO: Populate display sources by querying server
+    
+        if data_sources: 
+            self.populate_plot_grid_sources(data_sources) 
 
     def on_server_disconnected(self):
         try:

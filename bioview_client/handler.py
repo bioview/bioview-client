@@ -75,7 +75,7 @@ class Client(QThread):
     # General info signals
     log_message = pyqtSignal(str, str)
 
-    # Data signals for graphical output
+    # Data signals for graphical outputi 
     data_received = pyqtSignal(DataSource, np.ndarray)
 
     def __init__(
@@ -109,6 +109,8 @@ class Client(QThread):
 
         self.status = ClientStatus.DEFAULT
         self.data_connected = False
+
+        self.data_sources = None 
         self.data_streamer = None
 
         # Thread pool for background tasks (scanning, device discovery)
@@ -163,9 +165,6 @@ class Client(QThread):
                 # A tiny, non-essential message to test the connection.
                 if not isinstance(self.status, ClientStatus):
                     self.status = ClientStatus.DEFAULT
-
-                if self.status >= ClientStatus.SERVER_CONNECTED:
-                    self.control_socket.sendall(b"\x00")
             except (OSError, ConnectionResetError, BrokenPipeError):
                 # These exceptions mean the connection is closed.
                 self.disconnect_from_server()
@@ -180,7 +179,7 @@ class Client(QThread):
         # Track transient state for early stopping
         self._cancel_scan = False
         self._completed_scans = 0
-        total_ips = 254  # Currently we are only scanning IPv4
+        total_ips = 255  # Currently we are only scanning IPv4
         self._last_update_time = time.time()
 
         def handle_result(found):
@@ -219,34 +218,31 @@ class Client(QThread):
             self.thread_pool.start(worker)
 
     def cancel_scan(self):
-        """Cancel ongoing scan"""
         self._cancel_scan = True
         self.thread_pool.clear()
 
-    # Authentication check for initial connection to server
     def _authenticate_with_server(self, server_socket: socket.socket) -> Dict[str, Any]:
-        """
-        !WARNING: May throw exception
-        """
+        '''
+        We try to authenticate ourselves with the server. In case the server closes
+        the connection, we handle it gracefully (not that anything else can be done)
+        '''
         server_socket.settimeout(self.auth_timeout)
+        server_info = None 
 
-        # Step 1: Broadcast client info to server and get response
-        response = send_command(
-            sock=server_socket,
-            command=Command.CONNECT_SERVER,
-            params={"client_info": self.info, "timestamp": time.time()},
-        )
+        try: 
+            # Broadcast client info to server and get response
+            response = send_command(
+                sock=server_socket,
+                command=Command.CONNECT_SERVER,
+                params={"client_info": self.info, "timestamp": time.time()},
+            )
+            
+            # If we are here, the server did not close connection. 
+            resp_type, resp_payload = parse_and_validate_response(response)
 
-        resp_type, resp_payload = parse_and_validate_response(response)
-
-        # Step 2a: Check if connection was refused
-        if resp_type == Response.CONNECTION_REFUSED.name:
-            message = resp_payload.get("message", "Connection refused by server")
-            raise AuthenticationError(f"Connection refused by server: {message}")
-
-        # Step 2b: Check if server provided a challenge
-        if resp_type == Response.SERVER_CHALLENGE.name:
-            challenge = resp_payload.get("challenge", None)
+            # Check if server provided a challenge
+            if resp_type == Response.SERVER_CHALLENGE.name:
+                challenge = resp_payload.get("challenge", None)
 
             if not challenge:
                 raise AuthenticationError("Server did not provide authentication token")
@@ -265,7 +261,7 @@ class Client(QThread):
             )
 
             if auth_resp_type == Response.AUTHENTICATION_SUCCESS.name:
-                server_info = auth_resp_payload.get("server_info", {})
+                server_info = auth_resp_payload.get("server_info", None)
 
                 # Update status
                 self.status = ClientStatus.SERVER_CONNECTED
@@ -276,7 +272,9 @@ class Client(QThread):
             else:
                 err = auth_resp_payload.get("message", "")
                 raise AuthenticationError(f"Server authentication failed: {err}")
-
+        except Exception as e: 
+            self.log_message("error", "Authentication with server failed")
+        finally: 
             return server_info
 
     def change_selected_server(self, index: int):
@@ -337,7 +335,10 @@ class Client(QThread):
             # Once everything succeeds, update the status
             self.status = ClientStatus.SERVER_CONNECTED
             self.server_connected.emit(True)
-
+    
+            # Since the connection has completed successfully, we update data sources 
+            # using server info 
+            self.data_sources = server_info.get('data_sources', None)
         except Exception as e:
             # Reset status
             self.status = ClientStatus.DEFAULT
@@ -449,7 +450,7 @@ class Client(QThread):
 
     # Data streaming handlers
     def start_streaming(self):
-        if getattr(self, "_discovering_devices", False):
+        if self._discovering_devices:
             self.log_message.emit(
                 "warning", "Cannot start streaming while device discovery is in progress"
             )
@@ -505,7 +506,7 @@ class Client(QThread):
         self.data_received.emit(source, data)
 
     def stop_streaming(self):
-        if getattr(self, "_discovering_devices", False):
+        if self._discovering_devices:
             self.log_message.emit(
                 "warning", "Cannot stop streaming while device discovery is in progress"
             )
@@ -538,8 +539,12 @@ class Client(QThread):
         self.log_message.emit("debug", "Streaming stopped successfully")
 
     def configure_device(self, device_id, config):
-        """Configure device parameters"""
-        if getattr(self, "_discovering_devices", False):
+        '''
+        This function is used by BioView Configurator to modify operational parameters
+        of connected devices using respective device handlers, which in turn will make
+        calls using the provided device drivers. 
+        '''
+        if self._discovering_devices:
             self.log_message.emit(
                 "warning",
                 "Cannot configure device while device discovery is in progress",
@@ -567,19 +572,17 @@ class Client(QThread):
 
     # Client function for PyQt loops
     def start_client(self):
-        """Start the client worker"""
         self.running = True
         self.start()
 
     def stop_client(self):
-        """Stop the client worker"""
         self.running = False
         self.disconnect_from_server()
         self.quit()
 
     ### Helpers
-    def get_display_sources(self):
-        pass
+    def get_data_sources(self):
+        return self.data_sources
 
     def update_device_state(self, device_id) -> bool:
         """Helper function to keep track of device states internally"""

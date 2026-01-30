@@ -17,6 +17,8 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QTextEdit,
     QVBoxLayout,
+    QStyle,
+    QWidget
 )
 
 from bioview_client.utils import is_dict_of_dicts, load_json_file
@@ -24,77 +26,71 @@ from bioview_client.utils import is_dict_of_dicts, load_json_file
 
 class ConfigurationPrompt(QDialog):
     """
-    Dialog for uploading common and device configuration, loaded whenever the app does not find a valid configuration
+    Dialog for uploading common and device configuration, loaded whenever 
+    the app does not find a valid configuration
     """
-
     def __init__(
         self,
-        common_config: Dict = None,
+        experiment_config: Dict = None,
         group_configs: Dict[str, Dict] = None,
         parent=None,
     ):
         super().__init__(parent)
-        self.common_config = common_config
+        self.experiment_config = experiment_config or {} 
 
-        # Canonical internal representation: dict[group_id] -> dict[device_id] -> config
-        if is_dict_of_dicts(group_configs):
-            self.group_configs = group_configs
-        else:
-            self.group_configs = {}
-
+        self.group_configs = group_configs if is_dict_of_dicts(group_configs) else {}
+        
         self.setup_ui()
         self.populate_device_list()
+        self.update_experiment_config_preview()
 
     def setup_ui(self):
-        """Initialize the dialog UI."""
-        self.setWindowTitle(
-            f"Experimental Configuration - BioView Monitor {APP_VERSION}"
-        )
+        self.setWindowTitle(f"Configuration - BioView Monitor {APP_VERSION}")
         self.setModal(True)
-        self.resize(600, 500)
-
+        self.resize(800, 500)
+        
         layout = QVBoxLayout(self)
 
-        # Header message
-        header_label = QLabel(
-            "App was launched with incomplete configuration files. Please upload configuration files. Press 'Cancel' to skip."
-        )
-        header_label.setStyleSheet(
-            "color: #d32f2f; padding: 10px; background-color: #ffebee; border-radius: 4px;"
-        )
-        header_label.setWordWrap(True)
-        layout.addWidget(header_label)
+        # Header
+        header_container = QWidget()
+        header_layout = QHBoxLayout(header_container)
+        header_layout.setContentsMargins(10, 10, 10, 10) 
+        
+        warning_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning)
+        icon_label = QLabel()
+        icon_label.setPixmap(warning_icon.pixmap(24, 24)) 
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        # Common Configuration Section
-        common_group = QGroupBox("Common Configuration")
+        text_label = QLabel("App was launched with incomplete configuration. Please add configuration files.")
+        text_label.setWordWrap(True)
+
+        header_layout.addWidget(icon_label)
+        header_layout.addWidget(text_label, 1) # '1' lets text expand to fill space
+
+        layout.addWidget(header_container)
+
+        # Experiment Configuration Section
+        common_group = QGroupBox("Experiment Configuration")
         common_layout = QVBoxLayout(common_group)
 
-        common_info_layout = QHBoxLayout()
-        if self.common_config is None:
-            self.common_status_label = QLabel("No configuration provided")
-        else:
-            self.common_status_label = QLabel("Configuration found")
-        self.common_status_label.setStyleSheet("color: gray; font-style: italic;")
-        common_info_layout.addWidget(self.common_status_label)
-        common_info_layout.addStretch()
+        update_exp_cfg_btn_layout = QHBoxLayout()
+        update_exp_cfg_btn_layout.addStretch()
 
-        self.upload_common_btn = QPushButton("Upload Common Config")
-        self.upload_common_btn.clicked.connect(self.upload_common_config)
-        common_info_layout.addWidget(self.upload_common_btn)
+        self.update_experiment_cfg_btn = QPushButton("Browse Files")
+        self.update_experiment_cfg_btn.clicked.connect(self.update_experiment_config)
+        update_exp_cfg_btn_layout.addWidget(self.update_experiment_cfg_btn)
 
         self.clear_common_btn = QPushButton("Clear")
-        self.clear_common_btn.clicked.connect(self.clear_common_config)
+        self.clear_common_btn.clicked.connect(self.clear_experiment_config)
         self.clear_common_btn.setEnabled(False)
-        common_info_layout.addWidget(self.clear_common_btn)
+        update_exp_cfg_btn_layout.addWidget(self.clear_common_btn)
 
-        common_layout.addLayout(common_info_layout)
+        common_layout.addLayout(update_exp_cfg_btn_layout)
 
-        # Preview area for common config
-        self.common_preview = QTextEdit()
-        self.common_preview.setMaximumHeight(100)
-        self.common_preview.setPlaceholderText("Configuration Preview...")
-        self.common_preview.setReadOnly(True)
-        common_layout.addWidget(self.common_preview)
+        # Preview area for experiment config
+        self.experiment_config_preview = QTextEdit()
+        self.experiment_config_preview.setMaximumHeight(300) 
+        common_layout.addWidget(self.experiment_config_preview)
 
         layout.addWidget(common_group)
 
@@ -117,7 +113,7 @@ class ConfigurationPrompt(QDialog):
 
         device_layout.addLayout(device_controls_layout)
 
-        # Device list and preview
+        # Device config preview
         device_content_layout = QHBoxLayout()
 
         # Device list
@@ -126,7 +122,7 @@ class ConfigurationPrompt(QDialog):
         self.device_list.itemSelectionChanged.connect(self.on_device_selection_changed)
         device_content_layout.addWidget(self.device_list)
 
-        # Device preview
+        # Config preview
         self.device_preview = QTextEdit()
         self.device_preview.setPlaceholderText(
             "Select a device configuration to preview..."
@@ -172,17 +168,6 @@ class ConfigurationPrompt(QDialog):
                 item = QListWidgetItem(display_label)
                 item.setData(Qt.ItemDataRole.UserRole, (group_id, device_id))
                 self.device_list.addItem(item)
-
-    def get_device_display_name(self, device_config):
-        """Get a display name for the device config."""
-        # Try common fields that might contain a name
-        name_fields = ["device_name", "name", "id", "device_id", "type", "device_type"]
-
-        for field in name_fields:
-            if field in device_config and device_config[field]:
-                return str(device_config[field])
-
-        return "Device"
 
     def format_device_preview(self, device_config):
         """
@@ -244,48 +229,45 @@ class ConfigurationPrompt(QDialog):
 
         return "\n".join(formatted_lines)
 
-    def upload_common_config(self):
-        """Upload common configuration from JSON file."""
+    def update_experiment_config(self):
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Upload Common Configuration", "", "JSON Files (*.json);;All Files (*)"
+            self, "Add Experiment Configuration", "", "JSON Files (*.json);;All Files (*)"
         )
 
+        # If no file is added, just return  
         if not file_path:
-            raise ValueError("No file selected")
+            return 
 
         try:
             # Load dict
-            self.common_config = load_json_file(file_path)
+            self.experiment_config = load_json_file(file_path)
         except ValueError as e:
             QMessageBox.critical(
-                self, "Error", f"Failed to load common configuration:\n{str(e)}"
+                self, "Error", f"Failed to load Experiment Configuration:\n{str(e)}"
             )
-        self.update_common_preview()
+        self.update_experiment_config_preview()
         self.common_status_label.setText(f"Loaded: {Path(file_path).name}")
         self.common_status_label.setStyleSheet("color: green;")
         self.clear_common_btn.setEnabled(True)
 
-    def clear_common_config(self):
-        """Clear common configuration."""
-        self.common_config = {}
-        self.common_preview.clear()
-        self.common_status_label.setText("No common configuration loaded")
+    def clear_experiment_config(self):
+        self.experiment_config = {}
+        self.experiment_config_preview.clear()
+        self.common_status_label.setText("No Experiment Configuration loaded")
         self.common_status_label.setStyleSheet("color: gray; font-style: italic;")
         self.clear_common_btn.setEnabled(False)
 
-    def update_common_preview(self):
-        """Update common configuration preview."""
-        if self.common_config:
-            preview_text = json.dumps(self.common_config, indent=2)
+    def update_experiment_config_preview(self):
+        if self.experiment_config:
+            preview_text = json.dumps(self.experiment_config, indent=2)
             # Truncate if too long
             if len(preview_text) > 500:
                 preview_text = preview_text[:500] + "\n... (truncated)"
-            self.common_preview.setPlainText(preview_text)
+            self.experiment_config_preview.setPlainText(preview_text)
         else:
-            self.common_preview.clear()
+            self.experiment_config_preview.clear()
 
-    def add_device_group_config(self):
-        """Add a new device group configuration."""
+    def add_device_group_config(self): 
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Add Device Group Configuration",
@@ -294,7 +276,7 @@ class ConfigurationPrompt(QDialog):
         )
 
         if not file_path:
-            raise ValueError("No file selected")
+            return 
 
         try:
             group_cfg = load_json_file(file_path)
@@ -392,8 +374,8 @@ class ConfigurationPrompt(QDialog):
         """
         result = {}
 
-        if self.common_config:
-            result["common"] = self.common_config
+        if self.experiment_config:
+            result["common"] = self.experiment_config
 
         if self.group_configs:
             # Monitor expects device groups under key 'groups'
