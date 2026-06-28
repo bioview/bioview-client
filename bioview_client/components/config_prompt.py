@@ -9,7 +9,6 @@ from PyQt6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
-    QMessageBox,
     QPushButton,
     QTextEdit,
     QVBoxLayout,
@@ -18,6 +17,8 @@ from PyQt6.QtWidgets import (
 )
 
 from bioview_common import APP_VERSION, parse_configuration_file
+
+from .common import Toast
 
 class ConfigurationPrompt(QDialog):
     """
@@ -136,9 +137,7 @@ class ConfigurationPrompt(QDialog):
         
         self.remove_current_cfg_btn.setEnabled(True)
 
-        QMessageBox.information(
-            self, "Information", "Configuration successfully updated!"
-        )
+        Toast.show_message(self, "Configuration successfully updated!", level="success")
 
     def remove_config_file(self):
         self.config_file = None 

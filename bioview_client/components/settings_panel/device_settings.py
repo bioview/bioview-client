@@ -5,6 +5,9 @@ from PyQt6.QtWidgets import QDoubleSpinBox, QGridLayout, QGroupBox, QLabel, QSpi
 
 class DeviceSettingsPanel(QGroupBox):
     update_device_param = pyqtSignal(str, object)
+    # (configuration_id, param, value) emitted after a successful UI tweak so the
+    # change can be recorded into the active recording's metadata
+    device_param_changed = pyqtSignal(str, str, object)
     log_event = pyqtSignal(str, str)
 
     def __init__(self, device_configuration: Configuration, parent=None):
@@ -13,6 +16,8 @@ class DeviceSettingsPanel(QGroupBox):
         )
         self.device_configuration = device_configuration
         self.device_name = device_configuration.get_param("device_name", "Device")
+        # Set by SettingsPanel so emitted changes carry the configuration id
+        self.cfg_id = None
 
     def get_emittable_signals(self):
         return {
@@ -34,6 +39,9 @@ class DeviceSettingsPanel(QGroupBox):
             self.device_configuration.set_param(param, updated_value)
             # TODO: Communicate with backend
 
+            self.device_param_changed.emit(
+                self.cfg_id or self.device_name, param, updated_value
+            )
             self.log_event.emit(
                 "debug",
                 f"{self.device_name}: Updated {param} to {value} successfully",

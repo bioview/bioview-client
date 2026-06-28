@@ -17,6 +17,7 @@ SETTINGS_PANEL_MAPPING = {
 
 class SettingsPanel(QTabWidget):
     update_device_param = pyqtSignal(str, str) # (configuration_id, )
+    device_param_changed = pyqtSignal(str, str, object) # (configuration_id, param, value)
     log_event = pyqtSignal(str, str)
 
     def __init__(self, configurations):
@@ -41,6 +42,11 @@ class SettingsPanel(QTabWidget):
 
             # Enable logging 
             widget.log_event.connect(self.send_to_log)
+
+            # Forward device parameter tweaks (tagged with the configuration id)
+            if hasattr(widget, "device_param_changed"):
+                widget.cfg_id = cfg_id
+                widget.device_param_changed.connect(self.device_param_changed)
 
             # Connect signals
             signal_dict = widget.get_emittable_signals()

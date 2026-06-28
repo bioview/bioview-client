@@ -11,6 +11,7 @@ import contextlib
 import logging  # TODO: Remove
 import queue
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List
 
@@ -30,11 +31,12 @@ from bioview_client.components import (
     AnnotateEventPanel,
     AppControlPanel,
     ConfigurationPrompt,
+    InstructionController,
     LogDisplayPanel,
+    parse_timed_modes,
     PlotGrid,
     SettingsPanel,
     StatusBar,
-    TextDialog,
 )
 from bioview_client.handler import Client
 
@@ -100,16 +102,21 @@ class BioViewMonitor(QMainWindow):
 
         self.saving_status = False
 
-        # Track instruction
-        self.instruction_dialog = None
-        self.enable_instructions = self.experiment_config.get_param("enable_instructions", False)
-        self.instructions_type = self.experiment_config.get_param("instruction_type", None)
+        # Timed-mode (routine) state. Routines are declared in the experiment
+        # config and pair a fixed duration with optional audio/video/text
+        # instructions. Unlimited mode (free-running) remains always available.
+        self.timed_modes = parse_timed_modes(
+            self.experiment_config.get_timed_modes(),
+            base_dir=self._config_base_dir(),
+        )
+        self.active_timed_mode = None
+        self.instruction_controller = None
+        self._routine_deadline = 0.0
 
-        if self.enable_instructions: 
-            if self.instructions_type == "text": 
-                self.instruction_dialog = TextDialog()
-            elif self.instructions_type == 'audio': 
-                pass # TODO: Add Audio instructions. 
+        # Drives the bottom progress bar + auto-stop for a running timed mode
+        self.routine_timer = QTimer(self)
+        self.routine_timer.setInterval(200)
+        self.routine_timer.timeout.connect(self._on_routine_tick)
 
         # Set up UI
         self._init_ui()
@@ -124,9 +131,6 @@ class BioViewMonitor(QMainWindow):
 
         # Connect UI calls - including logging
         self._connect_signals()
-
-        ### Common Threads
-        self.instructions_thread = None
 
         # Available data sources advertised by the connected server
         self.available_sources = []
@@ -158,6 +162,8 @@ class BioViewMonitor(QMainWindow):
 
         # Connect/Start/Stop/Balance Signal Buttons
         self.command_bar = AppControlPanel()
+        # Expose declared timed modes in the routine selector next to Start
+        self.command_bar.set_routines([m.label for m in self.timed_modes])
         controls_layout.addWidget(self.command_bar, stretch=1)
 
         self.settings_panel = SettingsPanel(self.configurations)
@@ -254,10 +260,12 @@ class BioViewMonitor(QMainWindow):
 
     def _connect_command_bar_signals(self):
         self.command_bar.initialize_devices.connect(self.on_device_init_requested)
-        self.command_bar.start_streaming.connect(self.client_worker.start_streaming)
-        self.command_bar.stop_streaming.connect(self.client_worker.stop_streaming)
+        # Manual (unlimited mode) start; stop is routed through a handler that also
+        # tears down any running timed mode before stopping the stream.
+        self.command_bar.start_streaming.connect(self.handle_start_streaming)
+        self.command_bar.stop_streaming.connect(self.handle_stop_streaming)
         self.command_bar.enable_data_saving.connect(self.update_save_state)
-        self.command_bar.enable_instructions.connect(self.toggle_instructions)
+        self.command_bar.routine_selected.connect(self.on_routine_selected)
 
     def _connect_settings_panel_signals(self):
         # Save-related parameters (file name / save dir) flow to the client worker
@@ -276,6 +284,12 @@ class BioViewMonitor(QMainWindow):
             self.settings_panel.add_data_source.connect(self.add_plot_source)
         if getattr(self.settings_panel, "remove_data_source", None):
             self.settings_panel.remove_data_source.connect(self.remove_plot_source)
+
+        # Device parameter tweaks are recorded into the active recording's metadata
+        if getattr(self.settings_panel, "device_param_changed", None):
+            self.settings_panel.device_param_changed.connect(
+                self.on_device_param_changed
+            )
 
         # Connect logging
         self.settings_panel.log_event.connect(self.log_display_panel.log_message)
@@ -323,11 +337,29 @@ class BioViewMonitor(QMainWindow):
             self.device_status[group_id] = status
             self.status_bar.update_device_status(group_id, status)
 
+        # If streaming stopped for any reason while a routine was active (e.g. a
+        # server drop), tear down the routine UI/instructions to stay consistent.
+        if not is_streaming and self.active_timed_mode is not None:
+            self._cleanup_timed_mode()
+
         client_status = self.client_worker.status
         self.command_bar.update_button_states(client_status)
 
+    def keyPressEvent(self, event):
+        """Esc / F11 toggle fullscreen (the app launches fullscreen by default)."""
+        if event.key() in (Qt.Key.Key_Escape, Qt.Key.Key_F11):
+            if self.isFullScreen():
+                self.showNormal()
+            else:
+                self.showFullScreen()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def closeEvent(self, event):
         """Handle application close"""
+        self._stop_instruction()
+        self.routine_timer.stop()
         if self.client_worker:
             self.client_worker.stop_client()
         event.accept()
@@ -411,10 +443,124 @@ class BioViewMonitor(QMainWindow):
         if self.client_worker:
             self.client_worker.set_save_enabled(bool(enabled))
 
-    def toggle_instructions(self, flag):
-        self.enable_instructions = flag
-        if self.instruction_dialog is not None:
-            self.instruction_dialog.toggle_ui(self.enable_instructions)
+    # Timed-mode (routine) orchestration
+    def _config_base_dir(self) -> Path:
+        """Directory used to resolve relative instruction file paths."""
+        cf = self.config_file
+        if isinstance(cf, (list, tuple)):
+            cf = cf[0] if cf else None
+        if cf:
+            with contextlib.suppress(Exception):
+                return Path(cf).resolve().parent
+        return Path.cwd()
+
+    def on_routine_selected(self, index: int):
+        if index < 0 or index >= len(self.timed_modes):
+            return
+        self.start_timed_mode(self.timed_modes[index])
+
+    def start_timed_mode(self, mode):
+        # A routine requires connected devices and no active stream
+        if self.client_worker.status < ClientStatus.DEVICES_CONNECTED:
+            self.log_display_panel.log_message(
+                "warning", "Connect and initialize devices before running a routine"
+            )
+            self.command_bar.reset_routine_selection()
+            return
+        if self.client_worker.status == ClientStatus.STREAMING:
+            self.log_display_panel.log_message(
+                "warning", "Already streaming; stop before starting a routine"
+            )
+            self.command_bar.reset_routine_selection()
+            return
+
+        self.active_timed_mode = mode
+
+        # Timed modes always save. Reflect this in the UI; the recording is named
+        # <file name>_<routine label>.bvr (the label is applied by the handler).
+        self.command_bar.save_checkbox.setChecked(True)
+        self.update_save_state(True)
+        self.client_worker.set_save_label(mode.label)
+
+        # Begin instructions (if any) and the data stream
+        self._start_instruction(mode.instruction)
+        self.client_worker.start_streaming()
+
+        # Show the progress bar and arm the countdown
+        self.status_bar.start_routine(mode.label, mode.duration)
+        self._routine_deadline = time.monotonic() + mode.duration
+        self.routine_timer.start()
+
+        self.log_display_panel.log_message(
+            "info", f"Started routine '{mode.label}' ({int(mode.duration)}s)"
+        )
+
+    def _on_routine_tick(self):
+        if self.active_timed_mode is None:
+            self.routine_timer.stop()
+            return
+
+        remaining = self._routine_deadline - time.monotonic()
+        elapsed = self.active_timed_mode.duration - remaining
+        self.status_bar.update_routine(elapsed, self.active_timed_mode.duration)
+
+        if remaining <= 0:
+            self.stop_timed_mode(completed=True)
+
+    def _cleanup_timed_mode(self):
+        """Tear down routine UI/instructions without touching the data stream."""
+        self.routine_timer.stop()
+        self._stop_instruction()
+        self.status_bar.stop_routine()
+        self.command_bar.reset_routine_selection()
+        self.active_timed_mode = None
+
+    def stop_timed_mode(self, completed: bool = False):
+        if self.active_timed_mode is None:
+            return
+        label = self.active_timed_mode.label
+        self._cleanup_timed_mode()
+        self.client_worker.stop_streaming()
+        if completed:
+            self.log_display_panel.log_message("info", f"Routine '{label}' complete")
+
+    def on_device_param_changed(self, device_id, param, value):
+        """Forward a UI device-parameter tweak to the client so it is logged (with
+        a timestamp) into any active recording's metadata."""
+        if self.client_worker is not None:
+            self.client_worker.record_param_change(device_id, param, value)
+
+    def handle_start_streaming(self):
+        """Start button (unlimited mode): this is not a timed routine, so clear any
+        routine label before streaming. Recordings are then named <file name>.bvr."""
+        self.client_worker.set_save_label(None)
+        self.client_worker.start_streaming()
+
+    def handle_stop_streaming(self):
+        """Stop button: cancel a running routine (which also stops the stream) or
+        stop a plain unlimited-mode stream."""
+        if self.active_timed_mode is not None:
+            self.stop_timed_mode(completed=False)
+        else:
+            self.client_worker.stop_streaming()
+
+    def _start_instruction(self, spec):
+        self._stop_instruction()
+        if spec is None:
+            return
+        self.instruction_controller = InstructionController(spec, host_widget=self)
+        self.instruction_controller.log_event.connect(
+            self.log_display_panel.log_message
+        )
+        self.instruction_controller.start()
+
+    def _stop_instruction(self):
+        if self.instruction_controller is not None:
+            with contextlib.suppress(Exception):
+                self.instruction_controller.stop()
+            with contextlib.suppress(Exception):
+                self.instruction_controller.deleteLater()
+            self.instruction_controller = None
 
     # Client worker helper functions
     def on_server_connected(self, connected: bool = True):
@@ -497,7 +643,27 @@ if __name__ == "__main__":
         autodiscover=args.autodiscover,
         autoconnect=args.autoconnect,
     )
-    window.show()
+    # Launch fullscreen by default; Esc / F11 toggle back to a normal window.
+    window.showFullScreen()
+
+    # Seamless localhost: always probe 127.0.0.1 quickly and autoconnect the moment
+    # a local server answers -- no manual "discover servers" needed. The probe is
+    # cheap and runs off the UI thread; retry briefly until connected so the client
+    # can be launched before the server and still latch on as soon as it appears.
+    if window.client_worker:
+        lh_handler = window.client_worker
+        localhost_timer = QTimer()
+
+        def _try_localhost():
+            if lh_handler.status >= ClientStatus.SERVER_CONNECTED:
+                localhost_timer.stop()
+                return
+            lh_handler.quick_connect_localhost()
+
+        localhost_timer.timeout.connect(_try_localhost)
+        localhost_timer.start(1000)
+        window._localhost_timer = localhost_timer
+        lh_handler.quick_connect_localhost()
 
     # If auto-discover, trigger the scan. The scan is asynchronous, so autoconnect
     # must wait for the scan to actually complete before selecting/connecting.
@@ -509,6 +675,13 @@ if __name__ == "__main__":
                 # Connect to the first discovered server once results arrive. If a
                 # scan finds nothing we stay subscribed so a later retry (below)
                 # that finds the server will still autoconnect.
+                if handler.status >= ClientStatus.SERVER_CONNECTED:
+                    # Already connected (e.g. the localhost fast path beat us to it)
+                    with contextlib.suppress(Exception):
+                        handler.server_scan_completed.disconnect(
+                            _autoconnect_when_scan_done
+                        )
+                    return
                 if servers:
                     with contextlib.suppress(Exception):
                         handler.server_scan_completed.disconnect(

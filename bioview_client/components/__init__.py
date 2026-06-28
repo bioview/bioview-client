@@ -5,10 +5,9 @@ from .common import CheckableComboBox
 from .config_prompt import ConfigurationPrompt
 from .log_display import LogDisplayPanel
 from .plot_grid import PlotGrid
-from .routine_control import RoutineControl
+from .routine_control import InstructionController, parse_timed_modes
 from .settings_panel import SettingsPanel
 from .status_bar import StatusBar
-from .text_dialog import TextDialog
 
 
 __all__ = [
@@ -18,8 +17,8 @@ __all__ = [
     "LogDisplayPanel",
     "PlotGrid",
     "StatusBar",
-    "TextDialog",
     "CheckableComboBox",
-    "RoutineControl",
+    "InstructionController",
+    "parse_timed_modes",
     "SettingsPanel",
 ]

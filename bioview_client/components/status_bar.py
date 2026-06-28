@@ -333,6 +333,56 @@ class DeviceStatusPanel(QWidget):
             del self.device_widgets[group_id]
 
 
+class RoutineProgressBar(QWidget):
+    """Compact progress indicator for a running timed-mode routine, shown in the
+    bottom status bar. Hidden unless a routine is active."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._duration = 1.0
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(6, 0, 6, 0)
+        layout.setSpacing(8)
+
+        self.label = QLabel("")
+        layout.addWidget(self.label)
+
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 1000)
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(14)
+        self.bar.setFixedWidth(180)
+        layout.addWidget(self.bar)
+
+        self.time_label = QLabel("")
+        layout.addWidget(self.time_label)
+
+        self.setLayout(layout)
+        self.setVisible(False)
+
+    @staticmethod
+    def _fmt_remaining(elapsed: float, duration: float) -> str:
+        remaining = max(0, int(round(duration - elapsed)))
+        minutes, seconds = divmod(remaining, 60)
+        return f"{minutes:d}:{seconds:02d}"
+
+    def start(self, label: str, duration: float):
+        self._duration = max(0.001, float(duration))
+        self.label.setText(f"\u25b6 {label}")
+        self.bar.setValue(0)
+        self.time_label.setText(self._fmt_remaining(0.0, self._duration))
+        self.setVisible(True)
+
+    def update_progress(self, elapsed: float, duration: float):
+        frac = max(0.0, min(1.0, elapsed / max(0.001, duration)))
+        self.bar.setValue(int(frac * 1000))
+        self.time_label.setText(self._fmt_remaining(elapsed, duration))
+
+    def stop(self):
+        self.setVisible(False)
+
+
 class StatusBar(QStatusBar):
     network_scan_requested = pyqtSignal()
 
@@ -347,6 +397,13 @@ class StatusBar(QStatusBar):
         self.server_connector = ServerConnector()
         self._layout.addWidget(
             self.server_connector, alignment=Qt.AlignmentFlag.AlignLeft
+        )
+        self._layout.addStretch()
+
+        # Timed-mode progress indicator (centered, hidden until a routine runs)
+        self.routine_progress = RoutineProgressBar()
+        self._layout.addWidget(
+            self.routine_progress, alignment=Qt.AlignmentFlag.AlignCenter
         )
         self._layout.addStretch()
 
@@ -435,3 +492,13 @@ class StatusBar(QStatusBar):
 
     def update_device_status(self, group_id, new_status):
         self.device_status_panel.update_device_status(group_id, new_status)
+
+    # Timed-mode routine progress helpers
+    def start_routine(self, label: str, duration: float):
+        self.routine_progress.start(label, duration)
+
+    def update_routine(self, elapsed: float, duration: float):
+        self.routine_progress.update_progress(elapsed, duration)
+
+    def stop_routine(self):
+        self.routine_progress.stop()

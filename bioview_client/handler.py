@@ -49,6 +49,12 @@ from PyQt6.QtCore import QThread, QThreadPool, pyqtSignal
 from bioview_client.workers import DataSaver, DataStreamer, DeviceInitWorker, FunctionWorker, ScanWorker
 
 
+def _sanitize_label(label: str) -> str:
+    """Make a routine label safe for use in a file name."""
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(label)).strip("_")
+    return safe or "routine"
+
+
 class Client(QThread):
     # Server control signals
     server_scan_completed = pyqtSignal(list)
@@ -121,6 +127,10 @@ class Client(QThread):
         self.enable_save = False
         self.save_dir = ""
         self.file_name = ""
+        # Optional routine label appended to the file name for timed-mode runs:
+        #   timed:   <file_name>_<label>.bvr
+        #   untimed: <file_name>.bvr
+        self.save_label = None
 
         # Thread pool for control/device operations (connect, init, start/stop).
         # Kept small since these are serialized through the control socket lock.
@@ -132,6 +142,11 @@ class Client(QThread):
         self.scan_pool = QThreadPool()
         self.scan_pool.setMaxThreadCount(32)
         self._cancel_scan = False
+
+        # Guard so overlapping auto-connect attempts (e.g. fast localhost probe and
+        # a full LAN autoconnect firing close together) never run concurrently.
+        self._connecting = False
+        self._connect_guard_lock = threading.Lock()
 
         # Device discovery state
         self._discovering_devices = False
@@ -179,6 +194,20 @@ class Client(QThread):
             self.save_dir = value or ""
         elif name == "file_name":
             self.file_name = value or ""
+
+    def set_save_label(self, label):
+        """Set (or clear with None) the routine label appended to recordings made
+        in timed mode."""
+        self.save_label = label or None
+
+    def record_param_change(self, device_id: str, param: str, value):
+        """Record a UI-driven device parameter tweak. Keeps our config snapshot
+        current (so a subsequent recording's start metadata is accurate) and, when
+        a recording is active, logs the change with a timestamp into the .bvr."""
+        with contextlib.suppress(Exception):
+            self.config.update_device_param(device_id, param, value)
+        if self.data_saver is not None:
+            self.data_saver.record_change(device_id, param, value)
 
     @staticmethod
     def _build_configuration(experiment_config, group_configs) -> Configuration:
@@ -298,6 +327,37 @@ class Client(QThread):
 
         self.server_scan_completed.emit(self.discovered_servers)
 
+    def quick_connect_localhost(self):
+        """Fast path for seamless localhost usage: probe 127.0.0.1 with a short
+        timeout and, if a server answers, register it and connect immediately --
+        without the full LAN scan and without blocking the UI thread."""
+        if self.status >= ClientStatus.SERVER_CONNECTED:
+            return
+        if self._connecting:
+            return
+        worker = ScanWorker("127.0.0.1", self.control_port, timeout=0.5)
+        worker.signals.result.connect(self._on_localhost_probe)
+        self.scan_pool.start(worker)
+
+    def _on_localhost_probe(self, found):
+        # Runs on the UI thread (queued from the worker). Bail unless we found a
+        # local server and are still unconnected.
+        if not found or not isinstance(found, dict):
+            return
+        if self.status >= ClientStatus.SERVER_CONNECTED or self._connecting:
+            return
+
+        found.setdefault("ip", "127.0.0.1")
+        self.discovered_servers = [found] + [
+            s for s in self.discovered_servers if s.get("ip") != found.get("ip")
+        ]
+        # Surface the localhost server in the UI's server dropdown
+        self.server_scan_completed.emit(self.discovered_servers)
+
+        self.selected_server = found
+        self.log_message.emit("info", "Localhost server found; connecting...")
+        self.connect_to_server()
+
     def _authenticate_with_server(self, server_socket: socket.socket) -> Dict[str, Any]:
         '''
         We try to authenticate ourselves with the server. In case the server closes
@@ -371,6 +431,20 @@ class Client(QThread):
         self.thread_pool.start(FunctionWorker(self._connect_to_server_impl))
 
     def _connect_to_server_impl(self):
+        # Serialize connection attempts: if one is already in flight, skip this one
+        # so the fast localhost path and a LAN autoconnect can't both connect.
+        with self._connect_guard_lock:
+            if self._connecting:
+                return
+            self._connecting = True
+
+        try:
+            self._do_connect_to_server()
+        finally:
+            with self._connect_guard_lock:
+                self._connecting = False
+
+    def _do_connect_to_server(self):
         # Pick a server if none has been explicitly selected
         if not self.selected_server:
             if len(self.discovered_servers) == 0:
@@ -616,22 +690,37 @@ class Client(QThread):
             self.log_message.emit("error", f"Failed to start streaming: {msg}")
 
     def _start_saving(self):
-        """Create and start the client-side disk writer if saving is enabled."""
+        """Create and start the client-side disk writer if saving is enabled.
+
+        File naming:
+            timed mode:   <file_name>_<mode label>.bvr
+            unlimited:    <file_name>.bvr
+        Duplicate names are de-duplicated with a numeric suffix.
+        """
         self.data_saver = None
         if not self.enable_save:
             return
 
         save_dir = self.save_dir or os.getcwd()
-        file_name = self.file_name or "bioview_recording"
-        if not os.path.splitext(file_name)[1]:
-            file_name = f"{file_name}.bvr"
+        base = os.path.splitext((self.file_name or "").strip())[0] or "bioview_recording"
+        if self.save_label:
+            base = f"{base}_{_sanitize_label(self.save_label)}"
+        file_name = f"{base}.bvr"
 
         try:
             save_path = get_unique_path(save_dir, file_name)
             sources = self.data_sources or []
+            # Snapshot the device configuration constants at recording start
+            device_config = {}
+            if self.config is not None:
+                device_config = {
+                    dev_id: cfg.to_dict()
+                    for dev_id, cfg in self.config.devices.items()
+                }
             self.data_saver = DataSaver(
                 save_path=save_path,
                 sources=sources,
+                device_config=device_config,
                 log_signal=self.log_message,
             )
             self.data_saver.start_saving()

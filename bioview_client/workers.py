@@ -5,6 +5,7 @@ import queue
 import socket
 import struct
 import threading
+from datetime import datetime
 
 import numpy as np  # TODO: Investigate if this is strictly needed or not
 from bioview_common import (
@@ -241,27 +242,44 @@ class DataStreamer(QThread):
         self.running = False
 
 
+# 8-byte magic marking a metadata trailer at the end of a .bvr file
+BVR_TRAILER_MAGIC = b"BVRMETA1"
+
+
 class DataSaver(threading.Thread):
     """Client-side disk writer. Runs on its own thread and appends full-rate
     chunks to a self-describing binary file so disk I/O never blocks the data
     receiving thread.
 
-    File format ("bioview-raw-v1"):
+    File format ("bioview-raw-v2"):
         [Header Length (4 bytes, big-endian)][JSON header]
         [float32 samples, time-major: each chunk stored as (num_samples, num_sources)]
+        [JSON trailer]
+        [Trailer Length (8 bytes, big-endian)]
+        [8-byte magic "BVRMETA1"]
 
-    The JSON header records dtype, layout and the ordered source descriptors so
-    the recording can be reconstructed as (num_samples, num_sources)."""
+    The JSON header records dtype, layout, the ordered source descriptors, the
+    recording start time, and a snapshot of device configuration constants. The
+    trailer (written when the recording closes) records the end time and any
+    timestamped device-parameter changes made while recording. A reader locates
+    the trailer via the magic + length at EOF; the sample region is everything
+    between the header and the trailer."""
 
-    def __init__(self, save_path, sources=None, log_signal=None):
+    def __init__(self, save_path, sources=None, device_config=None, log_signal=None):
         super().__init__(daemon=True)
         self.save_path = str(save_path)
         self.sources = sources or []
+        self.device_config = device_config or {}
         self._log_signal = log_signal
         self._queue = queue.Queue()
         self._stop_event = threading.Event()
         self._file = None
         self._header_written = False
+
+        # Timestamped device-parameter changes recorded during this run
+        self._changes = []
+        self._changes_lock = threading.Lock()
+        self._start_time = None
 
     def _log(self, level, msg):
         if self._log_signal is not None:
@@ -274,14 +292,25 @@ class DataSaver(threading.Thread):
             if parent:
                 os.makedirs(parent, exist_ok=True)
             self._file = open(self.save_path, "wb")
+            self._start_time = datetime.now()
             header = {
-                "format": "bioview-raw-v1",
+                "format": "bioview-raw-v2",
                 "dtype": "float32",
                 "layout": "time_major",
                 "num_sources": len(self.sources),
                 "sources": self.sources,
+                "start_time": self._start_time.isoformat(),
+                "start_time_parts": {
+                    "year": self._start_time.year,
+                    "month": self._start_time.month,
+                    "day": self._start_time.day,
+                    "hour": self._start_time.hour,
+                    "minute": self._start_time.minute,
+                    "second": self._start_time.second,
+                },
+                "device_config": self.device_config,
             }
-            header_bytes = json.dumps(header).encode("utf-8")
+            header_bytes = json.dumps(header, default=str).encode("utf-8")
             self._file.write(struct.pack("!I", len(header_bytes)) + header_bytes)
             self._header_written = True
             self.start()
@@ -293,6 +322,32 @@ class DataSaver(threading.Thread):
     def add(self, data):
         if self._file is not None and not self._stop_event.is_set():
             self._queue.put(data)
+
+    def record_change(self, device_id: str, param: str, value):
+        """Append a timestamped device-parameter change to the recording's
+        metadata trailer."""
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "device_id": device_id,
+            "param": param,
+            "value": value,
+        }
+        with self._changes_lock:
+            self._changes.append(entry)
+
+    def _write_trailer(self):
+        if self._file is None:
+            return
+        with self._changes_lock:
+            changes = list(self._changes)
+        trailer = {
+            "end_time": datetime.now().isoformat(),
+            "param_changes": changes,
+        }
+        trailer_bytes = json.dumps(trailer, default=str).encode("utf-8")
+        self._file.write(trailer_bytes)
+        self._file.write(struct.pack("!Q", len(trailer_bytes)))
+        self._file.write(BVR_TRAILER_MAGIC)
 
     def run(self):
         while not self._stop_event.is_set() or not self._queue.empty():
@@ -309,6 +364,7 @@ class DataSaver(threading.Thread):
 
         with contextlib.suppress(Exception):
             if self._file is not None:
+                self._write_trailer()
                 self._file.flush()
                 self._file.close()
 
