@@ -286,9 +286,7 @@ class DeviceStatusPanel(QWidget):
         super().__init__()
         """
         device_status is of form -
-        group_id: {
-            device_id: DeviceStatus
-        }
+        group_id: DeviceStatus
         """
         self.device_widgets = {}
 
@@ -298,14 +296,14 @@ class DeviceStatusPanel(QWidget):
         self.layout.setSpacing(15)
 
         # Add device widgets (keys are device ids)
-        for group_id, group_items in device_status.items():
-            for item_id, item_state in group_items.items():
-                self.add_device(group_id, item_id, item_state)
+        for group_id, group_status in device_status.items():
+            self.add_device(group_id, group_status)
 
         self.setLayout(self.layout)
 
     # Handle theme changes
     def _update_icons(self):
+        # TODO: Fix this logic. 
         for device_id, device_map in self.devices.items():
             with contextlib.suppress(Exception):
                 status = device_map.get("status", DeviceStatus.DISCONNECTED)
@@ -316,27 +314,23 @@ class DeviceStatusPanel(QWidget):
             self._update_icons()
         return super().event(event)
 
-    def add_device(self, group_id, device_id, device_status=DeviceStatus.DISCONNECTED):
-        key = f"[{group_id}]:{device_id}"
-
-        device_widget = DeviceStatusWidget(device_id, device_status)
-        self.device_widgets[key] = device_widget
+    def add_device(self, group_id, group_status=DeviceStatus.DISCONNECTED):
+        device_widget = DeviceStatusWidget(group_id, group_status)
+        self.device_widgets[group_id] = device_widget
         self.layout.addWidget(device_widget)
 
-    def update_device_status(self, group_id, device_id, new_status):
-        key = f"[{group_id}]:{device_id}"
-        widget = self.device_widgets.get(key, None)
+    def update_device_status(self, group_id, new_status):
+        widget = self.device_widgets.get(group_id, None)
 
         if widget:
             widget.update_status(new_status)
 
-    def remove_device(self, group_id, device_id):
-        key = f"[{group_id}]:{device_id}"
-        if key in self.device_widgets:
-            widget = self.device_widgets[key]
+    def remove_device(self, group_id):
+        if group_id in self.device_widgets:
+            widget = self.device_widgets[group_id]
             self.layout.removeWidget(widget)
             widget.deleteLater()
-            del self.device_widgets[key]
+            del self.device_widgets[group_id]
 
 
 class StatusBar(QStatusBar):
@@ -439,5 +433,5 @@ class StatusBar(QStatusBar):
         self.on_scan_complete = self.server_connector.on_scan_complete
         self.update_scan_progress = self.server_connector.update_scan_progress
 
-    def update_device_status(self, group_id, device_id, new_status):
-        self.device_status_panel.update_device_status(group_id, device_id, new_status)
+    def update_device_status(self, group_id, new_status):
+        self.device_status_panel.update_device_status(group_id, new_status)

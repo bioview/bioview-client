@@ -1,61 +1,59 @@
-from typing import Dict
+from typing import Dict 
 
-from bioview_common.datatypes import Configuration
-from PyQt6.QtCore import pyqtSignal
-from PyQt6.QtWidgets import QTabWidget
+from PyQt6.QtCore import pyqtSignal, QObject
+from PyQt6.QtWidgets import QTabWidget, QGroupBox
+
+from bioview_common.datatypes import Configuration, SUPPORTED_CONFIGURATION_TYPES
 
 from .common_settings import CommonSettingsPanel
-from .device_settings import get_device_settings_panel
+from .device_settings import USRPSettingsPanel, BIOPACSettingsPanel, DummySettingsPanel
 
+SETTINGS_PANEL_MAPPING = {
+    SUPPORTED_CONFIGURATION_TYPES.USRP: USRPSettingsPanel,
+    SUPPORTED_CONFIGURATION_TYPES.BIOPAC: BIOPACSettingsPanel,
+    SUPPORTED_CONFIGURATION_TYPES.DUMMY: DummySettingsPanel,
+    SUPPORTED_CONFIGURATION_TYPES.EXPERIMENT: CommonSettingsPanel
+}
 
 class SettingsPanel(QTabWidget):
+    update_device_param = pyqtSignal(str, str) # (configuration_id, )
     log_event = pyqtSignal(str, str)
 
-    def __init__(
-        self,
-        experiment_config: Configuration = None,
-        group_configs: Dict[str, Dict] = None,
-    ):
+    def __init__(self, configurations):
         super().__init__()
 
-        # Add common panel if applicable
-        self.experiment_settings_panel = None
+        # Only get valid configurations 
+        configurations = {k: v for k, v in configurations.items() if v.get_type() in SUPPORTED_CONFIGURATION_TYPES}
 
-        if experiment_config is not None:
-            self.experiment_settings_panel = CommonSettingsPanel(experiment_config)
-            self.addTab(self.experiment_settings_panel, "Settings")  # Add to UI
+        # Hold all panels as a dictionary for easy access
+        self.setting_widgets = {} 
+
+        # Reference to the experiment (common) settings panel for source/save UI
+        self.experiment_panel = None
+
+        for cfg_id, config in configurations.items(): 
+            cfg_type = config.get_type() 
+            widget = SETTINGS_PANEL_MAPPING[cfg_type](config)
+            self.addTab(widget, f"{cfg_id} Settings") # Add to UI
+
+            if cfg_type == SUPPORTED_CONFIGURATION_TYPES.EXPERIMENT:
+                self.experiment_panel = widget
+
+            # Enable logging 
+            widget.log_event.connect(self.send_to_log)
 
             # Connect signals
-            # self.experiment_settings_panel.parameter_changed.connect()
-            self.experiment_settings_panel.log_event.connect(self.send_to_log)
-            self.display_duration_changed = (
-                self.experiment_settings_panel.display_duration_changed
-            )
-            self.grid_layout_changed = self.experiment_settings_panel.grid_layout_changed
-            self.add_data_source = self.experiment_settings_panel.add_data_source
-            self.remove_data_source = self.experiment_settings_panel.remove_data_source
+            signal_dict = widget.get_emittable_signals()
+            for signal_name, signal_callback in signal_dict.items(): 
+                if signal_name == 'update_device_param': 
+                    # TODO: handle the case for backend updates 
+                    pass
+                
+                # For unique behaviors, just adopt it. 
+                setattr(self, signal_name, signal_callback)
 
-            # Connect functions
-            self.update_source = self.experiment_settings_panel.update_source
-
-        # Create panels for connected devices
-        self.device_settings_panel = {}
-
-        # Group configs are Dicts of device configuration dicts
-        for device_group_id, device_group_config in group_configs.items():
-            # device_group_config will always be a dictionary since we always have
-            # metadata as a key item. If group contains multiple devices, create a
-            # tab per device with label 'group/device'
-            for item_key, item_dict in device_group_config.items():
-                if item_key == "metadata":
-                    continue
-                tab_label = f"{device_group_id}/{item_key}"
-                dev_panel = get_device_settings_panel(item_dict)
-
-                if dev_panel:
-                    self.device_settings_panel[tab_label] = dev_panel
-                    self.addTab(dev_panel, tab_label)
-                    dev_panel.log_event.connect(self.send_to_log)
+            # Add widget to dict 
+            self.setting_widgets[cfg_id] = widget 
 
         # Add styling
         self.setTabPosition(QTabWidget.TabPosition.South)
@@ -79,6 +77,19 @@ class SettingsPanel(QTabWidget):
             }
             """
         )
+    
+    def _route_signals(self, source, signal, *args): 
+        pass
+
+    def update_source(self, action, source):
+        """Forward selection state updates to the experiment settings panel."""
+        if self.experiment_panel is not None:
+            self.experiment_panel.update_source(action, source)
+
+    def set_available_sources(self, sources):
+        """Populate the experiment panel's plot-source selector."""
+        if self.experiment_panel is not None:
+            self.experiment_panel.set_available_sources(sources)
 
     def send_to_log(self, level, msg):
         self.log_event.emit(level, msg)

@@ -1,6 +1,3 @@
-import queue
-from collections import deque
-
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtCore import QEvent, QTimer, pyqtSignal
@@ -43,103 +40,75 @@ class PlotManager:
 
         # Data handling
         self.data_src = data_src
-        self.data_queue = queue.Queue()
+
+        # Dirty flag: only redraw when new data has arrived since the last frame
+        self._dirty = False
 
         # Initialize after setting up basic properties
         self._init_plot()
 
     def _init_plot(self):
-        # Calculate number of points for the display duration -
-        # This will be recalculated if device handler for the plot changes
+        # Number of points held on screen, sized by the (decimated) display rate.
         if self.data_src is None:
-            self.num_points = int(self.display_duration * 10)
+            disp_freq = 10.0
         else:
-            self.num_points = int(self.display_duration * self.data_src.get_disp_freq())
+            disp_freq = self.data_src.get_disp_freq()
+        self.num_points = max(2, int(self.display_duration * disp_freq))
 
-        # Initialize buffer with zeros - deque with fixed maxlen for sliding window
-        self.buffer = deque([0.0] * self.num_points, maxlen=self.num_points)
-
-        # Create time vector that will be reused
+        # Fixed-size numpy ring buffer (the sliding window) and reusable time axis
+        self.buffer = np.zeros(self.num_points, dtype=float)
         self.time_vector = np.linspace(
             0, self.display_duration, self.num_points, endpoint=False
         )
 
-        # Set initial data on the plot item (don't create new plot)
-        self.plot_item.setData(self.time_vector, list(self.buffer))
+        # Set initial data on the plot item (don't create a new plot)
+        self.plot_item.setData(self.time_vector, self.buffer)
+        self._dirty = False
 
         # Set ranges correctly
         self.widget.setXRange(0, self.display_duration, padding=0)
 
     def update_data_source(self, data_src: DataSource = None):
-        self.widget.setTitle(data_src)
+        self.widget.setTitle(str(data_src) if data_src is not None else "")
         self.data_src = data_src
         self._init_plot()
 
-        # Flush queue
-        while not self.data_queue.empty():
-            try:
-                self.data_queue.get_nowait()
-            except queue.Empty:
-                break
+    def _decimate(self, arr: np.ndarray) -> np.ndarray:
+        """Stride-decimate an incoming chunk so we never push more than one
+        screen's worth of points per chunk. This keeps the displayed rate roughly
+        independent of the (much higher) acquisition/save rate and bounds work."""
+        n = arr.size
+        if n > self.num_points:
+            stride = int(np.ceil(n / self.num_points))
+            arr = arr[::stride]
+        return arr
 
     def add_data(self, data):
-        if isinstance(data, (list, np.ndarray)):
-            # If it's an array, add each point individually to maintain proper sliding
-            for point in np.atleast_1d(data):
-                self._add_single_point(float(point))
-        else:
-            self._add_single_point(float(data))
-
-    def _add_single_point(self, point):
-        # Keep queue size reasonable - if it gets too big, we're falling behind
-        max_queue_size = (
-            self.num_points // 4
-        )  # Allow max 25% of display buffer in queue
-
-        if self.data_queue.qsize() > max_queue_size:
-            # We're falling behind - drop old data to stay real-time
-            try:
-                # Drop some old points to make room
-                drop_count = max_queue_size // 4
-                for _ in range(drop_count):
-                    self.data_queue.get_nowait()
-            except queue.Empty:
-                pass
-
-        self.data_queue.put(point)
-
-    def update_plot(self):
-        # Calculate how many points we should process to stay real-time
-        queue_size = self.data_queue.qsize()
-
-        if queue_size == 0:
+        """Append a chunk to the ring buffer using vectorized array ops (no
+        per-sample Python loop)."""
+        arr = np.asarray(data, dtype=float).ravel()
+        if arr.size == 0:
             return
 
-        skip_ratio = 1
-        updates_made = False
-        points_processed = 0
-        skip_counter = 0
+        arr = self._decimate(arr)
+        n = arr.size
 
-        while not self.data_queue.empty() and points_processed < queue_size:
-            try:
-                new_point = self.data_queue.get_nowait()
+        if n >= self.num_points:
+            # Chunk fills (or overfills) the window: keep the most recent points
+            self.buffer[:] = arr[-self.num_points:]
+        else:
+            # Slide the window left by n and append the new samples at the end
+            self.buffer[:-n] = self.buffer[n:]
+            self.buffer[-n:] = arr
 
-                # Skip points if we're behind (temporal downsampling)
-                skip_counter += 1
-                if skip_counter >= skip_ratio:
-                    skip_counter = 0
-                    # Add to deque - this automatically removes oldest point due to maxlen
-                    self.buffer.append(new_point)
-                    updates_made = True
+        self._dirty = True
 
-                points_processed += 1
-            except queue.Empty:
-                break
-
-        # Only update the plot if we have new data
-        if updates_made:
-            # Convert deque to list for plotting - this is the sliding window effect
-            self.plot_item.setData(self.time_vector, list(self.buffer))
+    def update_plot(self):
+        # Bounded work per tick: at most one setData using the existing ndarray
+        if not self._dirty:
+            return
+        self.plot_item.setData(self.time_vector, self.buffer)
+        self._dirty = False
 
     def update_display_duration(self, duration):
         self.display_duration = duration
@@ -171,11 +140,6 @@ class PlotGrid(QWidget):
         self.refresh_time = max(self._get_monitor_refresh_delay(), 10)
         self.update_timer = QTimer()
         self.update_timer.timeout.connect(self.update_plots)
-
-        # Add queue monitoring for debugging
-        self.queue_monitor_timer = QTimer()
-        self.queue_monitor_timer.timeout.connect(self._monitor_queues)
-        self.queue_monitor_timer.start(2000)  # Check every 2 seconds
 
         # Initialize grid
         self.init_grid()
@@ -217,6 +181,13 @@ class PlotGrid(QWidget):
                 self.available_slots.append((r, c))
 
     def update_grid(self, rows, cols):
+        """Resize the plot grid while keeping already-plotted sources in their
+        same (row, col) cell when that cell still exists. Sources whose cell no
+        longer fits the smaller grid are dropped and returned so the caller can
+        keep the source selector in sync."""
+        # Snapshot what is currently plotted and where
+        old_locs = {src: info["loc"] for src, info in self.selected_channels.items()}
+
         # Clear past grid
         while self.layout.count():
             child = self.layout.takeAt(0)
@@ -233,6 +204,25 @@ class PlotGrid(QWidget):
 
         self.init_grid()
 
+        # Re-place sources at their original cell if it still exists; otherwise
+        # they fall off the (smaller) grid and are reported as dropped.
+        dropped = []
+        for src, (r, c) in sorted(old_locs.items(), key=lambda kv: (kv[1][0], kv[1][1])):
+            if r < self.rows and c < self.cols:
+                self._assign_source(src, r, c)
+            else:
+                dropped.append(src)
+
+        return dropped
+
+    def _assign_source(self, source, row, col):
+        """Bind a data source to a specific grid cell and mark the slot taken."""
+        plot_obj = self.plots[row][col]
+        plot_obj.update_data_source(source)
+        self.selected_channels[source] = {"plot": plot_obj, "loc": (row, col)}
+        if (row, col) in self.available_slots:
+            self.available_slots.remove((row, col))
+
     def add_source(self, source):
         if source in self.selected_channels.keys():
             self.log_event.emit(
@@ -240,23 +230,17 @@ class PlotGrid(QWidget):
             )
             return True
 
-        try:
-            # Sort
-            self.available_slots.sort(key=lambda x: x[0] * self.cols + x[1])
-            # Pop
-            row, col = self.available_slots.pop(0)
-        except IndexError:
+        if not self.available_slots:
             self.log_event.emit(
                 "warning",
                 "All graph slots full. Update layout or remove an existing trace.",
             )
             return False
 
-        plot_obj = self.plots[row][col]
-        plot_obj.update_data_source(source)
-
-        # Update selected channel mapping
-        self.selected_channels[source] = {"plot": plot_obj, "loc": (row, col)}
+        # Fill the lowest-index free slot (row-major)
+        self.available_slots.sort(key=lambda x: x[0] * self.cols + x[1])
+        row, col = self.available_slots[0]
+        self._assign_source(source, row, col)
 
         return True
 
@@ -279,43 +263,30 @@ class PlotGrid(QWidget):
 
         return True
 
-    def add_new_data(self, data, source):
-        for channel_idx in range(np.shape(data)[0]):
-            if channel_idx >= len(self.config.display_sources):
-                break
+    def add_new_data(self, data, sources=None):
+        """Route a (num_sources, num_samples) chunk to the selected plots using the
+        per-chunk source list. Rows whose source is not currently plotted are
+        ignored."""
+        if data is None or sources is None:
+            return
 
-            channel_key = self.config.display_sources[channel_idx]
-            if channel_key not in self.selected_channels.keys():
+        data = np.atleast_2d(data)
+        n_rows = data.shape[0]
+
+        for idx in range(min(n_rows, len(sources))):
+            src = sources[idx]
+            source = DataSource.from_dict(src) if isinstance(src, dict) else src
+
+            entry = self.selected_channels.get(source)
+            if entry is None:
                 continue
 
-            plot_obj = self.selected_channels[channel_key]["plot"]
-            # Pass the data for this channel (could be multiple samples)
-            plot_obj.add_data(data[channel_idx, :])
+            entry["plot"].add_data(data[idx, :])
 
     def update_plots(self):
         for val in self.selected_channels.values():
             plot_obj = val["plot"]
             plot_obj.update_plot()
-
-    def _monitor_queues(self):
-        total_queued = 0
-        max_queue = 0
-
-        for channel_data in self.selected_channels.values():
-            plot_obj = channel_data["plot"]
-            queue_size = plot_obj.data_queue.qsize()
-            total_queued += queue_size
-            max_queue = max(max_queue, queue_size)
-
-        if max_queue > 100:  # Threshold for concern
-            self.log_event.emit(
-                "debug",
-                f"Plot queues getting large - max: {max_queue}, total: {total_queued}. Consider reducing data rate or increasing processing.",
-            )
-        elif total_queued > 0:
-            self.log_event.emit(
-                "debug", f"Active plot queues - max: {max_queue}, total: {total_queued}"
-            )
 
     def set_display_time(self, dur):
         self.display_duration = dur

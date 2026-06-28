@@ -33,6 +33,15 @@ class CommonSettingsPanel(QGroupBox):
         self.param_inputs = {}
         self.init_ui()
 
+    def get_emittable_signals(self):
+        return {
+            'parameter_changed': self.parameter_changed,
+            'display_duration_changed': self.display_duration_changed, 
+            'grid_layout_changed': self.grid_layout_changed, 
+            'add_data_source': self.add_data_source, 
+            'remove_data_source': self.remove_data_source 
+        }
+    
     def init_ui(self):
         layout = QGridLayout()
         row = 0
@@ -147,6 +156,10 @@ class CommonSettingsPanel(QGroupBox):
             self.plot_source.unselect_source(source)
         else:
             return None
+
+    def set_available_sources(self, sources):
+        """Populate the plot-source selector with the available data sources."""
+        self.plot_source.set_sources(sources)
 
     def openFolderDialog(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Folder")

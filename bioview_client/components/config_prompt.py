@@ -1,10 +1,5 @@
-import contextlib
 import pprint
-import json
-from pathlib import Path
-from typing import Dict
 
-from bioview_common import APP_VERSION
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QDialog,
@@ -22,29 +17,22 @@ from PyQt6.QtWidgets import (
     QWidget
 )
 
-from bioview_client.utils import is_dict_of_dicts, read_experiment_config_file, read_device_config_files
+from bioview_common import APP_VERSION, parse_configuration_file
 
 class ConfigurationPrompt(QDialog):
     """
     Dialog for uploading common and device configuration, loaded whenever 
     the app does not find a valid configuration
     """
-    def __init__(
-        self,
-        experiment_config: Dict = None,
-        device_config: Dict[str, Dict] = None,
-        parent=None,
-    ):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.experiment_config = experiment_config or {} 
-        self.device_config = device_config if is_dict_of_dicts(device_config) else {}
-        
-        self.setup_ui()
-        self.update_device_config_preview()
-        self.update_experiment_config_preview()
+        self.config_file = None 
+        self.configurations = {} # in case we have a valid file
 
-    def setup_ui(self):
-        self.setWindowTitle(f"Configuration - BioView Monitor {APP_VERSION}")
+        self.init_ui()
+
+    def init_ui(self):
+        self.setWindowTitle(f"BioView Configuration Loader (Version {APP_VERSION})")
         self.setModal(True)
         self.resize(800, 500)
         
@@ -60,202 +48,119 @@ class ConfigurationPrompt(QDialog):
         icon_label.setPixmap(warning_icon.pixmap(24, 24)) 
         icon_label.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        text_label = QLabel("App was launched with incomplete configuration. Please add configuration files.")
+        text_label = QLabel("App was launched without any specifications. Consider uploading a configuration file.")
         text_label.setWordWrap(True)
 
         header_layout.addWidget(icon_label)
-        header_layout.addWidget(text_label, 1) # '1' lets text expand to fill space
+        header_layout.addWidget(text_label, stretch=1)
 
         layout.addWidget(header_container)
 
-        # Experiment Configuration Section
-        common_group = QGroupBox("Experiment Configuration")
-        common_layout = QVBoxLayout(common_group)
+        # Configuration Preview 
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
 
-        update_exp_cfg_btn_layout = QHBoxLayout()
-        update_exp_cfg_btn_layout.addStretch()
+        add_cfg_file_btn = QPushButton("Add from files")
+        add_cfg_file_btn.clicked.connect(self.update_config_file)
+        btn_layout.addWidget(add_cfg_file_btn)
 
-        self.update_experiment_cfg_btn = QPushButton("Browse Files")
-        self.update_experiment_cfg_btn.clicked.connect(self.update_experiment_config)
-        update_exp_cfg_btn_layout.addWidget(self.update_experiment_cfg_btn)
+        self.remove_current_cfg_btn = QPushButton("Remove current")
+        self.remove_current_cfg_btn.clicked.connect(self.remove_config_file)
+        self.remove_current_cfg_btn.setEnabled(False)
+        btn_layout.addWidget(self.remove_current_cfg_btn)
 
-        self.clear_common_btn = QPushButton("Clear")
-        self.clear_common_btn.clicked.connect(self.clear_experiment_config)
-        self.clear_common_btn.setEnabled(False)
-        update_exp_cfg_btn_layout.addWidget(self.clear_common_btn)
+        layout.addLayout(btn_layout)
 
-        common_layout.addLayout(update_exp_cfg_btn_layout)
+        # Preview area
+        preview_group = QGroupBox("Preview")
+        preview_layout = QHBoxLayout(preview_group)
 
-        # Preview area for experiment config
-        self.experiment_config_preview = QTextEdit()
-        self.experiment_config_preview.setMaximumHeight(300) 
-        common_layout.addWidget(self.experiment_config_preview)
+        self.cfg_items_list = QListWidget()
+        self.cfg_items_list.setMaximumWidth(200)
+        self.cfg_items_list.setMaximumHeight(500) 
+        self.cfg_items_list.itemSelectionChanged.connect(self.on_selection_changed)
+        preview_layout.addWidget(self.cfg_items_list)
 
-        layout.addWidget(common_group)
+        self.preview_text_area = QTextEdit()
+        self.preview_text_area.setMaximumHeight(500) 
+        self.preview_text_area.setReadOnly(True)
+        preview_layout.addWidget(self.preview_text_area)
 
-        # Device Configuration Section
-        device_group = QGroupBox("Device Configurations")
-        device_layout = QVBoxLayout(device_group)
+        layout.addWidget(preview_group)
 
-        device_controls_layout = QHBoxLayout()
-        device_controls_layout.addStretch()
+        # Bottom buttons (Ok/Cancel)
+        footer_layout = QHBoxLayout()
+        footer_layout.addStretch()
 
-        self.add_device_config_btn = QPushButton("Add Device Configuration")
-        self.add_device_config_btn.clicked.connect(self.add_device_config)
-        device_controls_layout.addWidget(self.add_device_config_btn)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        footer_layout.addWidget(cancel_btn)
 
-        self.remove_device_group_btn = QPushButton("Remove Selected")
-        self.remove_device_group_btn.clicked.connect(self.remove_device_group_config)
-        self.remove_device_group_btn.setEnabled(False)
-        device_controls_layout.addWidget(self.remove_device_group_btn)
+        ok_btn = QPushButton("OK")
+        ok_btn.clicked.connect(self.accept)
+        ok_btn.setDefault(True)
+        footer_layout.addWidget(ok_btn)
 
-        device_layout.addLayout(device_controls_layout)
+        layout.addLayout(footer_layout)
 
-        # Device config preview
-        device_content_layout = QHBoxLayout()
-
-        # Device list
-        self.device_list = QListWidget()
-        self.device_list.setMaximumWidth(200)
-        self.device_list.itemSelectionChanged.connect(self.on_device_selection_changed)
-        device_content_layout.addWidget(self.device_list)
-
-        # Config preview
-        self.device_preview = QTextEdit()
-        self.device_preview.setPlaceholderText(
-            "Select a device configuration to preview..."
-        )
-        self.device_preview.setReadOnly(True)
-        device_content_layout.addWidget(self.device_preview)
-
-        device_layout.addLayout(device_content_layout)
-        layout.addWidget(device_group)
-
-        # Dialog buttons
-        button_layout = QHBoxLayout()
-        button_layout.addStretch()
-
-        self.cancel_btn = QPushButton("Cancel")
-        self.cancel_btn.clicked.connect(self.reject)
-        button_layout.addWidget(self.cancel_btn)
-
-        self.ok_btn = QPushButton("OK")
-        self.ok_btn.clicked.connect(self.accept)
-        self.ok_btn.setDefault(True)
-        button_layout.addWidget(self.ok_btn)
-
-        layout.addLayout(button_layout)
-
-    def update_device_config_preview(self):
+    def update_preview(self):
         # Clear preview if no items left
-        if len(self.device_config) == 0:
-            self.device_list.clear() 
-            self.device_preview.clear()
-            self.remove_device_group_btn.setEnabled(False)
-        else: 
-            self.remove_device_group_btn.setEnabled(True)
+        if len(self.configurations) == 0:
+            self.cfg_items_list.clear() 
+            self.preview_text_area.clear()
+            self.remove_current_cfg_btn.setEnabled(False)
         
-        self.device_list.clear() 
-        for group_id in self.device_config:
+        if self.config_file: 
+            self.remove_current_cfg_btn.setEnabled(True)
+        else: 
+            self.remove_current_cfg_btn.setEnabled(False)
+        
+        self.cfg_items_list.clear() 
+        for group_id in self.configurations:
             item = QListWidgetItem(group_id)
             item.setData(Qt.ItemDataRole.UserRole, (group_id))
-            self.device_list.addItem(item)    
+            self.cfg_items_list.addItem(item)    
 
-    def update_experiment_config(self):
+    def update_config_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Add Experiment Configuration", "", "JSON Files (*.json);;All Files (*)"
+            self, "Add configuration file", "", 
+            "BioView Files (*.bview), JSON Files (*.json);;All Files (*)"
         )
 
         # If no file is added, just return  
         if not file_path: return 
 
-        self.experiment_config = read_experiment_config_file(file_path)
-            
-        self.update_experiment_config_preview()
-        self.clear_common_btn.setEnabled(True)
+        self.config_file = file_path 
+        self.configurations = parse_configuration_file(self.config_file)
+        self.update_preview()
+        
+        self.remove_current_cfg_btn.setEnabled(True)
 
         QMessageBox.information(
-            self, "Information", "Experiment configuration updated."
+            self, "Information", "Configuration successfully updated!"
         )
 
-    def clear_experiment_config(self):
-        self.experiment_config = {}
-        self.experiment_config_preview.clear()
-        self.clear_common_btn.setEnabled(False)
+    def remove_config_file(self):
+        self.config_file = None 
+        self.configurations = {} 
+        self.update_preview() 
 
-    def update_experiment_config_preview(self):
-        if self.experiment_config:
-            preview_text = json.dumps(self.experiment_config, indent=2)
-            # Truncate if too long
-            if len(preview_text) > 500:
-                preview_text = preview_text[:500] + "\n... (truncated)"
-            self.experiment_config_preview.setPlainText(preview_text)
-        else:
-            self.experiment_config_preview.clear()
-
-    def add_device_config(self): 
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Add Device Group Configuration",
-            "",
-            "JSON Files (*.json);;All Files (*)",
-        )
-        if not file_path: return 
-
-        self.device_config.update(read_device_config_files(file_path))
-
-        # Update Preview 
-        self.update_device_config_preview() 
-
-        QMessageBox.information(
-            self, "Information", "Device configuration updated."
-        )
-
-    def remove_device_group_config(self):
-        # This will correspond to a key in self.device_config 
-        current_item = self.device_list.currentItem()
-        if current_item is None: return
-
-        # Remove from storage 
-        group_id = current_item.data(Qt.ItemDataRole.UserRole)
-
-        # Remove from UI
-        current_row = self.device_list.row(current_item)
-        self.device_list.takeItem(current_row)
-
-        # For now, we remove the entire group.
-        # FUTURE: We may want to let individual device configs be changed through UI.
-        del self.device_config[group_id]
-
-        # Refresh list
-        self.update_device_config_preview()
-
-    def on_device_selection_changed(self):
-        current_item = self.device_list.currentItem()
+    def on_selection_changed(self):
+        current_item = self.cfg_items_list.currentItem()
         
         if current_item:
             group_id = current_item.data(Qt.ItemDataRole.UserRole)
             
-            group_cfg = self.device_config[group_id] 
-            preview_text = pprint.pformat(group_cfg)
+            group_cfg = self.configurations[group_id]
+            # The stored value is a configuration object, not a dict. Render the
+            # underlying parameter dict so the preview is human-readable instead
+            # of "<... Configuration object at 0x...>".
+            cfg_dict = group_cfg.to_dict() if hasattr(group_cfg, "to_dict") else group_cfg
+            preview_text = pprint.pformat(cfg_dict, sort_dicts=False)
 
-            self.device_preview.setPlainText(preview_text)
+            self.preview_text_area.setPlainText(preview_text)
         else:
-            self.device_preview.clear()
-            self.remove_device_group_btn.setEnabled(False)
+            self.preview_text_area.clear()
 
-    def get_configurations(self):
-        """
-        Since all configurations will be passed to UI from this function,
-        we can delegate the task of wrapping in here
-        """
-        result = {}
-
-        if self.experiment_config:
-            result["common"] = self.experiment_config
-
-        if self.device_config:
-            # Monitor expects device groups under key 'groups'
-            result["groups"] = self.device_config
-
-        return result
+    def get_config_file(self): 
+        return self.config_file

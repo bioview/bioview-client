@@ -51,6 +51,13 @@ class CheckableComboBox(QComboBox):
         if checked:
             self.selectionChanged.emit("add", source)
 
+    def set_sources(self, sources):
+        """Replace the available sources shown in the combo box."""
+        self.model().clear()
+        for source in sources:
+            self.addItem(source)
+        self.update_line_text()
+
     def toggle_item(self, item: QStandardItem):
         """Toggle the check state of an item and emit the appropriate signal"""
         source = item.data(Qt.ItemDataRole.UserRole)

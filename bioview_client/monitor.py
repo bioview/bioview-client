@@ -14,7 +14,8 @@ import sys
 from pathlib import Path
 from typing import Dict, List
 
-from bioview_common import ClientStatus, Configuration, DataSource, DeviceStatus
+from bioview_common import ClientStatus, DataSource, DeviceStatus, ExperimentConfiguration, parse_configuration_file, SUPPORTED_CONFIGURATION_TYPES
+from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QGuiApplication, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
@@ -36,8 +37,6 @@ from bioview_client.components import (
     TextDialog,
 )
 from bioview_client.handler import Client
-from bioview_client.utils import is_dict_of_dicts, read_experiment_config_file, read_device_config_files
-
 
 class BioViewMonitor(QMainWindow):
     """'
@@ -60,8 +59,9 @@ class BioViewMonitor(QMainWindow):
 
     def __init__(
         self,
-        group_configs: List[Dict] = None,
-        experiment_config: Dict = None,
+        config_file: str | Path = None, 
+        # group_configs: List[Dict] = None,
+        # experiment_config: Dict = None,
         autodiscover: bool = True,
         autoconnect: bool = False,
     ):
@@ -70,37 +70,46 @@ class BioViewMonitor(QMainWindow):
         self.autodiscover = autodiscover
         self.autoconnect = autoconnect
 
-        # Check for valid configurations, else prompt user.
-        # UI and backend store it in Configuration objects,
-        # while handlers store as dict/json.
-        self.experiment_config, self.group_configs = self._resolve_initial_configs(
-            experiment_config, group_configs
-        )
+        self.config_file = config_file 
 
-        # Store device names and states - since that's all the UI needs
-        self.device_status: Dict[str, Dict] = {}
-        for group_id, group_dict in self.group_configs.items():
-            tmp = {}
-            for item_id in group_dict:
-                if item_id == "metadata":
-                    continue
-                tmp[item_id] = DeviceStatus.NOINIT
+        # If no valid configuration file present, prompt user.
+        if not self.config_file: 
+            dialog = ConfigurationPrompt()
 
-            self.device_status[group_id] = tmp
+            if dialog.exec() == QDialog.DialogCode.Accepted: 
+                self.config_file = dialog.get_config_file() 
+
+        # Now, parse and validate configurations. 
+        self.configurations = parse_configuration_file(self.config_file)
+
+        experiment_cfg_id = None
+        for cfg_id, cfg in self.configurations.items(): 
+            if cfg.get_type() == SUPPORTED_CONFIGURATION_TYPES.EXPERIMENT:
+                experiment_cfg_id = cfg_id
+                break
+        
+        if not experiment_cfg_id: 
+            self.experiment_config = ExperimentConfiguration({}) # Load a default one 
+            self.group_configs = self.configurations
+        else: 
+            self.experiment_config = self.configurations[experiment_cfg_id]
+            self.group_configs = {k: v for k, v in self.configurations.items() if k != experiment_cfg_id}
+
+        # Store group states
+        self.device_status = {k: DeviceStatus.NOINIT for k in self.group_configs}
 
         self.saving_status = False
 
         # Track instruction
         self.instruction_dialog = None
-        self.enable_instructions = self.experiment_config.get_param(
-            "enable_instructions", False
-        )
+        self.enable_instructions = self.experiment_config.get_param("enable_instructions", False)
+        self.instructions_type = self.experiment_config.get_param("instruction_type", None)
 
-        if (
-            self.enable_instructions
-            and self.experiment_config.get_param("instruction_type", "audio") == "text"
-        ):
-            self.instruction_dialog = TextDialog()
+        if self.enable_instructions: 
+            if self.instructions_type == "text": 
+                self.instruction_dialog = TextDialog()
+            elif self.instructions_type == 'audio': 
+                pass # TODO: Add Audio instructions. 
 
         # Set up UI
         self._init_ui()
@@ -119,8 +128,8 @@ class BioViewMonitor(QMainWindow):
         ### Common Threads
         self.instructions_thread = None
 
-        # Display Data Queue
-        self.display_data_queue = queue.Queue(maxsize=10000)
+        # Available data sources advertised by the connected server
+        self.available_sources = []
 
     def _init_ui(self):
         # Define main wndow
@@ -151,7 +160,7 @@ class BioViewMonitor(QMainWindow):
         self.command_bar = AppControlPanel()
         controls_layout.addWidget(self.command_bar, stretch=1)
 
-        self.settings_panel = SettingsPanel(self.experiment_config, self.group_configs)
+        self.settings_panel = SettingsPanel(self.configurations)
 
         controls_layout.addWidget(self.settings_panel, stretch=3)
 
@@ -182,70 +191,6 @@ class BioViewMonitor(QMainWindow):
         self.status_bar = StatusBar(device_status=self.device_status, parent=self)
         self.setStatusBar(self.status_bar)
 
-    # If initial configurations do not exist, ask using inputs
-    def _resolve_initial_configs(self, experiment_config, group_configs):
-        """
-        We initially receive configurations in JSON/dict format. These need
-        to be sanitized (if applicable). Hence, we load them into a
-        configuration object format. For the handler, however, we keep them
-        as dictionaries for easy serialization.
-        """
-        if not experiment_config or not group_configs:
-            dialog = ConfigurationPrompt()
-            # Will provide configurations as dict objects
-            configurations = None
-
-            if dialog.exec() == QDialog.DialogCode.Accepted:
-                configurations = dialog.get_configurations()
-
-            if configurations:
-                experiment_cfg = configurations.get("experiment", None)
-                group_cfgs = configurations.get("groups", None)
-            else:
-                experiment_cfg = {}
-                group_cfgs = {}
-
-        experiment_cfg = Configuration.from_dict(experiment_config, "experiment")
-        group_cfgs = self._convert_group_configs(group_configs)
-
-        # At this stage, we have sanitized Configuration objects
-        return experiment_cfg, group_cfgs
-
-    def _convert_group_configs(self, group_cfgs: Dict):
-        if not is_dict_of_dicts(group_cfgs):
-            return {}
-
-        converted: Dict[str, Dict] = {}
-
-        for group_id, group_items in group_cfgs.items():
-            converted[group_id] = {}
-            device_ids = [k for k in group_items if k != "metadata"]
-
-            # Populate metadata for further use
-            meta = group_items.get("metadata", {})
-            meta["group_id"] = group_id
-
-            for device_id in device_ids:
-                device_cfg = group_items[device_id]
-                converted[group_id][device_id] = Configuration.from_dict(device_cfg)
-
-                # TODO: Make this less jank
-                # Populate device_type using first device
-                if "device_type" not in meta:
-                    meta["device_type"] = converted[group_id][device_id].get_param(
-                        "device_type"
-                    )
-
-                # Populate samp_rate using first device
-                if "samp_rate" not in meta:
-                    meta["samp_rate"] = converted[group_id][device_id].get_param(
-                        "samp_rate"
-                    )
-
-            converted[group_id]["metadata"] = meta
-
-        return converted
-
     def _connect_client_signals(self):
         """Connect client signals to UI handlers."""
         # Server control signals
@@ -264,6 +209,9 @@ class BioViewMonitor(QMainWindow):
         self.client_worker.device_init_succeeded.connect(
             self.update_status_bar_and_buttons
         )
+        # Populate plot sources once devices are initialized/discovered
+        self.client_worker.device_init_succeeded.connect(self.on_devices_ready)
+        self.client_worker.devices_discovered.connect(self.on_devices_ready)
         self.client_worker.device_disconnect_succeeded.connect(
             self.update_status_bar_and_buttons
         )
@@ -274,6 +222,13 @@ class BioViewMonitor(QMainWindow):
             lambda x: self._handle_streaming_status_changed(not x)
         )
         self.client_worker.devices_discovered.connect(self.update_status_bar_and_buttons)
+
+        # Data signal for live display (data, sources). Use a queued connection so
+        # data bursts are marshalled to the UI thread one event at a time and never
+        # block or re-enter the receiving path.
+        self.client_worker.data_received.connect(
+            self.on_data_received, Qt.ConnectionType.QueuedConnection
+        )
 
         # General info signals
         self.client_worker.log_message.connect(self.log_display_panel.log_message)
@@ -305,6 +260,10 @@ class BioViewMonitor(QMainWindow):
         self.command_bar.enable_instructions.connect(self.toggle_instructions)
 
     def _connect_settings_panel_signals(self):
+        # Save-related parameters (file name / save dir) flow to the client worker
+        if getattr(self.settings_panel, "parameter_changed", None):
+            self.settings_panel.parameter_changed.connect(self.on_parameter_changed)
+
         if getattr(self.settings_panel, "display_duration_changed", None):
             self.settings_panel.display_duration_changed.connect(
                 self.handle_time_window_change
@@ -353,32 +312,16 @@ class BioViewMonitor(QMainWindow):
             lambda: self.client_worker.initialize_devices(True)
         )
 
-    def _handle_devices_discovered(self, devices_map: dict):
-        """Update status bar device panel when client reports discovered devices."""
-        if not devices_map:
-            return
-
-        # Enforce strict group->device mapping for the status bar. Reject other shapes.
-        if not is_dict_of_dicts(devices_map):
-            self.log_display_panel.log_message(
-                "warning",
-                "Received device map was not formatted correctly and was ignored.",
-            )
-            return
-
-        self.device_status = devices_map
-        self.update_status_bar_and_buttons(devices_map)
-
     def _handle_streaming_status_changed(self, is_streaming: bool):
         status = DeviceStatus.STREAMING if is_streaming else DeviceStatus.CONNECTED
 
-        for group_id, group in self.device_status.items():
-            for device_id in group:
-                if device_id == "metadata":
-                    continue
+        # device_status is a flat mapping {group_id: DeviceStatus}
+        for group_id in self.device_status:
+            if group_id == "metadata":
+                continue
 
-                self.device_status[group_id][device_id] = status
-                self.status_bar.update_device_status(group_id, device_id, status)
+            self.device_status[group_id] = status
+            self.status_bar.update_device_status(group_id, status)
 
         client_status = self.client_worker.status
         self.command_bar.update_button_states(client_status)
@@ -394,11 +337,43 @@ class BioViewMonitor(QMainWindow):
         self.plot_grid.set_display_time(seconds)
 
     def handle_grid_layout_change(self, rows, cols):
-        self.plot_grid.update_grid(rows, cols)
+        # Resizing keeps still-fitting sources plotted in place; any that no
+        # longer fit the new (smaller) grid are returned so we can uncheck them
+        # in the source selector and keep the UI state consistent.
+        dropped = self.plot_grid.update_grid(rows, cols)
+        for src in dropped or []:
+            self.settings_panel.update_source("remove", src)
 
     def populate_plot_grid_sources(self, sources):
-        # TODO: Callback from handler
-        pass
+        """Populate the plot-source selector from the data sources advertised by
+        the server. `sources` may be DataSource objects or descriptor dicts."""
+        if not sources:
+            return
+
+        source_objs = []
+        for src in sources:
+            if isinstance(src, DataSource):
+                source_objs.append(src)
+            elif isinstance(src, dict):
+                source_objs.append(DataSource.from_dict(src))
+
+        self.available_sources = source_objs
+        self.settings_panel.set_available_sources(source_objs)
+
+    def on_data_received(self, data, sources):
+        """Route a received data chunk to the plot grid for display."""
+        self.plot_grid.add_new_data(data, sources)
+
+    def on_devices_ready(self, _device_status=None):
+        """Populate the plot-source selector from the server's advertised sources."""
+        data_sources = self.client_worker.get_data_sources()
+        if data_sources:
+            self.populate_plot_grid_sources(data_sources)
+
+    def on_parameter_changed(self, name, value):
+        """Forward experiment parameter changes (e.g. save_dir/file_name) to client."""
+        if self.client_worker:
+            self.client_worker.set_save_param(name, value)
 
     def add_plot_source(self, source: DataSource):
         """
@@ -422,19 +397,19 @@ class BioViewMonitor(QMainWindow):
             return
 
         # Update UI to show CONNECTING state for all known devices
-        for group_id, group in self.device_status.items():
-            for device_id in group:
-                self.status_bar.update_device_status(
-                    group_id, device_id, DeviceStatus.CONNECTING
-                )
+        # device_status is a flat mapping {group_id: DeviceStatus}
+        for group_id in self.device_status:
+            if group_id == "metadata":
+                continue
+            self.status_bar.update_device_status(group_id, DeviceStatus.CONNECTING)
 
         # Request server to connect all initialized devices
         self.client_worker.initialize_devices()
 
-    def update_save_state(self):
-        self.saving_status = True
+    def update_save_state(self, enabled: bool = True):
+        self.saving_status = bool(enabled)
         if self.client_worker:
-            pass
+            self.client_worker.set_save_enabled(bool(enabled))
 
     def toggle_instructions(self, flag):
         self.enable_instructions = flag
@@ -442,7 +417,7 @@ class BioViewMonitor(QMainWindow):
             self.instruction_dialog.toggle_ui(self.enable_instructions)
 
     # Client worker helper functions
-    def on_server_connected(self, data_sources: None):
+    def on_server_connected(self, connected: bool = True):
         self.log_display_panel.log_message("info", "Connected to server")
 
         try:
@@ -454,9 +429,11 @@ class BioViewMonitor(QMainWindow):
         self.status_bar.server_connector.discover_btn.setEnabled(True)
 
         self.command_bar.update_button_states(self.client_worker.status)
-    
-        if data_sources: 
-            self.populate_plot_grid_sources(data_sources) 
+
+        # Populate plot sources from the data sources advertised by the server
+        data_sources = self.client_worker.get_data_sources()
+        if data_sources:
+            self.populate_plot_grid_sources(data_sources)
 
     def on_server_disconnected(self):
         try:
@@ -471,14 +448,15 @@ class BioViewMonitor(QMainWindow):
         pass
 
     def update_status_bar_and_buttons(self, device_status: Dict):
-        for group_id, group in device_status.items():
-            for device_id, new_status in group.items():
-                if device_id == "metadata":
-                    continue
+        # device_status is a flat mapping {group_id: DeviceStatus value}
+        for group_id, new_status in device_status.items():
+            if group_id == "metadata":
+                continue
 
-                if not isinstance(new_status, DeviceStatus):
+            if not isinstance(new_status, DeviceStatus):
+                with contextlib.suppress(Exception):
                     new_status = DeviceStatus(new_status)
-                self.status_bar.update_device_status(group_id, device_id, new_status)
+            self.status_bar.update_device_status(group_id, new_status)
 
         client_status = self.client_worker.status
         self.command_bar.update_button_states(client_status)
@@ -489,16 +467,10 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Launch BioView Monitor UI")
     parser.add_argument(
-        "--device-config",
+        "--config-file",
         nargs="*",
-        help="JSON files containing device configurations",
+        help="In case the app is launched using a .bview file", # A .json also works. 
         default=[],
-    )
-    parser.add_argument(
-        "--experiment-config",
-        help="JSON file containing experiment configuration",
-        type=str, 
-        default='',
     )
     parser.add_argument(
         "--autodiscover",
@@ -510,7 +482,7 @@ if __name__ == "__main__":
         "--autoconnect",
         dest="autoconnect",
         action="store_true",
-        help="Automatically connect to first discovered server",
+        help="Automatically connect to first discovered (usually localhost) server",
     )
 
     args = parser.parse_args()
@@ -521,20 +493,57 @@ if __name__ == "__main__":
 
     # Create and show main window with parsed configs and flags
     window = BioViewMonitor(
-        group_configs=read_device_config_files(args.device_config),
-        experiment_config=read_experiment_config_file(args.experiment_config),
+        config_file=args.config_file, 
         autodiscover=args.autodiscover,
         autoconnect=args.autoconnect,
     )
     window.show()
 
-    # If auto-discover, trigger the call
+    # If auto-discover, trigger the scan. The scan is asynchronous, so autoconnect
+    # must wait for the scan to actually complete before selecting/connecting.
     if window.autodiscover and window.client_worker:
         handler = window.client_worker
-        handler.discover_servers()
 
-        if window.autoconnect and len(handler.discovered_servers) > 0:
-            handler.change_selected_server(0)
-            handler.connect_to_server()
+        if window.autoconnect:
+            def _autoconnect_when_scan_done(servers):
+                # Connect to the first discovered server once results arrive. If a
+                # scan finds nothing we stay subscribed so a later retry (below)
+                # that finds the server will still autoconnect.
+                if servers:
+                    with contextlib.suppress(Exception):
+                        handler.server_scan_completed.disconnect(
+                            _autoconnect_when_scan_done
+                        )
+                    handler.change_selected_server(0)
+                    handler.connect_to_server()
+
+            handler.server_scan_completed.connect(_autoconnect_when_scan_done)
+
+        # Periodically re-scan until a server is found / we are connected, so the
+        # client can be started before the server and still discover it later.
+        rescan_timer = QTimer()
+
+        def _maybe_rescan():
+            # Stop retrying once connected (or further along) or once we have
+            # results the user can act on. A scan already in flight is left alone.
+            if handler.status >= ClientStatus.SERVER_CONNECTED:
+                rescan_timer.stop()
+                return
+            if handler.status == ClientStatus.SCANNING:
+                return
+            if handler.discovered_servers:
+                # Found something already; keep retrying only in autoconnect mode
+                # (so a dropped server can be re-found), otherwise let the user act.
+                if not window.autoconnect:
+                    rescan_timer.stop()
+                    return
+            handler.discover_servers()
+
+        rescan_timer.timeout.connect(_maybe_rescan)
+        rescan_timer.start(5000)
+        # Keep a reference so the timer isn't garbage-collected
+        window._rescan_timer = rescan_timer
+
+        handler.discover_servers()
 
     sys.exit(app.exec())

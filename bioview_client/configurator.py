@@ -29,8 +29,6 @@ from bioview_client.handler import Client
 
 
 class DeviceConfigDialog(QDialog):
-    """Device configuration dialog"""
-
     config_changed = pyqtSignal(dict, dict)  # device_info, new_config
 
     def __init__(self, device_info, editable_properties, parent=None):
@@ -84,7 +82,6 @@ class DeviceConfigDialog(QDialog):
         layout.addWidget(button_box)
 
     def accept_changes(self):
-        """Accept configuration changes"""
         new_config = {}
         for prop_name, widget in self.property_widgets.items():
             if isinstance(widget, QLineEdit):
@@ -338,6 +335,7 @@ class DeviceDiscoveryClient(QMainWindow):
             lambda msg: self.log_panel.add_log_message("error", msg)
         )
         self.client_worker.log_message.connect(self.log_panel.add_log_message)
+        self.client_worker.devices_discovered.connect(self.device_panel.update_discovered_devices)
 
         # Start client
         self.client_worker.start_client()
@@ -345,11 +343,11 @@ class DeviceDiscoveryClient(QMainWindow):
     def discover_devices(self):
         """Discover devices"""
         if self.client_worker:
-            devices = self.client_worker.discover_devices()
-            self.device_panel.update_discovered_devices(devices)
+            self.client_worker.discover_devices()
+            
             self.status_panel.update_device_count(len(devices) if devices else 0)
             self.log_panel.add_log_message(
-                "info", f"Found {len(devices) if devices else 0} devices"
+                "info", f"Discovery requested..."
             )
 
     def show_device_config(self, device_info, editable_properties):

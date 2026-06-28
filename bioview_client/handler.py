@@ -17,6 +17,7 @@ This can be modified for remote operation.
 """
 
 import contextlib
+import os
 import socket
 import threading
 import time
@@ -37,17 +38,15 @@ from bioview_common import (
     Response,
     get_app_info,
     get_ip,
-)
-from PyQt6.QtCore import QThread, QThreadPool, pyqtSignal
-
-from bioview_client.helpers import DataStreamer, DeviceInitWorker, ScanWorker
-from bioview_client.utils import (
     get_challenge_response,
-    group_config_to_dict,
+    get_unique_path,
     is_dict_of_dicts,
     parse_and_validate_response,
     send_command,
 )
+from PyQt6.QtCore import QThread, QThreadPool, pyqtSignal
+
+from bioview_client.workers import DataSaver, DataStreamer, DeviceInitWorker, FunctionWorker, ScanWorker
 
 
 class Client(QThread):
@@ -75,12 +74,15 @@ class Client(QThread):
     # General info signals
     log_message = pyqtSignal(str, str)
 
-    # Data signals for graphical outputi 
-    data_received = pyqtSignal(DataSource, np.ndarray)
+    # Data signal for graphical output. Carries (data, sources) where data is a
+    # (num_sources, num_samples) array and sources is the ordered list of source
+    # descriptor dicts describing each row.
+    data_received = pyqtSignal(np.ndarray, object)
 
     def __init__(
         self,
-        experiment_config: Dict = None,
+        config: Configuration = None,
+        experiment_config=None,
         group_configs: Dict = None,
         data_port: int = DATA_PORT,
         control_port: int = CONTROL_PORT,
@@ -113,9 +115,22 @@ class Client(QThread):
         self.data_sources = None 
         self.data_streamer = None
 
-        # Thread pool for background tasks (scanning, device discovery)
+        # Client-side saving (fast disk on the client per design). Settings are
+        # populated from the UI; the saver thread is created when streaming starts.
+        self.data_saver = None
+        self.enable_save = False
+        self.save_dir = ""
+        self.file_name = ""
+
+        # Thread pool for control/device operations (connect, init, start/stop).
+        # Kept small since these are serialized through the control socket lock.
         self.thread_pool = QThreadPool()
-        self.thread_pool.setMaxThreadCount(255)
+        self.thread_pool.setMaxThreadCount(8)
+
+        # Separate, bounded pool for the LAN scan so probing up to 254 hosts does
+        # not spawn a 254-thread storm that contends with the rest of the app.
+        self.scan_pool = QThreadPool()
+        self.scan_pool.setMaxThreadCount(32)
         self._cancel_scan = False
 
         # Device discovery state
@@ -128,35 +143,73 @@ class Client(QThread):
         # Running state for the QThread
         self.running = False
 
-        # Keep track of common configuration
-        self.experiment_config = None
+        # Keep track of unified configuration. The monitor UI passes a separate
+        # experiment_config object and a group_configs dict (device_id -> config
+        # object); merge them into a single Configuration here. A pre-built
+        # Configuration (used by other frontends) takes precedence if provided.
+        if config is None and (experiment_config is not None or group_configs):
+            config = self._build_configuration(experiment_config, group_configs)
+        self.config = config or Configuration()
 
-        if experiment_config:
-            if isinstance(experiment_config, Configuration):
-                self.experiment_config = experiment_config
-            elif isinstance(experiment_config, dict):
-                self.experiment_config = Configuration.from_dict(
-                    experiment_config, "experiment"
-                )
-
-        # Keep track of device configuration and states
-        self.group_configs = group_config_to_dict(group_configs) if group_configs else {}
+        # Backward compatibility for existing code that uses group_configs
+        self.group_configs = self.config.to_dict()
 
         # Now, while we understand devices in the form of groups, we keep track of
         # states for individual devices for clearer presentation in the UI
         self.device_states = {}
-        for group_id, group_dict in self.group_configs.items():
-            self.device_states[group_id] = {}
+        for device_id, device_cfg in self.config.devices.items():
+            self.device_states[device_id] = {
+                "id": device_id,
+                "config": device_cfg.to_dict(),
+                "status": DeviceStatus.DISCONNECTED,
+            }
 
-            for device_id, device_cfg in group_dict.items():
-                self.device_states[group_id][device_id] = {
-                    "group": group_id,
-                    "id": device_id,
-                    "config": device_cfg,
-                    "status": DeviceStatus.DISCONNECTED,
-                }
+        # Seed save settings from the experiment configuration if present
+        if self.config.experiment is not None:
+            self.enable_save = bool(self.config.experiment.get_param("enable_save", False))
+            self.save_dir = self.config.experiment.get_param("save_dir", "") or ""
+            self.file_name = self.config.experiment.get_param("file_name", "") or ""
+
+    # Save configuration setters (driven by the UI)
+    def set_save_enabled(self, enabled: bool):
+        self.enable_save = bool(enabled)
+
+    def set_save_param(self, name: str, value):
+        if name == "save_dir":
+            self.save_dir = value or ""
+        elif name == "file_name":
+            self.file_name = value or ""
+
+    @staticmethod
+    def _build_configuration(experiment_config, group_configs) -> Configuration:
+        """Merge a separate experiment config and per-device group configs into a
+        single unified Configuration."""
+        config_dict = {}
+
+        if experiment_config is not None:
+            config_dict["experiment"] = (
+                experiment_config.to_dict()
+                if hasattr(experiment_config, "to_dict")
+                else experiment_config
+            )
+
+        if group_configs:
+            for device_id, device_cfg in group_configs.items():
+                config_dict[device_id] = (
+                    device_cfg.to_dict()
+                    if hasattr(device_cfg, "to_dict")
+                    else device_cfg
+                )
+
+        return Configuration.from_dict(config_dict)
 
     # Thread handling
+    def _send_command_locked(self, command, params=None):
+        with self._control_lock:
+            if not self.control_socket:
+                return None
+            return send_command(self.control_socket, command, params)
+
     def run(self):
         self.log_message.emit("info", "Starting client handler...")
 
@@ -173,53 +226,75 @@ class Client(QThread):
 
     # Discover servers in parallel
     def discover_servers(self):
+        # Guard against overlapping scans (which would corrupt shared counters
+        # and make completion fire unreliably). A scan in progress is left to run.
+        if self.status == ClientStatus.SCANNING:
+            self.log_message.emit("debug", "Server scan already in progress")
+            return
+
         self.status = ClientStatus.SCANNING
         self.discovered_servers = []
-
-        # Track transient state for early stopping
         self._cancel_scan = False
-        self._completed_scans = 0
-        total_ips = 255  # Currently we are only scanning IPv4
-        self._last_update_time = time.time()
+
+        # Probe every host on the local /24 plus loopback, so a local-only server
+        # is always reachable even if NIC detection is off or there is no LAN.
+        targets = [f"{self.network_prefix}.{i}" for i in range(1, 255)]
+        if "127.0.0.1" not in targets:
+            targets.append("127.0.0.1")
+        total = len(targets)
+
+        # All scan state is local to this invocation so concurrent/rapid rescans
+        # never clobber each other's counters.
+        scan_lock = threading.Lock()
+        state = {"completed": 0, "done": False, "last_update": time.time()}
 
         def handle_result(found):
-            if self._cancel_scan:
-                return
-            self._completed_scans += 1
+            with scan_lock:
+                if self._cancel_scan or state["done"]:
+                    return
 
-            # Only emit progress every 100ms or at the end
-            now = time.time()
-            if now - self._last_update_time >= 0.1 or self._completed_scans == total_ips:
-                progress = int((self._completed_scans / total_ips) * 100)
-                self.server_scan_progress.emit(progress)
-                self._last_update_time = now
+                state["completed"] += 1
 
-            # Ensure we received a dict
-            if found and isinstance(found, dict):
-                # Avoid duplicates
-                addr = found.get("ip")
+                # Collect a discovered server (deduplicated by IP)
+                if found and isinstance(found, dict):
+                    addr = found.get("ip")
+                    if addr and not any(
+                        s.get("ip") == addr for s in self.discovered_servers
+                    ):
+                        self.discovered_servers.append(found)
 
-                if addr and not any(
-                    s.get("ip") == addr for s in self.discovered_servers
-                ):
-                    self.discovered_servers.append(found)
+                completed = state["completed"]
+                is_done = completed >= total
+                if is_done:
+                    state["done"] = True
 
-            if self._completed_scans == total_ips:
+                now = time.time()
+                emit_progress = (now - state["last_update"] >= 0.1) or is_done
+                if emit_progress:
+                    state["last_update"] = now
+
+            # Emit signals outside the lock to avoid holding it across Qt dispatch
+            if emit_progress:
+                self.server_scan_progress.emit(int((completed / total) * 100))
+
+            if is_done:
                 self.status = ClientStatus.DEFAULT
-                # discovery results updated
                 self.server_scan_completed.emit(self.discovered_servers)
 
-        for i in range(1, 255):
+        for target_ip in targets:
             if self._cancel_scan:
                 break
-            target_ip = f"{self.network_prefix}.{i}"
             worker = ScanWorker(target_ip, self.control_port)
             worker.signals.result.connect(handle_result)
-            self.thread_pool.start(worker)
+            self.scan_pool.start(worker)
 
     def cancel_scan(self):
         self._cancel_scan = True
-        self.thread_pool.clear()
+        self.scan_pool.clear()
+
+        # Reset out of the scanning state so a fresh scan can be started
+        if self.status == ClientStatus.SCANNING:
+            self.status = ClientStatus.DEFAULT
 
         self.server_scan_completed.emit(self.discovered_servers)
 
@@ -243,7 +318,8 @@ class Client(QThread):
             resp_type, resp_payload = parse_and_validate_response(response)
 
             # Check if server provided a challenge
-            if resp_type == Response.SERVER_CHALLENGE.name:
+            challenge = None
+            if resp_type == Response.SERVER_CHALLENGE.name and resp_payload:
                 challenge = resp_payload.get("challenge", None)
 
             if not challenge:
@@ -263,21 +339,23 @@ class Client(QThread):
             )
 
             if auth_resp_type == Response.AUTHENTICATION_SUCCESS.name:
-                server_info = auth_resp_payload.get("server_info", None)
+                server_info = auth_resp_payload.get("server_info", None) if auth_resp_payload else None
 
                 # Update status
                 self.status = ClientStatus.SERVER_CONNECTED
 
+                hostname = server_info.get("hostname") if server_info else "server"
                 self.log_message.emit(
-                    "info", f"Successfully connected to {server_info.get('hostname')}"
+                    "info", f"Successfully connected to {hostname}"
                 )
             else:
-                err = auth_resp_payload.get("message", "")
+                err = auth_resp_payload.get("message", "") if auth_resp_payload else ""
                 raise AuthenticationError(f"Server authentication failed: {err}")
         except Exception as e: 
-            self.log_message("error", "Authentication with server failed")
-        finally: 
-            return server_info
+            self.log_message.emit("error", f"Authentication with server failed: {e}")
+            server_info = None
+
+        return server_info
 
     def change_selected_server(self, index: int):
         if self.discovered_servers is None or len(self.discovered_servers) == 0:
@@ -288,22 +366,20 @@ class Client(QThread):
             self.selected_server = self.discovered_servers[index]
 
     def connect_to_server(self):
-        if len(self.discovered_servers) == 0:
-            self.discover_servers()
+        """Dispatch the (blocking) connection handshake onto the thread pool so the
+        UI thread is never blocked while sockets connect and authenticate."""
+        self.thread_pool.start(FunctionWorker(self._connect_to_server_impl))
 
-        if self.selected_server == {}:
-            self.log_message.emit(
-                "warn",
-                "No server selected. Automatically connecting to an available server.",
-            )
+    def _connect_to_server_impl(self):
+        # Pick a server if none has been explicitly selected
+        if not self.selected_server:
             if len(self.discovered_servers) == 0:
                 self.log_message.emit("error", "No valid servers available.")
                 return
-            else:
-                self.selected_server = self.discovered_servers[0]
-                self.log_message.emit(
-                    "info", f"Connecting to server: {self.selected_server}"
-                )
+            self.selected_server = self.discovered_servers[0]
+            self.log_message.emit(
+                "info", f"Connecting to server: {self.selected_server.get('ip')}"
+            )
 
         try:
             # Connect to control server - close pre-existing connections
@@ -321,42 +397,62 @@ class Client(QThread):
             # Perform authentication handshake over the connected control socket
             server_info = self._authenticate_with_server(self.control_socket)
 
-            # Update selected_server with returned info
-            if server_info:
-                # Connect data - close pre-existing connections
-                if self.data_socket:
+            # Authentication failed - do not enter a connected state
+            if not server_info:
+                raise AuthenticationError("Authentication with server failed")
+
+            # Connect data socket - close pre-existing connections
+            if self.data_socket:
+                with contextlib.suppress(Exception):
                     self.data_socket.close()
 
-                self.data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.data_socket.settimeout(5)
-                self.data_socket.connect((self.selected_server["ip"], self.data_port))
+            self.data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.data_socket.settimeout(5)
+            self.data_socket.connect((self.selected_server["ip"], self.data_port))
+            self.data_connected = True
 
-                # Update server info
-                self.selected_server.update(server_info)
+            # Start the long-lived data receiver for the whole session. Streaming
+            # start/stop only toggles whether the server sends; the socket and this
+            # receiver stay up until disconnect.
+            self._start_data_streamer()
+
+            # Update server info and data sources
+            self.selected_server.update(server_info)
+            self.data_sources = server_info.get("data_sources", None)
 
             # Once everything succeeds, update the status
             self.status = ClientStatus.SERVER_CONNECTED
             self.server_connected.emit(True)
-    
-            # Since the connection has completed successfully, we update data sources 
-            # using server info 
-            self.data_sources = server_info.get('data_sources', None)
         except Exception as e:
             # Reset status
-            self.status = ClientStatus.DEFAULT
+            self.status = ClientStatus.SERVER_DISCONNECTED
 
-            # Reset sockets
+            # Stop the receiver (if any) and reset sockets
+            self._stop_data_streamer()
             with contextlib.suppress(Exception):
-                self.control_socket.close()
+                if self.control_socket:
+                    self.control_socket.close()
             self.control_socket = None
             with contextlib.suppress(Exception):
-                self.data_socket.close()
+                if self.data_socket:
+                    self.data_socket.close()
             self.data_socket = None
+            self.data_connected = False
 
-            # Log message in UI
+            # Log message in UI and notify listeners of failure
             self.log_message.emit("error", f"Server connection failed: {e}")
+            self.server_disconnected.emit(True)
 
     def disconnect_from_server(self):
+        # Stop the long-lived data receiver before closing the socket it reads
+        self._stop_data_streamer()
+
+        # Stop any client-side saving in progress
+        if self.data_saver is not None:
+            with contextlib.suppress(Exception):
+                self.data_saver.stop_saving()
+            self.data_saver = None
+
         # Locks for concurrency
         with self._control_lock:
             if self.control_socket:
@@ -369,6 +465,7 @@ class Client(QThread):
                     self.data_socket.close()
                 self.data_socket = None
 
+        self.data_connected = False
         self.status = ClientStatus.SERVER_DISCONNECTED
 
         try:
@@ -379,6 +476,8 @@ class Client(QThread):
         self.log_message.emit("info", "Disconnected from server")
 
     ### Device Commands
+    def discover_devices(self):
+        self.initialize_devices(only_discover=True)
     def initialize_devices(self, only_discover: bool = False):
         # Avoid starting another discovery while one is active
         if self._discovering_devices:
@@ -398,18 +497,13 @@ class Client(QThread):
 
         def _on_finished(group_status_dict):
             """
-            Server response for discovered groups follows the convention -
-            'group_id': {
-                'device_id': {
-                    'status': DeviceStatus
-                }
-            }
+            The server reports device states as a flat mapping:
+                { device_id (== group_id): DeviceStatus value }
 
-            Note that the response will only contain keys for device groups
-            that were requested in the provided payload. If no groups were
-            specified, nothing will be printed out.
+            The response only contains keys for device groups that were requested
+            in the provided payload.
             """
-            if not group_status_dict or not is_dict_of_dicts(group_status_dict):
+            if not group_status_dict or not isinstance(group_status_dict, dict):
                 self._discovering_devices = False
 
                 if len(self.group_configs) > 0: 
@@ -438,8 +532,7 @@ class Client(QThread):
         if self.status is ClientStatus.STREAMING:
             self.stop_streaming()
 
-        response = send_command(
-            sock=self.control_socket, command=Command.DISCONNECT_DEVICES
+        response = self._send_command_locked( command=Command.DISCONNECT_DEVICES
         )
         resp_type, resp_payload = parse_and_validate_response(response)
 
@@ -450,64 +543,117 @@ class Client(QThread):
             msg = resp_payload.get("message", "")
             self.log_message.emit("error", f"Disconnect failed: {msg}")
 
+    # Data receiver lifecycle (long-lived for the whole session)
+    def _start_data_streamer(self):
+        """Start the long-lived data receiver bound to the session data socket.
+        Idempotent: any previous receiver is stopped first."""
+        if self.data_socket is None:
+            return
+        self._stop_data_streamer()
+        self.data_streamer = DataStreamer(data_conn=self.data_socket)
+        self.data_streamer.data_received.connect(self._handle_received_data)
+        self.data_streamer.log_message.connect(self.log_message)
+        self.data_streamer.start()
+
+    def _stop_data_streamer(self):
+        if self.data_streamer is not None:
+            with contextlib.suppress(Exception):
+                self.data_streamer.stop()
+                # Give the receive loop time to exit its (timed) recv cleanly
+                self.data_streamer.wait(2000)
+            self.data_streamer = None
+
     # Data streaming handlers
     def start_streaming(self):
+        """Dispatch the streaming start (blocking control RPC + socket setup) onto
+        the thread pool to keep the UI responsive."""
+        self.thread_pool.start(FunctionWorker(self._start_streaming_impl))
+
+    def _start_streaming_impl(self):
         if self._discovering_devices:
             self.log_message.emit(
                 "warning", "Cannot start streaming while device discovery is in progress"
             )
             return False
 
+        if not self.control_socket:
+            self.log_message.emit("error", "Cannot start streaming: not connected to a server")
+            return False
+
         self.log_message.emit("info", "Attempting to start data streaming...")
         self.control_socket.settimeout(10)
-        response = send_command(
-            sock=self.control_socket,
+        response = self._send_command_locked(
             command=Command.START_STREAMING,
-            params={
-                "save_config": self.experiment_config.get_save_config(),
-                "display_config": self.experiment_config.get_display_config(),
-            },
+            params=self.config.to_dict(),
         )
         resp_type, resp_payload = parse_and_validate_response(response)
 
         if resp_type == Response.SUCCESS.name:
-            # Enter streaming state; data socket will be connected by run() or here
             self.status = ClientStatus.STREAMING
             self.log_message.emit("info", "Data streaming started")
-            try:
-                # Try to ensure data connection immediately
-                if not self.data_connected:
-                    if not self.data_socket:
-                        self.data_socket = socket.socket(
-                            socket.AF_INET, socket.SOCK_STREAM
-                        )
 
-                    self.data_socket.settimeout(10)
-                    self.data_socket.connect(
-                        (self.selected_server.get("ip"), self.data_port)
-                    )
-                    self.data_connected = True
-            except Exception as e:
-                self.log_message.emit("error", f"Data connection failed: {e}")
+            # The data socket is opened once per session at connect time and the
+            # server keeps a single data connection for the whole session. We must
+            # NOT tear it down on stop/restart (doing so left the server sending on
+            # a dead socket -> "connection reset by peer"). Just make sure the
+            # long-lived receiver is running on the existing socket.
+            if not self.data_connected:
+                self.log_message.emit(
+                    "warning",
+                    "Data connection not established; reconnect to the server.",
+                )
+            elif self.data_streamer is None or not self.data_streamer.isRunning():
+                self._start_data_streamer()
 
-            # Start data streamer streamer
-            self.data_streamer = DataStreamer(data_conn=self.data_socket)
-            self.data_streamer.data_received.connect(self._handle_received_data)
-            self.data_streamer.start()
+            # Set up client-side saving (full-rate) if enabled
+            self._start_saving()
 
             # Emit success
             self.streaming_started.emit(True)
             self.log_message.emit("debug", "Streaming started successfully")
         else:
-            msg = resp_payload.get("message", "")
+            msg = resp_payload.get("message", "") if resp_payload else ""
             self.log_message.emit("error", f"Failed to start streaming: {msg}")
 
-    def _handle_received_data(self, source, data):
-        # Forwards received (source, data) to UI for display
-        # Any processing is expected to be done in DataStreamer
-        self.data_received.emit(source, data)
+    def _start_saving(self):
+        """Create and start the client-side disk writer if saving is enabled."""
+        self.data_saver = None
+        if not self.enable_save:
+            return
+
+        save_dir = self.save_dir or os.getcwd()
+        file_name = self.file_name or "bioview_recording"
+        if not os.path.splitext(file_name)[1]:
+            file_name = f"{file_name}.bvr"
+
+        try:
+            save_path = get_unique_path(save_dir, file_name)
+            sources = self.data_sources or []
+            self.data_saver = DataSaver(
+                save_path=save_path,
+                sources=sources,
+                log_signal=self.log_message,
+            )
+            self.data_saver.start_saving()
+        except Exception as e:
+            self.data_saver = None
+            self.log_message.emit("error", f"Unable to start saving: {e}")
+
+    def _handle_received_data(self, data, sources=None):
+        # Tee the full-rate chunk: one branch to disk, one to the UI for display.
+        # Use the per-chunk source list when present (more robust for multi-device),
+        # falling back to the data sources advertised at connection time.
+        if self.data_saver is not None:
+            self.data_saver.add(data)
+
+        chunk_sources = sources if sources else self.data_sources
+        self.data_received.emit(data, chunk_sources)
 
     def stop_streaming(self):
+        """Dispatch the streaming stop onto the thread pool to keep the UI responsive."""
+        self.thread_pool.start(FunctionWorker(self._stop_streaming_impl))
+
+    def _stop_streaming_impl(self):
         if self._discovering_devices:
             self.log_message.emit(
                 "warning", "Cannot stop streaming while device discovery is in progress"
@@ -516,24 +662,25 @@ class Client(QThread):
 
         self.log_message.emit("debug", "Attempting to stop streaming...")
 
-        self.control_socket.settimeout(10)
-        response = send_command(sock=self.control_socket, command=Command.STOP_STREAMING)
+        if self.control_socket:
+            self.control_socket.settimeout(10)
+        response = self._send_command_locked( command=Command.STOP_STREAMING)
         resp_type, resp_payload = parse_and_validate_response(response)
 
         if resp_type == Response.ERROR.name:
-            msg = f'Failed to stop streaming: {resp_payload.get('message', '')}'
+            err = resp_payload.get("message", "") if resp_payload else ""
+            msg = f"Failed to stop streaming: {err}"
             self.log_message.emit("error", msg)
 
-        # Stop receiving data regardless
-        if self.data_socket:
-            with contextlib.suppress(Exception):
-                self.data_socket.close()
-            self.data_socket = None
-            self.data_connected = False
+        # Intentionally keep the data socket AND the receiver alive for the whole
+        # session. The server pauses its backends on stop (it stops sending) but
+        # keeps the same per-session data connection, so closing it here is what
+        # previously broke restart. The receiver simply idles until data resumes.
 
-        # Stop stream worker
-        if self.data_streamer:
-            self.data_streamer.stop()
+        # Stop client-side saving and flush to disk
+        if self.data_saver is not None:
+            self.data_saver.stop_saving()
+            self.data_saver = None
 
         # Update status
         self.status = ClientStatus.DEVICES_CONNECTED
@@ -554,8 +701,7 @@ class Client(QThread):
             return False
 
         self.log_message.emit("info", "Configuring device: {device_id}")
-        response = send_command(
-            sock=self.control_socket,
+        response = self._send_command_locked(
             command=Command.UPDATE_RUNNING_PARAMETER,
             params={"id": device_id, "config": config},
         )

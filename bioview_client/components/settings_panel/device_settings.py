@@ -1,6 +1,6 @@
 from bioview_common import Configuration, DeviceType
 from PyQt6.QtCore import pyqtSignal
-from PyQt6.QtWidgets import QDoubleSpinBox, QGridLayout, QGroupBox, QLabel
+from PyQt6.QtWidgets import QDoubleSpinBox, QGridLayout, QGroupBox, QLabel, QSpinBox
 
 
 class DeviceSettingsPanel(QGroupBox):
@@ -14,6 +14,11 @@ class DeviceSettingsPanel(QGroupBox):
         self.device_configuration = device_configuration
         self.device_name = device_configuration.get_param("device_name", "Device")
 
+    def get_emittable_signals(self):
+        return {
+            "update_device_param": self.update_device_param
+        }
+    
     # Parameter updates should be taken care of by the Configuration object since it is shared
     def update_param(self, param, value, idx=None):
         # We may have lists here, these need to be handled correctly
@@ -112,10 +117,13 @@ class USRPSettingsPanel(DeviceSettingsPanel):
             input_widgets = []
 
             for col, value in enumerate(values):
-                # Make current value an integer
-                display_value = (
-                    value / multiplier if isinstance(value, (int, float)) else value
-                )
+                # A param may be missing from a partial config (value is None) or
+                # otherwise non-numeric. Fall back to the range minimum so the spin
+                # box still constructs instead of crashing on setValue(None).
+                if isinstance(value, (int, float)):
+                    display_value = value / multiplier
+                else:
+                    display_value = min_val
 
                 # Make widget
                 widget = QDoubleSpinBox()
@@ -126,7 +134,6 @@ class USRPSettingsPanel(DeviceSettingsPanel):
 
                 # Connect signal
                 idx = col if len(values) > 1 else None
-                val = value * multiplier
                 widget.valueChanged.connect(
                     lambda val, param_name=param_name, idx=idx: self.update_param(
                         param_name=param_name, value=val, idx=idx
@@ -147,9 +154,62 @@ class BIOPACSettingsPanel(DeviceSettingsPanel):
         super().__init__(device_configuration, parent)
 
 
+class DummySettingsPanel(DeviceSettingsPanel):
+    """Settings for the virtual sine-wave device. Sampling rate and channel count
+    are init-time parameters; signal frequency / amplitude / noise can be tweaked
+    live for testing convenience."""
+
+    def __init__(self, device_configuration, parent=None):
+        super().__init__(device_configuration, parent)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QGridLayout()
+        self.param_inputs = {}
+
+        # (param, label, range, step, decimals); decimals == 0 -> integer spin box
+        param_specs = [
+            ("samp_rate", "Sample Rate (Hz)", (1, 1000000), 100, 0),
+            ("num_channels", "Channels", (1, 64), 1, 0),
+            ("signal_freq", "Signal Freq. (Hz)", (0.01, 10000.0), 0.1, 2),
+            ("amplitude", "Amplitude", (0.0, 1000.0), 0.1, 2),
+            ("noise_std", "Noise Std-Dev", (0.0, 100.0), 0.1, 2),
+            ("chunk_duration", "Chunk Duration (s)", (0.001, 1.0), 0.01, 3),
+        ]
+
+        for row, (param_name, label_text, (min_val, max_val), step, decimals) in enumerate(param_specs):
+            layout.addWidget(QLabel(label_text), row, 0)
+
+            value = self.device_configuration.get_param(param_name)
+
+            if decimals == 0:
+                widget = QSpinBox()
+                widget.setRange(int(min_val), int(max_val))
+                widget.setSingleStep(int(step))
+                widget.setValue(int(value) if isinstance(value, (int, float)) else int(min_val))
+            else:
+                widget = QDoubleSpinBox()
+                widget.setRange(float(min_val), float(max_val))
+                widget.setDecimals(decimals)
+                widget.setSingleStep(float(step))
+                widget.setValue(float(value) if isinstance(value, (int, float)) else float(min_val))
+
+            widget.valueChanged.connect(
+                lambda val, param_name=param_name: self.update_param(
+                    param_name=param_name, value=val
+                )
+            )
+
+            layout.addWidget(widget, row, 1)
+            self.param_inputs[param_name] = widget
+
+        self.setLayout(layout)
+
+
 settings_panel_generators = {
     DeviceType.USRP: USRPSettingsPanel,
     DeviceType.BIOPAC: BIOPACSettingsPanel,
+    DeviceType.DUMMY: DummySettingsPanel,
 }
 
 
