@@ -387,7 +387,7 @@ class DeviceDiscoveryClient(QMainWindow):
         event.accept()
 
 
-if __name__ == "__main__":
+def run_configurator(argv=None) -> int:
     app = QApplication(sys.argv)
 
     # Create and show main window
@@ -402,4 +402,12 @@ if __name__ == "__main__":
         "warning", "Make sure a compatible backend server is running!"
     )
 
-    sys.exit(app.exec())
+    return app.exec()
+
+
+def main(argv=None) -> int:
+    return run_configurator(argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

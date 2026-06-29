@@ -16,6 +16,12 @@ dependencies = [
     "darkdetect (>=0.7.1, <0.8.0)",
 ]
 
+[project.scripts]
+# Primary launcher: starts a hidden localhost server, then opens the Monitor GUI
+bioview = "bioview_client.launch:main"
+bioview-monitor = "bioview_client.launch:main"
+bioview-configurator = "bioview_client.configurator:main"
+
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]

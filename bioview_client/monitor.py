@@ -608,9 +608,7 @@ class BioViewMonitor(QMainWindow):
         self.command_bar.update_button_states(client_status)
 
 
-if __name__ == "__main__":
-    import qdarktheme  # Provide consistent styling across all OSes
-
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Launch BioView Monitor UI")
     parser.add_argument(
         "--config-file",
@@ -630,8 +628,19 @@ if __name__ == "__main__":
         action="store_true",
         help="Automatically connect to first discovered (usually localhost) server",
     )
+    return parser
 
-    args = parser.parse_args()
+
+def run_monitor(argv=None) -> int:
+    """Build the Qt application, show the monitor window, and run the event loop.
+
+    Shared by ``python -m bioview_client.monitor`` and the ``bioview`` launcher so
+    both entry points behave identically. Returns the Qt exit code (does not call
+    ``sys.exit`` itself, so callers can perform cleanup afterwards)."""
+    import qdarktheme  # Provide consistent styling across all OSes
+
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
 
     qdarktheme.enable_hi_dpi()
     app = QApplication(sys.argv)
@@ -719,4 +728,8 @@ if __name__ == "__main__":
 
         handler.discover_servers()
 
-    sys.exit(app.exec())
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(run_monitor())
