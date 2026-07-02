@@ -17,7 +17,7 @@ from typing import Dict, List
 
 from bioview_common import ClientStatus, DataSource, DeviceStatus, ExperimentConfiguration, parse_configuration_file, SUPPORTED_CONFIGURATION_TYPES
 from PyQt6.QtCore import QTimer, Qt
-from PyQt6.QtGui import QGuiApplication, QIcon
+from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import (
     QApplication,
     QDialog,
@@ -38,6 +38,8 @@ from bioview_client.components import (
     SettingsPanel,
     StatusBar,
 )
+from bioview_client.assets import APP_DESKTOP_NAME, get_app_icon
+from bioview_client.components.common import Toast
 from bioview_client.handler import Client
 
 class BioViewMonitor(QMainWindow):
@@ -138,10 +140,10 @@ class BioViewMonitor(QMainWindow):
     def _init_ui(self):
         # Define main wndow
         self.setWindowTitle("BioView Data Monitor")
-        # TODO: Make path agnostic
-        iconDir = Path(__file__).resolve().parent.parent / "docs" / "assets" / "icon.png"
-
-        self.setWindowIcon(QIcon(str(iconDir)))
+        # Window title-bar icon. On Windows and KDE this shows in the title bar;
+        # GNOME and macOS ignore per-window icons and use the app/.desktop icon
+        # instead, which is set application-wide in run_monitor().
+        self.setWindowIcon(get_app_icon())
         screen = QGuiApplication.primaryScreen().geometry()
         width = screen.width()
         height = screen.height()
@@ -180,8 +182,10 @@ class BioViewMonitor(QMainWindow):
         self.log_display_panel = LogDisplayPanel(logger=self.logger)
         self.meta_panels.addWidget(self.log_display_panel, stretch=3)
 
-        # Annotation Panel
-        self.annotate_event_panel = AnnotateEventPanel(self.experiment_config)
+        # Annotation Panel. Annotations are stored centrally in the active
+        # recording's .bvr file (not in per-annotation sidecar files), so the
+        # panel just emits the text and the monitor routes it to the client.
+        self.annotate_event_panel = AnnotateEventPanel()
         self.meta_panels.addWidget(self.annotate_event_panel, stretch=2)
         top_layout.addLayout(self.meta_panels, stretch=2)
 
@@ -246,6 +250,13 @@ class BioViewMonitor(QMainWindow):
         self._connect_command_bar_signals()
         self._connect_settings_panel_signals()
         self._connect_statusbar_signals()
+        self._connect_annotation_signals()
+
+    def _connect_annotation_signals(self):
+        """Wire the Mark Events panel to the client so annotations are stored in
+        the active recording, and surface its log events in the experiment log."""
+        self.annotate_event_panel.annotation_requested.connect(self.on_annotation_requested)
+        self.annotate_event_panel.log_event.connect(self.log_display_panel.log_message)
 
     def _handle_server_connection_request(self, server_info: dict):
         """Handle server connect requests from the UI"""
@@ -438,10 +449,61 @@ class BioViewMonitor(QMainWindow):
         # Request server to connect all initialized devices
         self.client_worker.initialize_devices()
 
+    def _show_toast(self, message: str, level: str = "info"):
+        """Show a transient toast notification overlaid on the main window."""
+        with contextlib.suppress(Exception):
+            Toast.show_message(self, message, level=level)
+
+    def _warn_missing_save_target(self) -> bool:
+        """If the user has not provided both a file name and a save folder, warn
+        via a toast and return True (i.e. the save target is missing)."""
+        if self.client_worker and self.client_worker.has_valid_save_target():
+            return False
+        self._show_toast(
+            "Provide a file name and a save folder before saving or marking events.",
+            level="warning",
+        )
+        self.log_display_panel.log_message(
+            "warning",
+            "Cannot save: a file name and a save folder are both required.",
+        )
+        return True
+
     def update_save_state(self, enabled: bool = True):
+        # Enabling saving requires a file name + folder. If either is missing,
+        # warn the user and revert the checkbox so state stays consistent.
+        if enabled and self._warn_missing_save_target():
+            with contextlib.suppress(Exception):
+                self.command_bar.save_checkbox.setChecked(False)
+            self.saving_status = False
+            if self.client_worker:
+                self.client_worker.set_save_enabled(False)
+            return
+
         self.saving_status = bool(enabled)
         if self.client_worker:
             self.client_worker.set_save_enabled(bool(enabled))
+
+    def on_annotation_requested(self, text: str):
+        """Store a "Mark Event" annotation in the active recording's .bvr file.
+
+        Guards: a file name + folder must be set (otherwise nothing can be saved),
+        and a recording must be active (annotations attach to a recording)."""
+        if self._warn_missing_save_target():
+            return
+
+        if not self.client_worker or not self.client_worker.record_annotation(text):
+            self._show_toast(
+                "Start a recording before marking events.", level="warning"
+            )
+            self.log_display_panel.log_message(
+                "warning", "No active recording to attach the annotation to."
+            )
+            return
+
+        self.annotate_event_panel.clear_annotation()
+        self._show_toast("Event marked.", level="success")
+        self.log_display_panel.log_message("info", f"Marked event: {text}")
 
     # Timed-mode (routine) orchestration
     def _config_base_dir(self) -> Path:
@@ -471,6 +533,11 @@ class BioViewMonitor(QMainWindow):
             self.log_display_panel.log_message(
                 "warning", "Already streaming; stop before starting a routine"
             )
+            self.command_bar.reset_routine_selection()
+            return
+
+        # Timed modes always save, so a valid save target is mandatory here.
+        if self._warn_missing_save_target():
             self.command_bar.reset_routine_selection()
             return
 
@@ -533,6 +600,9 @@ class BioViewMonitor(QMainWindow):
     def handle_start_streaming(self):
         """Start button (unlimited mode): this is not a timed routine, so clear any
         routine label before streaming. Recordings are then named <file name>.bvr."""
+        # If saving is enabled, a valid save target is mandatory before we start.
+        if self.saving_status and self._warn_missing_save_target():
+            return
         self.client_worker.set_save_label(None)
         self.client_worker.start_streaming()
 
@@ -644,6 +714,13 @@ def run_monitor(argv=None) -> int:
 
     qdarktheme.enable_hi_dpi()
     app = QApplication(sys.argv)
+    # Application-wide branding: the app icon (dock/taskbar + GNOME/macOS window
+    # icon) and the desktop-file association Wayland/KDE use to pick the launcher
+    # icon for the running window.
+    app.setApplicationName("BioView")
+    app.setApplicationDisplayName("BioView Data Monitor")
+    app.setDesktopFileName(APP_DESKTOP_NAME)
+    app.setWindowIcon(get_app_icon())
     qdarktheme.setup_theme(theme="dark")
 
     # Create and show main window with parsed configs and flags

@@ -209,6 +209,24 @@ class Client(QThread):
         if self.data_saver is not None:
             self.data_saver.record_change(device_id, param, value)
 
+    def has_valid_save_target(self) -> bool:
+        """Whether the user has provided both a file name and a save folder, which
+        are required before any recording (or annotation) can be written to disk."""
+        return bool((self.file_name or "").strip()) and bool((self.save_dir or "").strip())
+
+    def is_recording(self) -> bool:
+        """Whether a client-side recording is currently active."""
+        return self.data_saver is not None
+
+    def record_annotation(self, text: str) -> bool:
+        """Store an event annotation ("Mark Event") in the active recording's
+        .bvr metadata (under the ``Annotations`` key). Returns True if it was
+        recorded, or False if there is no active recording to attach it to."""
+        if self.data_saver is None:
+            return False
+        self.data_saver.record_annotation(text)
+        return True
+
     @staticmethod
     def _build_configuration(experiment_config, group_configs) -> Configuration:
         """Merge a separate experiment config and per-device group configs into a

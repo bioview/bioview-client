@@ -260,10 +260,12 @@ class DataSaver(threading.Thread):
 
     The JSON header records dtype, layout, the ordered source descriptors, the
     recording start time, and a snapshot of device configuration constants. The
-    trailer (written when the recording closes) records the end time and any
-    timestamped device-parameter changes made while recording. A reader locates
-    the trailer via the magic + length at EOF; the sample region is everything
-    between the header and the trailer."""
+    trailer (written when the recording closes) records the end time, any
+    timestamped device-parameter changes, and any event annotations ("Mark
+    Event") made while recording -- all stored centrally in this one file rather
+    than in per-annotation sidecar files. A reader locates the trailer via the
+    magic + length at EOF; the sample region is everything between the header and
+    the trailer."""
 
     def __init__(self, save_path, sources=None, device_config=None, log_signal=None):
         super().__init__(daemon=True)
@@ -279,6 +281,9 @@ class DataSaver(threading.Thread):
         # Timestamped device-parameter changes recorded during this run
         self._changes = []
         self._changes_lock = threading.Lock()
+        # Timestamped event annotations ("Mark Event") recorded during this run
+        self._annotations = []
+        self._annotations_lock = threading.Lock()
         self._start_time = None
 
     def _log(self, level, msg):
@@ -335,14 +340,34 @@ class DataSaver(threading.Thread):
         with self._changes_lock:
             self._changes.append(entry)
 
+    def record_annotation(self, text: str) -> dict:
+        """Append a timestamped event annotation to the recording's metadata
+        trailer (stored under the ``Annotations`` key of the .bvr file). Returns
+        the stored entry."""
+        now = datetime.now()
+        elapsed = None
+        if self._start_time is not None:
+            elapsed = (now - self._start_time).total_seconds()
+        entry = {
+            "timestamp": now.isoformat(),
+            "elapsed_seconds": elapsed,
+            "text": str(text),
+        }
+        with self._annotations_lock:
+            self._annotations.append(entry)
+        return entry
+
     def _write_trailer(self):
         if self._file is None:
             return
         with self._changes_lock:
             changes = list(self._changes)
+        with self._annotations_lock:
+            annotations = list(self._annotations)
         trailer = {
             "end_time": datetime.now().isoformat(),
             "param_changes": changes,
+            "Annotations": annotations,
         }
         trailer_bytes = json.dumps(trailer, default=str).encode("utf-8")
         self._file.write(trailer_bytes)

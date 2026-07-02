@@ -1,11 +1,10 @@
 # UI for device discovery
 import sys
 import time
-from pathlib import Path
 
 from bioview_common import APP_VERSION
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QFont, QGuiApplication, QIcon, QTextCursor
+from PyQt6.QtGui import QFont, QGuiApplication, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
     QDialog,
@@ -25,6 +24,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from bioview_client.assets import APP_DESKTOP_NAME, get_app_icon
 from bioview_client.handler import Client
 
 
@@ -287,9 +287,7 @@ class DeviceDiscoveryClient(QMainWindow):
 
     def init_ui(self):
         self.setWindowTitle("BioView Device Discovery")
-        iconDir = Path(__file__).resolve().parent.parent / "docs" / "assets" / "icon.png"
-
-        self.setWindowIcon(QIcon(str(iconDir)))
+        self.setWindowIcon(get_app_icon())
         screen = QGuiApplication.primaryScreen().geometry()
         width = screen.width()
         height = screen.height()
@@ -389,6 +387,10 @@ class DeviceDiscoveryClient(QMainWindow):
 
 def run_configurator(argv=None) -> int:
     app = QApplication(sys.argv)
+    app.setApplicationName("BioView")
+    app.setApplicationDisplayName("BioView Device Discovery")
+    app.setDesktopFileName(APP_DESKTOP_NAME)
+    app.setWindowIcon(get_app_icon())
 
     # Create and show main window
     window = DeviceDiscoveryClient()

@@ -1,5 +1,3 @@
-from datetime import datetime
-
 import qtawesome as qta
 from PyQt6.QtWidgets import QGroupBox, QHBoxLayout, QPlainTextEdit, QToolButton
 from PyQt6.QtCore import Qt, pyqtSignal, QEvent
@@ -8,11 +6,13 @@ from bioview_client.constants import get_qcolor
 
 class AnnotateEventPanel(QGroupBox):
     log_event = pyqtSignal(str, str)
+    # Emitted with the annotation text when the user marks an event. The monitor
+    # validates the save target and forwards it to the active recording so it is
+    # stored centrally in the .bvr file's "Annotations" metadata.
+    annotation_requested = pyqtSignal(str)
 
-    def __init__(self, log_path, parent=None):
+    def __init__(self, parent=None):
         super().__init__("Mark Events", parent)
-
-        self.log_path = log_path
 
         layout = QHBoxLayout()
         self.annotation_box = QPlainTextEdit(self)
@@ -45,17 +45,16 @@ class AnnotateEventPanel(QGroupBox):
         return super().event(event)
 
     def record_annotation(self):
-        # Get current time, add to text file
-        try:
-            annotation = self.annotation_box.toPlainText()
-            if not annotation.strip():  # Check if the text is empty or just whitespace
-                self.log_event.emit("debug", "No text to append")
+        """Emit the current annotation text for the monitor to store in the
+        active recording. The box is only cleared once the monitor confirms the
+        annotation was accepted (see clear_annotation)."""
+        annotation = self.annotation_box.toPlainText().strip()
+        if not annotation:
+            self.log_event.emit("warning", "Enter some text before marking an event")
+            return
 
-            with open(self.log_path, "a") as f:
-                f.write(
-                    f"{datetime.now().strftime('%d-%m-%Y %H:%M:%S')} - {annotation}\n"
-                )
+        self.annotation_requested.emit(annotation)
 
-            self.annotation_box.clear()
-        except Exception as e:
-            self.log_event.emit("error", f"An error occurred: {e}")
+    def clear_annotation(self):
+        """Clear the text box after a successful annotation."""
+        self.annotation_box.clear()
