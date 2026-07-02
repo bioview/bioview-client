@@ -1,6 +1,6 @@
 [project]
 name = "bioview-client"
-version = "0.9.3.9"
+version = "0.9.3.9debug"
 description = "A front-end for real-time visualization of data acquired by the BioView server"
 authors = [
     {name = "Aakash Kapoor",email = "113218196+meowkash@users.noreply.github.com"}
