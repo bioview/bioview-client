@@ -30,7 +30,9 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest
+          # bioview_common re-exports preprocess helpers that import scipy at
+          # package load time; numpy is required by the .bvr test helpers too.
+          pip install pytest numpy scipy
           # The client depends on bioview-common (a separate repo). Install it
           # from the same source the installer uses (see build.toml).
           pip install "bioview-common @ git+https://github.com/bioview/bioview-common.git@main"
