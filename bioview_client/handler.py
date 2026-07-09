@@ -503,10 +503,8 @@ class Client(QThread):
             self.data_socket.connect((self.selected_server["ip"], self.data_port))
             self.data_connected = True
 
-            # Start the long-lived data receiver for the whole session. Streaming
-            # start/stop only toggles whether the server sends; the socket and this
-            # receiver stay up until disconnect.
-            self._start_data_streamer()
+            # Data receiver starts after devices are initialized (see
+            # _start_data_streamer_after_init), not on bare server connect.
 
             # Update server info and data sources
             self.selected_server.update(server_info)
@@ -576,7 +574,20 @@ class Client(QThread):
             self.log_message.emit("warn", "Device discovery already in progress")
             return
 
+        if self.status < ClientStatus.SERVER_CONNECTED:
+            self.log_message.emit(
+                "warning", "Connect to a server before initializing devices"
+            )
+            return
+
+        if not self.config.devices:
+            self.log_message.emit(
+                "warning", "No device configuration loaded to initialize"
+            )
+            return
+
         self._discovering_devices = True
+        self.group_configs = self.config.to_dict()
 
         if only_discover:
             cmd = Command.DISCOVER_DEVICES
@@ -598,8 +609,11 @@ class Client(QThread):
             if not group_status_dict or not isinstance(group_status_dict, dict):
                 self._discovering_devices = False
 
-                if len(self.group_configs) > 0: 
-                    self.log_message.emit("warning", f"Invalid response received")
+                if self.config.devices:
+                    self.log_message.emit(
+                        "warning",
+                        "Device command failed: no status returned from server",
+                    )
                 return
 
             self.device_states = group_status_dict
@@ -610,6 +624,7 @@ class Client(QThread):
                 self.devices_discovered.emit(self.device_states)
             else:
                 self.status = ClientStatus.DEVICES_CONNECTED
+                self._start_data_streamer_after_init()
                 self.device_init_succeeded.emit(self.device_states)
 
             self._discovering_devices = False
@@ -636,6 +651,12 @@ class Client(QThread):
             self.log_message.emit("error", f"Disconnect failed: {msg}")
 
     # Data receiver lifecycle (long-lived for the whole session)
+    def _start_data_streamer_after_init(self):
+        """Start the data receiver once devices are initialized and the data socket exists."""
+        if not self.data_connected or self.data_socket is None:
+            return
+        self._start_data_streamer()
+
     def _start_data_streamer(self):
         """Start the long-lived data receiver bound to the session data socket.
         Idempotent: any previous receiver is stopped first."""
@@ -807,7 +828,7 @@ class Client(QThread):
             )
             return False
 
-        self.log_message.emit("info", "Configuring device: {device_id}")
+        self.log_message.emit("info", f"Configuring device: {device_id}")
         response = self._send_command_locked(
             command=Command.UPDATE_RUNNING_PARAMETER,
             params={"id": device_id, "config": config},
@@ -824,6 +845,27 @@ class Client(QThread):
             self.log_message.emit("debug", f"Failed to update parameter: {msg}")
             # TODO: Update UI
             return False
+
+    def run_dpic_balance(self, device_id: str):
+        if self._discovering_devices:
+            self.log_message.emit(
+                "warning",
+                "Cannot run DPIC balance while device discovery is in progress",
+            )
+            return False
+
+        self.log_message.emit("info", f"Running DPIC balance for {device_id}")
+        response = self._send_command_locked(
+            command=Command.RUN_DPIC_BALANCE,
+            params={"id": device_id},
+        )
+        resp_type, resp_payload = parse_and_validate_response(response)
+        if resp_type == Response.SUCCESS.name:
+            self.log_message.emit("info", "DPIC balance completed")
+            return True
+        msg = resp_payload.get("message", "DPIC balance failed")
+        self.log_message.emit("error", msg)
+        return False
 
     # Client function for PyQt loops
     def start_client(self):

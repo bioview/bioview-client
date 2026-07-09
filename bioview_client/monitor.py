@@ -156,8 +156,13 @@ class BioViewMonitor(QMainWindow):
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
 
+        from PyQt6.QtWidgets import QSplitter, QSizePolicy
+        splitter = QSplitter(Qt.Orientation.Vertical)
+
         # Top shelf container
-        top_layout = QHBoxLayout()
+        top_widget = QWidget()
+        top_layout = QHBoxLayout(top_widget)
+        top_layout.setContentsMargins(0, 0, 0, 0)
 
         # All controls are in one container
         controls_layout = QVBoxLayout()
@@ -189,12 +194,23 @@ class BioViewMonitor(QMainWindow):
         self.meta_panels.addWidget(self.annotate_event_panel, stretch=2)
         top_layout.addLayout(self.meta_panels, stretch=2)
 
-        main_layout.addLayout(top_layout)
-
         # Plot Grid
         self.plot_grid = PlotGrid(self.experiment_config)
-        main_layout.addWidget(self.plot_grid)
+        
+        # Enforce plot heights (50% to 60% of the initial window height)
+        window_height = int(0.8 * height)
+        self.plot_grid.setMinimumHeight(int(0.5 * window_height))
+        self.plot_grid.setMaximumHeight(int(0.6 * window_height))
+        
+        # Add to splitter
+        splitter.addWidget(top_widget)
+        splitter.addWidget(self.plot_grid)
+        
+        # Give plots priority to expand
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
 
+        main_layout.addWidget(splitter)
         central_widget.setLayout(main_layout)
 
         # Status Bar
@@ -302,7 +318,11 @@ class BioViewMonitor(QMainWindow):
                 self.on_device_param_changed
             )
 
-        # Connect logging
+        if getattr(self.settings_panel, "run_dpic_balance", None):
+            self.settings_panel.run_dpic_balance.connect(
+                self.client_worker.run_dpic_balance
+            )
+
         self.settings_panel.log_event.connect(self.log_display_panel.log_message)
         self.plot_grid.log_event.connect(self.log_display_panel.log_message)
 
@@ -338,6 +358,10 @@ class BioViewMonitor(QMainWindow):
         )
 
     def _handle_streaming_status_changed(self, is_streaming: bool):
+        if hasattr(self.settings_panel, "set_streaming_locked"):
+            self.settings_panel.set_streaming_locked(is_streaming)
+        if is_streaming:
+            self.on_streaming_started()
         status = DeviceStatus.STREAMING if is_streaming else DeviceStatus.CONNECTED
 
         # device_status is a flat mapping {group_id: DeviceStatus}
@@ -592,10 +616,15 @@ class BioViewMonitor(QMainWindow):
             self.log_display_panel.log_message("info", f"Routine '{label}' complete")
 
     def on_device_param_changed(self, device_id, param, value):
-        """Forward a UI device-parameter tweak to the client so it is logged (with
-        a timestamp) into any active recording's metadata."""
+        """Forward UI tweaks to the client config snapshot and live backend."""
         if self.client_worker is not None:
             self.client_worker.record_param_change(device_id, param, value)
+
+        if (
+            self.client_worker is not None
+            and self.client_worker.status >= ClientStatus.DEVICES_CONNECTED
+        ):
+            self.client_worker.configure_device(device_id, {param: value})
 
     def handle_start_streaming(self):
         """Start button (unlimited mode): this is not a timed routine, so clear any
@@ -661,7 +690,8 @@ class BioViewMonitor(QMainWindow):
         self.log_display_panel.log_message("warning", "Disconnected from server")
 
     def on_streaming_started(self):
-        pass
+        if hasattr(self.settings_panel, "set_streaming_locked"):
+            self.settings_panel.set_streaming_locked(True)
 
     def update_status_bar_and_buttons(self, device_status: Dict):
         # device_status is a flat mapping {group_id: DeviceStatus value}

@@ -7,6 +7,7 @@ from bioview_common.datatypes import Configuration, SUPPORTED_CONFIGURATION_TYPE
 
 from .common_settings import CommonSettingsPanel
 from .device_settings import USRPSettingsPanel, BIOPACSettingsPanel, DummySettingsPanel
+from .panel_utils import DEFAULT_MAX_PANEL_HEIGHT, wrap_scrollable
 
 SETTINGS_PANEL_MAPPING = {
     SUPPORTED_CONFIGURATION_TYPES.USRP: USRPSettingsPanel,
@@ -16,8 +17,9 @@ SETTINGS_PANEL_MAPPING = {
 }
 
 class SettingsPanel(QTabWidget):
-    update_device_param = pyqtSignal(str, str) # (configuration_id, )
-    device_param_changed = pyqtSignal(str, str, object) # (configuration_id, param, value)
+    update_device_param = pyqtSignal(str, str)
+    device_param_changed = pyqtSignal(str, str, object)
+    run_dpic_balance = pyqtSignal(str)
     log_event = pyqtSignal(str, str)
 
     def __init__(self, configurations):
@@ -35,7 +37,8 @@ class SettingsPanel(QTabWidget):
         for cfg_id, config in configurations.items(): 
             cfg_type = config.get_type() 
             widget = SETTINGS_PANEL_MAPPING[cfg_type](config)
-            self.addTab(widget, f"{cfg_id} Settings") # Add to UI
+            scroll = wrap_scrollable(widget, max_height=DEFAULT_MAX_PANEL_HEIGHT)
+            self.addTab(scroll, f"{cfg_id} Settings") # Add to UI
 
             if cfg_type == SUPPORTED_CONFIGURATION_TYPES.EXPERIMENT:
                 self.experiment_panel = widget
@@ -48,18 +51,20 @@ class SettingsPanel(QTabWidget):
                 widget.cfg_id = cfg_id
                 widget.device_param_changed.connect(self.device_param_changed)
 
-            # Connect signals
+            if hasattr(widget, "run_dpic_balance"):
+                widget.run_dpic_balance.connect(self.run_dpic_balance.emit)
+
             signal_dict = widget.get_emittable_signals()
-            for signal_name, signal_callback in signal_dict.items(): 
-                if signal_name == 'update_device_param': 
-                    # TODO: handle the case for backend updates 
-                    pass
-                
-                # For unique behaviors, just adopt it. 
-                setattr(self, signal_name, signal_callback)
+            for signal_name, signal_callback in signal_dict.items():
+                if signal_name in ("update_device_param", "run_dpic_balance"):
+                    continue
+                if not hasattr(self, signal_name):
+                    setattr(self, signal_name, signal_callback)
 
             # Add widget to dict 
             self.setting_widgets[cfg_id] = widget 
+
+        self.setMaximumHeight(DEFAULT_MAX_PANEL_HEIGHT + 36)
 
         # Add styling
         self.setTabPosition(QTabWidget.TabPosition.South)
@@ -99,3 +104,8 @@ class SettingsPanel(QTabWidget):
 
     def send_to_log(self, level, msg):
         self.log_event.emit(level, msg)
+
+    def set_streaming_locked(self, locked: bool):
+        for widget in self.setting_widgets.values():
+            if hasattr(widget, "set_streaming_locked"):
+                widget.set_streaming_locked(locked)

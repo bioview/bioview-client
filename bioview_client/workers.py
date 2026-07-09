@@ -112,33 +112,44 @@ class DeviceInitWorker(QRunnable):
         device_status = {}
 
         try:
-            # Device discovery can be slow on server side; use a longer timeout
             self.client_ref.control_socket.settimeout(self.timeout)
 
+            device_groups = self.client_ref.config.to_dict()
             response = self.client_ref._send_command_locked(
                 command=self.command,
-                params={
-                    "device_groups": self.client_ref.group_configs,
-                },
+                params={"device_groups": device_groups},
             )
+            if not response:
+                raise ValueError(
+                    "No response from server. Connect to a server and try again."
+                )
 
             resp_type, resp_payload = parse_and_validate_response(response)
+            if not resp_type:
+                raise ValueError("Malformed response from server")
 
-            if resp_type == Response.SUCCESS.name:
-                device_status = resp_payload.get("device_status", {})
-                # Capture the data sources advertised by the server so the UI can
-                # populate the plot-source selector after initialization.
-                data_sources = resp_payload.get("data_sources")
+            if resp_type in (Response.SUCCESS.name, Response.WARNING.name):
+                device_status = (resp_payload or {}).get("device_status", {})
+                data_sources = (resp_payload or {}).get("data_sources")
                 if data_sources is not None:
                     self.client_ref.data_sources = data_sources
+                if resp_type == Response.WARNING.name:
+                    self.client_ref.log_message.emit(
+                        "warning",
+                        f"Device command completed with server warnings: {resp_type}",
+                    )
             elif resp_type == Response.ERROR.name:
-                msg = resp_payload.get("message", "") if resp_payload else ""
-                raise ValueError(f"Invalid device format received: {msg}")
+                msg = (resp_payload or {}).get("message", "Unknown server error")
+                raise ValueError(msg)
+            else:
+                raise ValueError(f"Unexpected response type: {resp_type}")
+
+            if not device_status:
+                raise ValueError("Server returned no device status")
 
             self.signals.finished.emit(device_status)
         except Exception as e:
-            # On error, emit empty dict
-            self.client_ref.log_message.emit("error", f"Device discovery failed: {e}")
+            self.client_ref.log_message.emit("error", f"Device command failed: {e}")
             self.signals.finished.emit({})
 
 
@@ -156,7 +167,7 @@ class DataStreamer(QThread):
     def run(self):
         """Receive real-time data from server"""
         self.running = True
-        self.log_message.emit("debug", "Data receiving thread started")
+        self.log_message.emit("debug", "Data receiver thread started")
 
         # Use a short socket timeout so the loop can periodically re-check
         # self.running and ride out idle periods (e.g. while streaming is paused
