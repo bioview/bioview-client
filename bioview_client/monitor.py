@@ -74,7 +74,9 @@ class BioViewMonitor(QMainWindow):
         self.autodiscover = autodiscover
         self.autoconnect = autoconnect
 
-        self.config_file = config_file 
+        self.config_file = config_file
+        if isinstance(self.config_file, (list, tuple)):
+            self.config_file = self.config_file[0] if self.config_file else None
 
         # If no valid configuration file present, prompt user.
         if not self.config_file: 
@@ -363,15 +365,20 @@ class BioViewMonitor(QMainWindow):
             self.settings_panel.set_streaming_locked(is_streaming)
         if is_streaming:
             self.on_streaming_started()
-        status = DeviceStatus.STREAMING if is_streaming else DeviceStatus.CONNECTED
-
-        # device_status is a flat mapping {group_id: DeviceStatus}
-        for group_id in self.device_status:
+        # Only transition statuses for devices that are actually connected/streaming.
+        # Never "promote" failed devices (e.g. unavailable BIOPAC) to connected.
+        for group_id, current in list(self.device_status.items()):
             if group_id == "metadata":
                 continue
 
-            self.device_status[group_id] = status
-            self.status_bar.update_device_status(group_id, status)
+            if is_streaming:
+                if current == DeviceStatus.CONNECTED:
+                    self.device_status[group_id] = DeviceStatus.STREAMING
+                    self.status_bar.update_device_status(group_id, DeviceStatus.STREAMING)
+            else:
+                if current == DeviceStatus.STREAMING:
+                    self.device_status[group_id] = DeviceStatus.CONNECTED
+                    self.status_bar.update_device_status(group_id, DeviceStatus.CONNECTED)
 
         # If streaming stopped for any reason while a routine was active (e.g. a
         # server drop), tear down the routine UI/instructions to stay consistent.
@@ -698,6 +705,11 @@ class BioViewMonitor(QMainWindow):
         except Exception:
             self.log_display_panel.log_message("warning", "Unable to update status bar")
 
+        # Reset plot/source UI state so a new server connection starts cleanly.
+        self.available_sources = []
+        self.settings_panel.set_available_sources([])
+        self.plot_grid.clear_sources()
+
         self.command_bar.update_button_states(self.client_worker.status)
         self.log_display_panel.log_message("warning", "Disconnected from server")
 
@@ -714,6 +726,7 @@ class BioViewMonitor(QMainWindow):
             if not isinstance(new_status, DeviceStatus):
                 with contextlib.suppress(Exception):
                     new_status = DeviceStatus(new_status)
+            self.device_status[group_id] = new_status
             self.status_bar.update_device_status(group_id, new_status)
 
         client_status = self.client_worker.status
@@ -725,7 +738,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config-file",
         nargs="*",
-        help="In case the app is launched using a .bview file", # A .json also works. 
+        help="In case the app is launched using a .bvi file", # A .json also works. 
         default=[],
     )
     parser.add_argument(

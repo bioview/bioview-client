@@ -125,7 +125,7 @@ class ConfigurationPrompt(QDialog):
     def update_config_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Add configuration file", "", 
-            "BioView Files (*.bview), JSON Files (*.json);;All Files (*)"
+            "BioView Files (*.bvi), JSON Files (*.json);;All Files (*)"
         )
 
         # If no file is added, just return  

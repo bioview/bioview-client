@@ -293,3 +293,11 @@ class PlotGrid(QWidget):
         for r in range(self.rows):
             for c in range(self.cols):
                 self.plots[r][c].update_display_duration(dur)
+
+    def clear_sources(self):
+        """Clear all current source-to-plot bindings and reset slot availability."""
+        for entry in self.selected_channels.values():
+            with np.errstate(all="ignore"):
+                entry["plot"].update_data_source()
+        self.selected_channels = {}
+        self.available_slots = [(r, c) for r in range(self.rows) for c in range(self.cols)]
