@@ -235,6 +235,7 @@ class BioViewMonitor(QMainWindow):
         self.client_worker.device_init_succeeded.connect(
             self.update_status_bar_and_buttons
         )
+        self.client_worker.device_init_failed.connect(self.on_device_init_failed)
         # Populate plot sources once devices are initialized/discovered
         self.client_worker.device_init_succeeded.connect(self.on_devices_ready)
         self.client_worker.devices_discovered.connect(self.on_devices_ready)
@@ -470,8 +471,19 @@ class BioViewMonitor(QMainWindow):
                 continue
             self.status_bar.update_device_status(group_id, DeviceStatus.CONNECTING)
 
+        self.command_bar.initialize_button.setEnabled(False)
+
         # Request server to connect all initialized devices
         self.client_worker.initialize_devices()
+
+    def on_device_init_failed(self):
+        """Reset UI when device initialization fails or times out."""
+        for group_id in self.device_status:
+            if group_id == "metadata":
+                continue
+            self.status_bar.update_device_status(group_id, DeviceStatus.DISCONNECTED)
+        if self.client_worker:
+            self.command_bar.update_button_states(self.client_worker.status)
 
     def _show_toast(self, message: str, level: str = "info"):
         """Show a transient toast notification overlaid on the main window."""

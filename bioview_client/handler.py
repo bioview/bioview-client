@@ -70,6 +70,7 @@ class Client(QThread):
     # not add explicit signals for failure, only success
     devices_discovered = pyqtSignal(dict)
     device_init_succeeded = pyqtSignal(dict)
+    device_init_failed = pyqtSignal()
     device_status_updated = pyqtSignal(dict)
     device_disconnect_succeeded = pyqtSignal()
 
@@ -614,6 +615,8 @@ class Client(QThread):
                         "warning",
                         "Device command failed: no status returned from server",
                     )
+                    if not only_discover:
+                        self.device_init_failed.emit()
                 return
 
             self.device_states = group_status_dict

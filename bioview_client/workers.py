@@ -5,6 +5,7 @@ import queue
 import socket
 import struct
 import threading
+import time
 from datetime import datetime
 
 import numpy as np  # TODO: Investigate if this is strictly needed or not
@@ -12,10 +13,16 @@ from bioview_common import (
     ClientStatus,
     Command,
     DataSource,
+    DEVICE_OP_COMMAND_TIMEOUT,
+    DEVICE_OP_POLL_INTERVAL,
+    DISCOVER_TIMEOUT,
+    INIT_TIMEOUT_DEFAULT,
+    INIT_TIMEOUT_USRP,
     Response,
     parse_and_validate_response,
     send_command,
 )
+from bioview_common.datatypes.devices import DeviceType
 from PyQt6.QtCore import QObject, QRunnable, QThread, pyqtSignal, pyqtSlot
 
 
@@ -99,20 +106,66 @@ class DeviceInitWorker(QRunnable):
         self.command = command
 
         if command == Command.DISCOVER_DEVICES:
-            self.timeout = 60
+            self.overall_timeout = DISCOVER_TIMEOUT
         elif command == Command.INITIALIZE_DEVICES:
-            self.timeout = 120
+            has_usrp = any(
+                cfg.get_param("device_type") == DeviceType.USRP.value
+                for cfg in client_ref.config.devices.values()
+            )
+            self.overall_timeout = (
+                INIT_TIMEOUT_USRP if has_usrp else INIT_TIMEOUT_DEFAULT
+            )
         else:
-            self.timeout = 15
+            self.overall_timeout = INIT_TIMEOUT_DEFAULT
 
         self.signals = DeviceInitSignals()
+
+    def _poll_until_complete(self, deadline: float):
+        while time.monotonic() < deadline:
+            self.client_ref.control_socket.settimeout(DEVICE_OP_COMMAND_TIMEOUT)
+            response = self.client_ref._send_command_locked(
+                command=Command.GET_DEVICE_STATUS,
+            )
+            if not response:
+                time.sleep(DEVICE_OP_POLL_INTERVAL)
+                continue
+
+            resp_type, resp_payload = parse_and_validate_response(response)
+            if not resp_type:
+                time.sleep(DEVICE_OP_POLL_INTERVAL)
+                continue
+
+            pending = bool((resp_payload or {}).get("pending", False))
+            device_status = (resp_payload or {}).get("device_status", {})
+            if not pending and device_status:
+                return device_status, resp_payload, resp_type
+
+            time.sleep(DEVICE_OP_POLL_INTERVAL)
+
+        raise TimeoutError(
+            f"Device operation timed out after {self.overall_timeout:.0f}s"
+        )
+
+    def _extract_result(self, resp_type, resp_payload):
+        device_status = (resp_payload or {}).get("device_status", {})
+        data_sources = (resp_payload or {}).get("data_sources")
+        if data_sources is not None:
+            self.client_ref.data_sources = data_sources
+        if resp_type == Response.WARNING.name:
+            self.client_ref.log_message.emit(
+                "warning",
+                "Device command completed with server warnings",
+            )
+        if not device_status:
+            raise ValueError("Server returned no device status")
+        return device_status
 
     @pyqtSlot()
     def run(self):
         device_status = {}
 
         try:
-            self.client_ref.control_socket.settimeout(self.timeout)
+            self.client_ref.control_socket.settimeout(DEVICE_OP_COMMAND_TIMEOUT)
 
             device_groups = self.client_ref.config.to_dict()
             response = self.client_ref._send_command_locked(
@@ -128,24 +181,19 @@ class DeviceInitWorker(QRunnable):
             if not resp_type:
                 raise ValueError("Malformed response from server")
 
-            if resp_type in (Response.SUCCESS.name, Response.WARNING.name):
-                device_status = (resp_payload or {}).get("device_status", {})
-                data_sources = (resp_payload or {}).get("data_sources")
-                if data_sources is not None:
-                    self.client_ref.data_sources = data_sources
-                if resp_type == Response.WARNING.name:
-                    self.client_ref.log_message.emit(
-                        "warning",
-                        f"Device command completed with server warnings: {resp_type}",
-                    )
+            if resp_type == Response.DEVICE_CONNECTING.name:
+                deadline = time.monotonic() + self.overall_timeout
+                _, resp_payload, poll_type = self._poll_until_complete(deadline)
+                device_status = self._extract_result(
+                    poll_type or Response.SUCCESS.name, resp_payload
+                )
+            elif resp_type in (Response.SUCCESS.name, Response.WARNING.name):
+                device_status = self._extract_result(resp_type, resp_payload)
             elif resp_type == Response.ERROR.name:
                 msg = (resp_payload or {}).get("message", "Unknown server error")
                 raise ValueError(msg)
             else:
                 raise ValueError(f"Unexpected response type: {resp_type}")
-
-            if not device_status:
-                raise ValueError("Server returned no device status")
 
             self.signals.finished.emit(device_status)
         except Exception as e:
