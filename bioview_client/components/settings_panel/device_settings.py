@@ -136,6 +136,68 @@ class USRPSettingsPanel(DeviceSettingsPanel):
 class BIOPACSettingsPanel(DeviceSettingsPanel):
     def __init__(self, device_configuration, parent=None):
         super().__init__(device_configuration, parent)
+        self._streaming_locked = False
+        self.init_ui()
+
+    def init_ui(self):
+        from PyQt6.QtWidgets import QDoubleSpinBox, QLabel
+
+        layout = QGridLayout()
+        self.param_inputs = {}
+        param_specs = [
+            ("samp_rate", "Sample Rate (Hz)", (1, 10000), 10, 0),
+            ("connection_type", "Connection Type", (10, 20), 10, 0),
+        ]
+        for row, (param_name, label_text, (min_val, max_val), step, decimals) in enumerate(
+            param_specs
+        ):
+            layout.addWidget(QLabel(label_text), row, 0)
+            value = self.device_configuration.get_param(param_name)
+            if decimals == 0:
+                widget = QSpinBox()
+                widget.setRange(int(min_val), int(max_val))
+                widget.setSingleStep(int(step))
+                widget.setValue(
+                    int(value) if isinstance(value, (int, float)) else int(min_val)
+                )
+            else:
+                widget = QDoubleSpinBox()
+                widget.setRange(float(min_val), float(max_val))
+                widget.setDecimals(decimals)
+                widget.setSingleStep(float(step))
+                widget.setValue(
+                    float(value) if isinstance(value, (int, float)) else float(min_val)
+                )
+            widget.valueChanged.connect(
+                lambda val, param_name=param_name: self.update_param(param_name, val)
+            )
+            layout.addWidget(widget, row, 1)
+            self.param_inputs[param_name] = widget
+
+        channels = self.device_configuration.get_param("channels") or [1, 1, 1, 1]
+        self.channel_checks = []
+        ch_row = len(param_specs)
+        layout.addWidget(QLabel("Enabled Channels"), ch_row, 0)
+        ch_box = QHBoxLayout()
+        for idx, enabled in enumerate(channels):
+            cb = QCheckBox(f"Ch{idx + 1}")
+            cb.setChecked(bool(enabled))
+            cb.toggled.connect(self._on_channel_toggled)
+            ch_box.addWidget(cb)
+            self.channel_checks.append(cb)
+        layout.addLayout(ch_box, ch_row, 1)
+        self.setLayout(layout)
+
+    def _on_channel_toggled(self, _checked: bool):
+        channels = [1 if cb.isChecked() else 0 for cb in self.channel_checks]
+        self.update_param("channels", channels)
+
+    def set_streaming_locked(self, locked: bool):
+        self._streaming_locked = locked
+        for widget in getattr(self, "param_inputs", {}).values():
+            widget.setEnabled(not locked)
+        for cb in getattr(self, "channel_checks", []):
+            cb.setEnabled(not locked)
 
 
 class DummySettingsPanel(DeviceSettingsPanel):

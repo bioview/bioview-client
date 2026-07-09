@@ -621,14 +621,27 @@ class Client(QThread):
 
             self.device_states = group_status_dict
 
+            def _is_connected(status_value) -> bool:
+                if status_value == DeviceStatus.CONNECTED:
+                    return True
+                if isinstance(status_value, DeviceStatus):
+                    return status_value == DeviceStatus.CONNECTED
+                return str(status_value) == DeviceStatus.CONNECTED.value
+
             # Update state and emit appropriate signal
             if only_discover:
                 self.status = ClientStatus.DEVICES_DISCOVERED
                 self.devices_discovered.emit(self.device_states)
-            else:
+            elif any(_is_connected(v) for v in group_status_dict.values()):
                 self.status = ClientStatus.DEVICES_CONNECTED
                 self._start_data_streamer_after_init()
                 self.device_init_succeeded.emit(self.device_states)
+            else:
+                self.log_message.emit(
+                    "error",
+                    "Device initialization failed: no devices connected",
+                )
+                self.device_init_failed.emit()
 
             self._discovering_devices = False
 
