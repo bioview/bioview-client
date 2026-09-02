@@ -10,15 +10,14 @@ from datetime import datetime
 
 import numpy as np  # TODO: Investigate if this is strictly needed or not
 from bioview_common import (
-    ClientStatus,
-    Command,
-    DataSource,
     DEVICE_OP_COMMAND_TIMEOUT,
     DEVICE_OP_POLL_INTERVAL,
     DISCOVER_TIMEOUT,
     INIT_TIMEOUT_DEFAULT,
     INIT_TIMEOUT_USRP,
+    Command,
     Response,
+    describe_failure,
     parse_and_validate_response,
     send_command,
 )
@@ -121,6 +120,12 @@ class DeviceInitWorker(QRunnable):
         self.signals = DeviceInitSignals()
 
     def _poll_until_complete(self, deadline: float):
+        # Progress reporting for the wait itself: the per-command trace skips
+        # this poll (it repeats for the whole length of the operation), so
+        # without this a long device init looks like the client has hung.
+        started = time.monotonic()
+        last_status = None
+
         while time.monotonic() < deadline:
             self.client_ref.control_socket.settimeout(DEVICE_OP_COMMAND_TIMEOUT)
             response = self.client_ref._send_command_locked(
@@ -140,10 +145,21 @@ class DeviceInitWorker(QRunnable):
             if not pending and device_status:
                 return device_status, resp_payload, resp_type
 
+            if device_status != last_status:
+                last_status = device_status
+                states = ", ".join(f"{k}={v}" for k, v in (device_status or {}).items())
+                self.client_ref.log_message.emit(
+                    "debug",
+                    f"{self.command.name} in progress "
+                    f"({time.monotonic() - started:.0f}s)"
+                    + (f": {states}" if states else ""),
+                )
+
             time.sleep(DEVICE_OP_POLL_INTERVAL)
 
         raise TimeoutError(
-            f"Device operation timed out after {self.overall_timeout:.0f}s"
+            f"{self.command.name} timed out after {self.overall_timeout:.0f}s "
+            "with the server still reporting the operation as pending"
         )
 
     def _extract_result(self, resp_type, resp_payload):
@@ -151,6 +167,9 @@ class DeviceInitWorker(QRunnable):
         data_sources = (resp_payload or {}).get("data_sources")
         if data_sources is not None:
             self.client_ref.data_sources = data_sources
+        # Why any group failed, so the client can say so instead of reporting a
+        # bare "initialization failed" and leaving the reason on the server.
+        self.client_ref.device_errors = (resp_payload or {}).get("device_errors") or {}
         if resp_type == Response.WARNING.name:
             self.client_ref.log_message.emit(
                 "warning",
@@ -197,7 +216,9 @@ class DeviceInitWorker(QRunnable):
 
             self.signals.finished.emit(device_status)
         except Exception as e:
-            self.client_ref.log_message.emit("error", f"Device command failed: {e}")
+            self.client_ref.log_message.emit(
+                "error", f"Device command failed: {describe_failure(e)}"
+            )
             self.signals.finished.emit({})
 
 
@@ -250,12 +271,17 @@ class DataStreamer(QThread):
         """Receive exactly num_bytes from the data socket. Returns None only on a
         real disconnect or when the worker is stopped; transient socket timeouts
         are tolerated so the receiver keeps waiting while idle."""
-        data = b""
-        while len(data) < num_bytes:
+        # Collect and join rather than ``data += chunk``: repeated concatenation
+        # reallocates the whole buffer per read, which is quadratic in the number
+        # of reads. Harmless for a two-read chunk, but it degrades badly as
+        # payloads grow or TCP fragments more.
+        chunks = []
+        received = 0
+        while received < num_bytes:
             if not self.running:
                 return None
             try:
-                chunk = self.data_conn.recv(num_bytes - len(data))
+                chunk = self.data_conn.recv(num_bytes - received)
             except socket.timeout:
                 continue  # idle gap; keep waiting while still running
             except OSError as e:
@@ -264,8 +290,9 @@ class DataStreamer(QThread):
                 return None
             if not chunk:
                 return None  # peer closed the connection
-            data += chunk
-        return data
+            chunks.append(chunk)
+            received += len(chunk)
+        return b"".join(chunks)
 
     def _deserialize_data(self, data_bytes):
         """Deserialize a numpy data chunk and its source metadata from the server.
@@ -355,7 +382,9 @@ class DataSaver(threading.Thread):
             parent = os.path.dirname(self.save_path)
             if parent:
                 os.makedirs(parent, exist_ok=True)
-            self._file = open(self.save_path, "wb")
+            # Not a context manager: the recording file stays open from
+            # start_saving() until stop_saving() closes it.
+            self._file = open(self.save_path, "wb")  # noqa: SIM115
             self._start_time = datetime.now()
             header = {
                 "format": "bioview-raw-v2",

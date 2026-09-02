@@ -1,10 +1,23 @@
-# UI for device discovery
-import sys
-import time
+"""BioView Configurator.
 
-from bioview_common import APP_VERSION
+Lists every device attached to the server and lets tweakable per-device
+properties be edited -- the role NI's USRP Configuration Utility plays for
+LabVIEW. Today the only editable property is a USRP's ``device_name``.
+
+Flow: Discover lists what is attached; selecting a device enables Edit when its
+backend declares editable properties; Edit opens a modal with those fields plus
+Save and Cancel.
+
+Names are stored by BioView (keyed on the radio's serial) and applied during
+discovery, rather than written to device EEPROM. Configuration files, the
+channel map and the serial cache all see the chosen name.
+"""
+
+import sys
+
+from bioview_common import APP_VERSION, ClientStatus
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QFont, QGuiApplication, QTextCursor
+from PyQt6.QtGui import QFont, QGuiApplication
 from PyQt6.QtWidgets import (
     QApplication,
     QDialog,
@@ -17,392 +30,385 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QStatusBar,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from bioview_client.assets import APP_DESKTOP_NAME, get_app_icon
+from bioview_client.autoconnect import start_localhost_autoconnect
+from bioview_client.components import (
+    LogDisplayPanel,
+    device_health_warning,
+    device_is_healthy,
+)
 from bioview_client.handler import Client
 
 
 class DeviceConfigDialog(QDialog):
-    config_changed = pyqtSignal(dict, dict)  # device_info, new_config
+    """Modal editor for one device's editable properties."""
 
     def __init__(self, device_info, editable_properties, parent=None):
         super().__init__(parent)
-        self.device_info = device_info
-        self.editable_properties = editable_properties
+        self.device_info = device_info or {}
+        self.editable_properties = editable_properties or {}
         self.property_widgets = {}
-        self.init_ui()
+        self.result_config = None
+        self._init_ui()
 
-    def init_ui(self):
-        self.setWindowTitle(
-            f"Configure Device - {self.device_info.get('name', 'Unknown')}"
-        )
+    def _init_ui(self):
+        name = self.device_info.get("name", "Unknown")
+        self.setWindowTitle(f"Edit Device - {name}")
         self.setModal(True)
-        self.resize(400, 300)
+        self.setMinimumWidth(420)
 
         layout = QVBoxLayout(self)
 
-        # Device info header
-        info_label = QLabel(
-            f"Device: {self.device_info.get('type', 'Unknown')} "
-            f"(S/N: {self.device_info.get('serial', 'Unknown')})"
+        header = QLabel(
+            f"{self.device_info.get('device_type', 'Unknown')}"
+            f"  ·  S/N {self.device_info.get('serial', 'Unknown')}"
         )
-        info_label.setFont(QFont("Arial", 10, QFont.Weight.Bold))
-        layout.addWidget(info_label)
+        header.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+        layout.addWidget(header)
 
-        # Editable properties form
-        form_layout = QFormLayout()
+        eeprom = self.device_info.get("eeprom_name")
+        if eeprom and eeprom != name:
+            hint = QLabel(f"Factory name: {eeprom}")
+            hint.setStyleSheet("color: gray; font-style: italic;")
+            layout.addWidget(hint)
 
-        for prop_name, prop_info in self.editable_properties.items():
-            current_value = self.device_info.get(prop_name, prop_info.get("default", ""))
-
-            if prop_info.get("type") == "text":
-                widget = QLineEdit(str(current_value))
-            else:
-                # Default to text input
-                widget = QLineEdit(str(current_value))
-
+        form = QFormLayout()
+        for prop_name, spec in self.editable_properties.items():
+            current = self.device_info.get(prop_name, spec.get("default", ""))
+            widget = QLineEdit(str(current))
+            if spec.get("max_length"):
+                widget.setMaxLength(int(spec["max_length"]))
+            if spec.get("help"):
+                widget.setToolTip(spec["help"])
             self.property_widgets[prop_name] = widget
-            display_name = prop_info.get("display_name", prop_name.title())
-            form_layout.addRow(f"{display_name}:", widget)
+            form.addRow(f"{spec.get('display_name', prop_name.title())}:", widget)
+        layout.addLayout(form)
 
-        layout.addLayout(form_layout)
+        self.error_label = QLabel("")
+        self.error_label.setStyleSheet("color: #ff6b6b;")
+        self.error_label.setWordWrap(True)
+        self.error_label.hide()
+        layout.addWidget(self.error_label)
 
-        # Buttons
-        button_box = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
-        button_box.accepted.connect(self.accept_changes)
-        button_box.rejected.connect(self.reject)
-        layout.addWidget(button_box)
+        buttons.accepted.connect(self._on_save)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
 
-    def accept_changes(self):
-        new_config = {}
-        for prop_name, widget in self.property_widgets.items():
-            if isinstance(widget, QLineEdit):
-                new_config[prop_name] = widget.text()
+    def _validate(self, config):
+        for prop_name, spec in self.editable_properties.items():
+            value = config.get(prop_name, "")
+            label = spec.get("display_name", prop_name)
+            if spec.get("required") and not value:
+                return f"{label} cannot be empty."
+            max_len = spec.get("max_length")
+            if max_len and len(value) > int(max_len):
+                return f"{label} must be {max_len} characters or fewer."
+        return None
 
-        self.config_changed.emit(self.device_info, new_config)
+    def _on_save(self):
+        config = {
+            name: widget.text().strip() for name, widget in self.property_widgets.items()
+        }
+        error = self._validate(config)
+        if error:
+            self.error_label.setText(error)
+            self.error_label.show()
+            return
+        self.result_config = config
         self.accept()
 
 
 class DeviceListPanel(QWidget):
-    """Device list panel for device discovery and selection"""
+    """Discover / list / select, with Edit gated on backend support."""
 
-    # Signals
     discover_requested = pyqtSignal()
-    device_configure_requested = pyqtSignal(
-        dict, dict
-    )  # device_info, editable_properties
+    edit_requested = pyqtSignal(dict, dict)  # device_info, editable_properties
 
     def __init__(self):
         super().__init__()
-        self.discovered_devices = []
-        self.init_ui()
+        self.devices = []
+        self.backends = {}
+        self._init_ui()
 
-    def init_ui(self):
+    def _init_ui(self):
         layout = QVBoxLayout(self)
 
-        # Device discovery group
-        discovery_group = QGroupBox("Device Discovery")
-        discovery_layout = QVBoxLayout(discovery_group)
+        group = QGroupBox("Attached Devices")
+        group_layout = QHBoxLayout(group)
 
-        # Discovery button
-        button_layout = QHBoxLayout()
+        self.device_list = QListWidget()
+        self.device_list.itemSelectionChanged.connect(self._on_selection_changed)
+        self.device_list.itemDoubleClicked.connect(
+            lambda _item: self._emit_edit_request()
+        )
+        group_layout.addWidget(self.device_list, stretch=1)
+
+        # Buttons stack to the right of the list: Discover on top, Edit beneath.
+        button_column = QVBoxLayout()
         self.discover_btn = QPushButton("Discover Devices")
         self.discover_btn.clicked.connect(self.discover_requested.emit)
-        button_layout.addWidget(self.discover_btn)
-        button_layout.addStretch()
-        discovery_layout.addLayout(button_layout)
+        button_column.addWidget(self.discover_btn)
 
-        # Device list
-        self.device_list = QListWidget()
-        self.device_list.itemDoubleClicked.connect(self.on_device_double_clicked)
-        discovery_layout.addWidget(self.device_list)
+        self.edit_btn = QPushButton("Edit")
+        self.edit_btn.setEnabled(False)
+        self.edit_btn.clicked.connect(self._emit_edit_request)
+        button_column.addWidget(self.edit_btn)
 
-        # Instructions
-        instructions = QLabel("Double-click a device to configure it")
-        instructions.setStyleSheet("color: gray; font-style: italic;")
-        discovery_layout.addWidget(instructions)
+        self.hint_label = QLabel("")
+        self.hint_label.setStyleSheet("color: gray; font-style: italic;")
+        self.hint_label.setWordWrap(True)
+        button_column.addWidget(self.hint_label)
+        button_column.addStretch()
+        group_layout.addLayout(button_column)
 
-        layout.addWidget(discovery_group)
+        layout.addWidget(group)
 
-    def update_discovered_devices(self, devices):
-        """Update device list"""
-        self.discovered_devices = devices
+    def set_busy(self, busy: bool):
+        self.discover_btn.setEnabled(not busy)
+        self.discover_btn.setText("Discovering..." if busy else "Discover Devices")
+        if busy:
+            self.edit_btn.setEnabled(False)
+
+    def update_devices(self, devices, backends):
+        self.devices = list(devices or [])
+        self.backends = dict(backends or {})
         self.device_list.clear()
 
-        if devices:
-            for device in devices:
-                device_name = device.get("name", "Unnamed Device")
-                device_type = device.get("type", "Unknown")
-                serial = device.get("serial", "Unknown")
-
-                # Create display text
-                display_text = f"{device_name}\n{device_type} | S/N: {serial}"
-
-                # Create list item
-                item = QListWidgetItem(display_text)
-                item.setData(Qt.ItemDataRole.UserRole, device)
-
-                # Add visual styling
-                font = QFont()
-                font.setBold(True)
-                item.setFont(font)
-
-                self.device_list.addItem(item)
-        else:
-            # Add placeholder item
+        if not self.devices:
             item = QListWidgetItem("No devices found")
-            item.setFlags(Qt.ItemFlag.NoItemFlags)  # Make it non-selectable
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
             item.setForeground(Qt.GlobalColor.gray)
             self.device_list.addItem(item)
+            self._on_selection_changed()
+            return
 
-    def on_device_double_clicked(self, item):
-        """Handle device double-click"""
-        device_info = item.data(Qt.ItemDataRole.UserRole)
-        if device_info:
-            # Mock editable properties - in real implementation, this would come from client
-            editable_properties = {
-                "name": {
-                    "type": "text",
-                    "display_name": "Device Name",
-                    "default": device_info.get("name", ""),
-                },
-                "alias": {
-                    "type": "text",
-                    "display_name": "Alias",
-                    "default": device_info.get("alias", ""),
-                },
-            }
+        for device in self.devices:
+            name = device.get("name", "Unnamed Device")
+            item = QListWidgetItem(f"{name}\n{self._device_details(device)}")
+            item.setData(Qt.ItemDataRole.UserRole, device)
+            font = QFont()
+            font.setBold(True)
+            item.setFont(font)
+            if not device_is_healthy(device):
+                item.setForeground(Qt.GlobalColor.red)
+                item.setToolTip(
+                    f"Windows reports this device as '{device.get('status')}'. "
+                    "It will not open for acquisition until its driver is working."
+                )
+            self.device_list.addItem(item)
 
-            self.device_configure_requested.emit(device_info, editable_properties)
+        self._on_selection_changed()
 
+    def selected_device(self):
+        items = self.device_list.selectedItems()
+        if not items:
+            return None
+        return items[0].data(Qt.ItemDataRole.UserRole)
 
-class LogDisplayPanel(QWidget):
-    """Compact log display panel"""
+    def editable_properties_for(self, device):
+        if not device:
+            return {}
+        backend = self.backends.get(device.get("device_type"), {})
+        return backend.get("editable_properties", {}) or {}
 
-    def __init__(self):
-        super().__init__()
-        self.init_ui()
+    def _on_selection_changed(self):
+        device = self.selected_device()
+        schema = self.editable_properties_for(device)
+        self.edit_btn.setEnabled(bool(schema))
 
-    def init_ui(self):
-        layout = QVBoxLayout(self)
+        if device is None:
+            self.hint_label.setText("Select a device to edit it.")
+        elif schema:
+            self.hint_label.setText("")
+        else:
+            self.hint_label.setText(
+                f"{device.get('device_type', 'This device')} has no editable "
+                "properties."
+            )
 
-        # Header
-        header_layout = QHBoxLayout()
-        title_label = QLabel("System Log")
-        title_label.setFont(QFont("Arial", 9, QFont.Weight.Bold))
-        header_layout.addWidget(title_label)
-
-        header_layout.addStretch()
-
-        clear_btn = QPushButton("Clear")
-        clear_btn.setMaximumSize(60, 25)
-        clear_btn.clicked.connect(self.clear_log)
-        header_layout.addWidget(clear_btn)
-
-        layout.addLayout(header_layout)
-
-        # Log display (smaller)
-        self.log_text = QTextEdit()
-        self.log_text.setFont(QFont("Consolas", 8))
-        self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(150)  # Make it smaller
-        layout.addWidget(self.log_text)
-
-    def add_log_message(self, level, message):
-        """Add log message"""
-        timestamp = time.strftime("%H:%M:%S")
-
-        color_map = {
-            "error": "#ff4444",
-            "warning": "#ff8800",
-            "info": "#4444ff",
-            "debug": "#888888",
-        }
-
-        color = color_map.get(level.lower(), "#000000")
-        formatted_msg = f'<span style="color: {color};">[{timestamp}] {level.upper()}: {message}</span>'
-
-        self.log_text.append(formatted_msg)
-
-        # Auto-scroll
-        cursor = self.log_text.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        self.log_text.setTextCursor(cursor)
-
-    def clear_log(self):
-        """Clear log"""
-        self.log_text.clear()
+    def _emit_edit_request(self):
+        device = self.selected_device()
+        schema = self.editable_properties_for(device)
+        if device and schema:
+            self.edit_requested.emit(device, schema)
 
 
 class StatusPanel(QWidget):
-    """Status panel"""
+    """Server connection state and device count."""
 
     def __init__(self):
         super().__init__()
-        self.init_ui()
+        self._init_ui()
 
-    def init_ui(self):
+    def _init_ui(self):
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)
-
-        self.server_status = QLabel("Server: Disconnected")
-        self.server_status.setStyleSheet("color: red; font-weight: bold;")
-        layout.addWidget(self.server_status)
-
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.server_label = QLabel("Server: disconnected")
+        self.device_label = QLabel("Devices: 0")
+        layout.addWidget(self.server_label)
         layout.addWidget(QLabel("|"))
-
-        self.device_count = QLabel("Devices: 0")
-        layout.addWidget(self.device_count)
-
-        layout.addStretch()
+        layout.addWidget(self.device_label)
 
     def update_server_status(self, connected):
-        """Update server status"""
-        if connected:
-            self.server_status.setText("Server: Connected")
-            self.server_status.setStyleSheet("color: green; font-weight: bold;")
-        else:
-            self.server_status.setText("Server: Disconnected")
-            self.server_status.setStyleSheet("color: red; font-weight: bold;")
+        self.server_label.setText(
+            "Server: connected" if connected else "Server: disconnected"
+        )
 
     def update_device_count(self, count):
-        """Update device count"""
-        self.device_count.setText(f"Devices: {count}")
+        self.device_label.setText(f"Devices: {count}")
 
 
-class DeviceDiscoveryClient(QMainWindow):
+class ConfiguratorWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.client_worker = None
-        self.init_ui()
-        self.setup_client()
+        self._pending_device = None
+        self._init_ui()
+        self._setup_client()
 
-    def init_ui(self):
-        self.setWindowTitle("BioView Device Discovery")
+    def _init_ui(self):
+        self.setWindowTitle("BioView Configurator")
         self.setWindowIcon(get_app_icon())
         screen = QGuiApplication.primaryScreen().geometry()
-        width = screen.width()
-        height = screen.height()
         self.setGeometry(
-            int(0.4 * width),
-            int(0.3 * height),
-            500,
-            500,  # Slightly smaller
+            int(0.35 * screen.width()), int(0.25 * screen.height()), 620, 560
         )
 
-        # Central widget
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
 
-        main_layout = QVBoxLayout(central_widget)
-
-        # Device list panel (takes most space)
         self.device_panel = DeviceListPanel()
-        main_layout.addWidget(self.device_panel, stretch=3)
+        layout.addWidget(self.device_panel, stretch=3)
 
-        # Log panel (smaller)
         self.log_panel = LogDisplayPanel()
-        main_layout.addWidget(self.log_panel, stretch=1)
+        layout.addWidget(self.log_panel, stretch=1)
 
-        # Status bar
         self.status_panel = StatusPanel()
         status_bar = QStatusBar()
         status_bar.addPermanentWidget(self.status_panel)
         self.setStatusBar(status_bar)
 
-        # Connect signals
         self.device_panel.discover_requested.connect(self.discover_devices)
-        self.device_panel.device_configure_requested.connect(self.show_device_config)
+        self.device_panel.edit_requested.connect(self.show_device_config)
 
-    def setup_client(self):
-        """Connect to client"""
+    def _setup_client(self):
         self.client_worker = Client()
 
-        # Connect signals
         self.client_worker.server_connected.connect(self.on_server_connected)
         self.client_worker.server_disconnected.connect(self.on_server_disconnected)
-        self.client_worker.error_occurred.connect(
-            lambda msg: self.log_panel.add_log_message("error", msg)
-        )
         self.client_worker.log_message.connect(self.log_panel.add_log_message)
-        self.client_worker.devices_discovered.connect(self.device_panel.update_discovered_devices)
+        self.client_worker.devices_listed.connect(self.on_devices_listed)
+        self.client_worker.device_list_failed.connect(self.on_device_list_failed)
+        self.client_worker.device_config_updated.connect(self.on_device_config_updated)
+        self.client_worker.device_config_failed.connect(self.on_device_config_failed)
 
-        # Start client
         self.client_worker.start_client()
 
-    def discover_devices(self):
-        """Discover devices"""
-        if self.client_worker:
-            self.client_worker.discover_devices()
-            
-            self.status_panel.update_device_count(len(devices) if devices else 0)
-            self.log_panel.add_log_message(
-                "info", f"Discovery requested..."
-            )
-
-    def show_device_config(self, device_info, editable_properties):
-        """Show device configuration dialog"""
-        dialog = DeviceConfigDialog(device_info, editable_properties, self)
-        dialog.config_changed.connect(self.on_device_config_changed)
-        dialog.exec()
-
-    def on_device_config_changed(self, device_info, new_config):
-        """Handle device configuration change"""
-        device_name = device_info.get("name", "Unknown")
-        self.log_panel.add_log_message(
-            "info", f"Configuration updated for device: {device_name}"
+        # The Configurator is useless without a server, so latch onto a local one
+        # as soon as it answers -- and stay latched, so it recovers by itself if
+        # that server is ever restarted. The launcher starts one alongside this
+        # window; localhost is the only server this window can use.
+        self._connect_timer = start_localhost_autoconnect(
+            self.client_worker, self, keep_latched=True
         )
 
-        # Here you would send the configuration to the client
-        if self.client_worker:
-            # self.client_worker.update_device_config(device_info, new_config)
-            pass
+    def discover_devices(self):
+        if self.client_worker.status < ClientStatus.SERVER_CONNECTED:
+            self.log_panel.add_log_message("warning", "Not connected to a server yet")
+            return
+        self.device_panel.set_busy(True)
+        self.log_panel.add_log_message("info", "Discovering devices...")
+        self.client_worker.list_devices()
+
+    def on_devices_listed(self, devices, backends):
+        self.device_panel.set_busy(False)
+        self.device_panel.update_devices(devices, backends)
+        self.status_panel.update_device_count(len(devices))
+
+        for backend_type, info in (backends or {}).items():
+            if not info.get("available", True):
+                self.log_panel.add_log_message(
+                    "warning",
+                    f"{backend_type} backend unavailable: "
+                    f"{info.get('error', 'unknown error')}",
+                )
+
+        # A device the OS cannot drive is still discovered and listed, so say so
+        # here rather than letting acquisition fail later with no explanation.
+        for device in devices:
+            warning = device_health_warning(device)
+            if warning:
+                self.log_panel.add_log_message("warning", warning)
+
+    def on_device_list_failed(self, message):
+        self.device_panel.set_busy(False)
+        self.log_panel.add_log_message("error", f"Discovery failed: {message}")
+
+    def show_device_config(self, device_info, editable_properties):
+        dialog = DeviceConfigDialog(device_info, editable_properties, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if not dialog.result_config:
+            return
+        self._pending_device = device_info
+        self.client_worker.set_device_config(device_info, dialog.result_config)
+
+    def on_device_config_updated(self, device_info, message):
+        self.log_panel.add_log_message(
+            "info", f"{device_info.get('name', 'Device')}: {message}"
+        )
+        self._pending_device = None
+        # Re-list so the new name is reflected everywhere.
+        self.discover_devices()
+
+    def on_device_config_failed(self, message):
+        self._pending_device = None
+        self.log_panel.add_log_message("error", f"Update failed: {message}")
+        QMessageBox.warning(self, "Could not update device", message)
 
     def on_server_connected(self):
-        """Handle server connection"""
         self.status_panel.update_server_status(True)
         self.log_panel.add_log_message("info", "Connected to server")
+        self.discover_devices()
 
     def on_server_disconnected(self):
-        """Handle server disconnection"""
         self.status_panel.update_server_status(False)
         self.status_panel.update_device_count(0)
-        self.device_panel.update_discovered_devices([])
+        self.device_panel.update_devices([], {})
         self.log_panel.add_log_message("warning", "Disconnected from server")
 
     def closeEvent(self, event):
-        """Handle application close"""
         if self.client_worker:
             self.client_worker.stop_client()
         event.accept()
 
 
 def run_configurator(argv=None) -> int:
+    import qdarktheme
+
+    qdarktheme.enable_hi_dpi()
     app = QApplication(sys.argv)
     app.setApplicationName("BioView")
-    app.setApplicationDisplayName("BioView Device Discovery")
+    app.setApplicationDisplayName("BioView Configurator")
     app.setDesktopFileName(APP_DESKTOP_NAME)
     app.setWindowIcon(get_app_icon())
+    qdarktheme.setup_theme(theme="dark")
 
-    # Create and show main window
-    window = DeviceDiscoveryClient()
+    window = ConfiguratorWindow()
     window.show()
 
-    # Add startup messages
-    window.log_panel.add_log_message(
-        "info", f"Welcome to BioView Device Discovery Version {APP_VERSION}"
-    )
-    window.log_panel.add_log_message(
-        "warning", "Make sure a compatible backend server is running!"
-    )
+    window.log_panel.add_log_message("info", f"BioView Configurator {APP_VERSION}")
 
     return app.exec()
 

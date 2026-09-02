@@ -1,20 +1,19 @@
-from typing import Dict 
-
-from PyQt6.QtCore import pyqtSignal, QObject
-from PyQt6.QtWidgets import QTabWidget, QGroupBox
-
-from bioview_common.datatypes import Configuration, SUPPORTED_CONFIGURATION_TYPES
+from bioview_common.datatypes import SUPPORTED_CONFIGURATION_TYPES
+from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtWidgets import QTabWidget
 
 from .common_settings import CommonSettingsPanel
-from .device_settings import USRPSettingsPanel, BIOPACSettingsPanel, DummySettingsPanel
+from .device_settings import BIOPACSettingsPanel, DummySettingsPanel, USRPSettingsPanel
 from .panel_utils import DEFAULT_MAX_PANEL_HEIGHT, wrap_scrollable
+
 
 SETTINGS_PANEL_MAPPING = {
     SUPPORTED_CONFIGURATION_TYPES.USRP: USRPSettingsPanel,
     SUPPORTED_CONFIGURATION_TYPES.BIOPAC: BIOPACSettingsPanel,
     SUPPORTED_CONFIGURATION_TYPES.DUMMY: DummySettingsPanel,
-    SUPPORTED_CONFIGURATION_TYPES.EXPERIMENT: CommonSettingsPanel
+    SUPPORTED_CONFIGURATION_TYPES.EXPERIMENT: CommonSettingsPanel,
 }
+
 
 class SettingsPanel(QTabWidget):
     update_device_param = pyqtSignal(str, str)
@@ -25,25 +24,29 @@ class SettingsPanel(QTabWidget):
     def __init__(self, configurations):
         super().__init__()
 
-        # Only get valid configurations 
-        configurations = {k: v for k, v in configurations.items() if v.get_type() in SUPPORTED_CONFIGURATION_TYPES}
+        # Only get valid configurations
+        configurations = {
+            k: v
+            for k, v in configurations.items()
+            if v.get_type() in SUPPORTED_CONFIGURATION_TYPES
+        }
 
         # Hold all panels as a dictionary for easy access
-        self.setting_widgets = {} 
+        self.setting_widgets = {}
 
         # Reference to the experiment (common) settings panel for source/save UI
         self.experiment_panel = None
 
-        for cfg_id, config in configurations.items(): 
-            cfg_type = config.get_type() 
+        for cfg_id, config in configurations.items():
+            cfg_type = config.get_type()
             widget = SETTINGS_PANEL_MAPPING[cfg_type](config)
             scroll = wrap_scrollable(widget, max_height=DEFAULT_MAX_PANEL_HEIGHT)
-            self.addTab(scroll, f"{cfg_id} Settings") # Add to UI
+            self.addTab(scroll, f"{cfg_id} Settings")  # Add to UI
 
             if cfg_type == SUPPORTED_CONFIGURATION_TYPES.EXPERIMENT:
                 self.experiment_panel = widget
 
-            # Enable logging 
+            # Enable logging
             widget.log_event.connect(self.send_to_log)
 
             # Forward device parameter tweaks (tagged with the configuration id)
@@ -61,8 +64,8 @@ class SettingsPanel(QTabWidget):
                 if not hasattr(self, signal_name):
                     setattr(self, signal_name, signal_callback)
 
-            # Add widget to dict 
-            self.setting_widgets[cfg_id] = widget 
+            # Add widget to dict
+            self.setting_widgets[cfg_id] = widget
 
         self.setMaximumHeight(DEFAULT_MAX_PANEL_HEIGHT + 36)
 
@@ -88,8 +91,8 @@ class SettingsPanel(QTabWidget):
             }
             """
         )
-    
-    def _route_signals(self, source, signal, *args): 
+
+    def _route_signals(self, source, signal, *args):
         pass
 
     def update_source(self, action, source):

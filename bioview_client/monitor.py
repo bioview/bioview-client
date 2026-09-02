@@ -9,14 +9,20 @@ components/default values
 import argparse
 import contextlib
 import logging  # TODO: Remove
-import queue
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict
 
-from bioview_common import ClientStatus, DataSource, DeviceStatus, ExperimentConfiguration, parse_configuration_file, SUPPORTED_CONFIGURATION_TYPES
-from PyQt6.QtCore import QTimer, Qt
+from bioview_common import (
+    SUPPORTED_CONFIGURATION_TYPES,
+    ClientStatus,
+    DataSource,
+    DeviceStatus,
+    ExperimentConfiguration,
+    parse_configuration_file,
+)
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import (
     QApplication,
@@ -27,20 +33,22 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from bioview_client.assets import APP_DESKTOP_NAME, get_app_icon
+from bioview_client.autoconnect import start_localhost_autoconnect
 from bioview_client.components import (
     AnnotateEventPanel,
     AppControlPanel,
     ConfigurationPrompt,
     InstructionController,
     LogDisplayPanel,
-    parse_timed_modes,
     PlotGrid,
     SettingsPanel,
     StatusBar,
+    parse_timed_modes,
 )
-from bioview_client.assets import APP_DESKTOP_NAME, get_app_icon
 from bioview_client.components.common import Toast
 from bioview_client.handler import Client
+
 
 class BioViewMonitor(QMainWindow):
     """'
@@ -63,7 +71,7 @@ class BioViewMonitor(QMainWindow):
 
     def __init__(
         self,
-        config_file: str | Path = None, 
+        config_file: str | Path = None,
         # group_configs: List[Dict] = None,
         # experiment_config: Dict = None,
         autodiscover: bool = True,
@@ -79,27 +87,29 @@ class BioViewMonitor(QMainWindow):
             self.config_file = self.config_file[0] if self.config_file else None
 
         # If no valid configuration file present, prompt user.
-        if not self.config_file: 
+        if not self.config_file:
             dialog = ConfigurationPrompt()
 
-            if dialog.exec() == QDialog.DialogCode.Accepted: 
-                self.config_file = dialog.get_config_file() 
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                self.config_file = dialog.get_config_file()
 
-        # Now, parse and validate configurations. 
+        # Now, parse and validate configurations.
         self.configurations = parse_configuration_file(self.config_file)
 
         experiment_cfg_id = None
-        for cfg_id, cfg in self.configurations.items(): 
+        for cfg_id, cfg in self.configurations.items():
             if cfg.get_type() == SUPPORTED_CONFIGURATION_TYPES.EXPERIMENT:
                 experiment_cfg_id = cfg_id
                 break
-        
-        if not experiment_cfg_id: 
-            self.experiment_config = ExperimentConfiguration({}) # Load a default one 
+
+        if not experiment_cfg_id:
+            self.experiment_config = ExperimentConfiguration({})  # Load a default one
             self.group_configs = self.configurations
-        else: 
+        else:
             self.experiment_config = self.configurations[experiment_cfg_id]
-            self.group_configs = {k: v for k, v in self.configurations.items() if k != experiment_cfg_id}
+            self.group_configs = {
+                k: v for k, v in self.configurations.items() if k != experiment_cfg_id
+            }
 
         # Store group states
         self.device_status = {k: DeviceStatus.NOINIT for k in self.group_configs}
@@ -158,7 +168,8 @@ class BioViewMonitor(QMainWindow):
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
 
-        from PyQt6.QtWidgets import QSplitter, QSizePolicy
+        from PyQt6.QtWidgets import QSplitter
+
         splitter = QSplitter(Qt.Orientation.Vertical)
 
         # Top shelf container
@@ -198,16 +209,16 @@ class BioViewMonitor(QMainWindow):
 
         # Plot Grid
         self.plot_grid = PlotGrid(self.experiment_config)
-        
+
         # Enforce plot heights (50% to 60% of the initial window height)
         window_height = int(0.8 * height)
         self.plot_grid.setMinimumHeight(int(0.5 * window_height))
         self.plot_grid.setMaximumHeight(int(0.6 * window_height))
-        
+
         # Add to splitter
         splitter.addWidget(top_widget)
         splitter.addWidget(self.plot_grid)
-        
+
         # Give plots priority to expand
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
@@ -244,6 +255,9 @@ class BioViewMonitor(QMainWindow):
         self.client_worker.device_disconnect_succeeded.connect(
             self.update_status_bar_and_buttons
         )
+        # A live parameter change (e.g. the BIOPAC channel mask) can add or drop
+        # streams; keep the plot-source selector in step with the device.
+        self.client_worker.data_sources_changed.connect(self.populate_plot_grid_sources)
         self.client_worker.streaming_started.connect(
             lambda x: self._handle_streaming_status_changed(x)
         )
@@ -274,7 +288,9 @@ class BioViewMonitor(QMainWindow):
     def _connect_annotation_signals(self):
         """Wire the Mark Events panel to the client so annotations are stored in
         the active recording, and surface its log events in the experiment log."""
-        self.annotate_event_panel.annotation_requested.connect(self.on_annotation_requested)
+        self.annotate_event_panel.annotation_requested.connect(
+            self.on_annotation_requested
+        )
         self.annotate_event_panel.log_event.connect(self.log_display_panel.log_message)
 
     def _handle_server_connection_request(self, server_info: dict):
@@ -374,11 +390,15 @@ class BioViewMonitor(QMainWindow):
             if is_streaming:
                 if current == DeviceStatus.CONNECTED:
                     self.device_status[group_id] = DeviceStatus.STREAMING
-                    self.status_bar.update_device_status(group_id, DeviceStatus.STREAMING)
+                    self.status_bar.update_device_status(
+                        group_id, DeviceStatus.STREAMING
+                    )
             else:
                 if current == DeviceStatus.STREAMING:
                     self.device_status[group_id] = DeviceStatus.CONNECTED
-                    self.status_bar.update_device_status(group_id, DeviceStatus.CONNECTED)
+                    self.status_bar.update_device_status(
+                        group_id, DeviceStatus.CONNECTED
+                    )
 
         # If streaming stopped for any reason while a routine was active (e.g. a
         # server drop), tear down the routine UI/instructions to stay consistent.
@@ -389,12 +409,22 @@ class BioViewMonitor(QMainWindow):
         self.command_bar.update_button_states(client_status)
 
     def keyPressEvent(self, event):
-        """Esc / F11 toggle fullscreen (the app launches fullscreen by default)."""
-        if event.key() in (Qt.Key.Key_Escape, Qt.Key.Key_F11):
+        """F11 toggles true fullscreen; Esc only leaves it.
+
+        The app launches *maximized* (normal window frame, title bar and taskbar
+        still visible), so leaving fullscreen must restore the maximized state
+        rather than the smaller "normal" geometry.
+        """
+        key = event.key()
+        if key == Qt.Key.Key_F11:
             if self.isFullScreen():
-                self.showNormal()
+                self.showMaximized()
             else:
                 self.showFullScreen()
+            event.accept()
+            return
+        if key == Qt.Key.Key_Escape and self.isFullScreen():
+            self.showMaximized()
             event.accept()
             return
         super().keyPressEvent(event)
@@ -420,9 +450,15 @@ class BioViewMonitor(QMainWindow):
             self.settings_panel.update_source("remove", src)
 
     def populate_plot_grid_sources(self, sources):
-        """Populate the plot-source selector from the data sources advertised by
-        the server. `sources` may be DataSource objects or descriptor dicts."""
-        if not sources:
+        """Rebuild the plot-source selector from the sources the server advertises.
+
+        `sources` may be DataSource objects or descriptor dicts. This runs again
+        whenever the server's source list changes (enabling or disabling a device
+        channel, for instance), so it reconciles rather than just repopulating:
+        a source that has gone away is unplotted, and one that is still plotted
+        keeps its tick when the selector is rebuilt.
+        """
+        if sources is None:
             return
 
         source_objs = []
@@ -433,7 +469,19 @@ class BioViewMonitor(QMainWindow):
                 source_objs.append(DataSource.from_dict(src))
 
         self.available_sources = source_objs
+        available = set(source_objs)
+
+        # Free the grid cells held by sources the server no longer offers.
+        for src in list(self.plot_grid.selected_channels.keys()):
+            if src not in available:
+                self.plot_grid.remove_source(src)
+
+        # set_available_sources() rebuilds the model and so clears every check
+        # state; restore the ticks for whatever is still on the grid.
+        still_plotted = list(self.plot_grid.selected_channels.keys())
         self.settings_panel.set_available_sources(source_objs)
+        for src in still_plotted:
+            self.settings_panel.update_source("add", src)
 
     def on_data_received(self, data, sources):
         """Route a received data chunk to the plot grid for display."""
@@ -536,9 +584,7 @@ class BioViewMonitor(QMainWindow):
             return
 
         if not self.client_worker or not self.client_worker.record_annotation(text):
-            self._show_toast(
-                "Start a recording before marking events.", level="warning"
-            )
+            self._show_toast("Start a recording before marking events.", level="warning")
             self.log_display_panel.log_message(
                 "warning", "No active recording to attach the annotation to."
             )
@@ -667,9 +713,7 @@ class BioViewMonitor(QMainWindow):
         if spec is None:
             return
         self.instruction_controller = InstructionController(spec, host_widget=self)
-        self.instruction_controller.log_event.connect(
-            self.log_display_panel.log_message
-        )
+        self.instruction_controller.log_event.connect(self.log_display_panel.log_message)
         self.instruction_controller.start()
 
     def _stop_instruction(self):
@@ -738,7 +782,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config-file",
         nargs="*",
-        help="In case the app is launched using a .bvi file", # A .json also works. 
+        help="In case the app is launched using a .bvi file",  # A .json also works.
         default=[],
     )
     parser.add_argument(
@@ -780,31 +824,19 @@ def run_monitor(argv=None) -> int:
 
     # Create and show main window with parsed configs and flags
     window = BioViewMonitor(
-        config_file=args.config_file, 
+        config_file=args.config_file,
         autodiscover=args.autodiscover,
         autoconnect=args.autoconnect,
     )
-    # Launch fullscreen by default; Esc / F11 toggle back to a normal window.
-    window.showFullScreen()
+    # Launch maximized (not fullscreen): the title bar, window controls and the
+    # OS taskbar all stay visible. F11 opts into true fullscreen; Esc leaves it.
+    window.showMaximized()
 
     # Seamless localhost: always probe 127.0.0.1 quickly and autoconnect the moment
     # a local server answers -- no manual "discover servers" needed. The probe is
     # cheap and runs off the UI thread; retry briefly until connected so the client
     # can be launched before the server and still latch on as soon as it appears.
-    if window.client_worker:
-        lh_handler = window.client_worker
-        localhost_timer = QTimer()
-
-        def _try_localhost():
-            if lh_handler.status >= ClientStatus.SERVER_CONNECTED:
-                localhost_timer.stop()
-                return
-            lh_handler.quick_connect_localhost()
-
-        localhost_timer.timeout.connect(_try_localhost)
-        localhost_timer.start(1000)
-        window._localhost_timer = localhost_timer
-        lh_handler.quick_connect_localhost()
+    window._localhost_timer = start_localhost_autoconnect(window.client_worker, window)
 
     # If auto-discover, trigger the scan. The scan is asynchronous, so autoconnect
     # must wait for the scan to actually complete before selecting/connecting.
@@ -812,6 +844,7 @@ def run_monitor(argv=None) -> int:
         handler = window.client_worker
 
         if window.autoconnect:
+
             def _autoconnect_when_scan_done(servers):
                 # Connect to the first discovered server once results arrive. If a
                 # scan finds nothing we stay subscribed so a later retry (below)
@@ -845,12 +878,11 @@ def run_monitor(argv=None) -> int:
                 return
             if handler.status == ClientStatus.SCANNING:
                 return
-            if handler.discovered_servers:
-                # Found something already; keep retrying only in autoconnect mode
-                # (so a dropped server can be re-found), otherwise let the user act.
-                if not window.autoconnect:
-                    rescan_timer.stop()
-                    return
+            # Found something already; keep retrying only in autoconnect mode
+            # (so a dropped server can be re-found), otherwise let the user act.
+            if handler.discovered_servers and not window.autoconnect:
+                rescan_timer.stop()
+                return
             handler.discover_servers()
 
         rescan_timer.timeout.connect(_maybe_rescan)

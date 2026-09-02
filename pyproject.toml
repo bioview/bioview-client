@@ -20,7 +20,9 @@ dependencies = [
 # Primary launcher: starts a hidden localhost server, then opens the Monitor GUI
 bioview = "bioview_client.launch:main"
 bioview-monitor = "bioview_client.launch:main"
-bioview-configurator = "bioview_client.configurator:main"
+# Also goes through the launcher, so the Configurator starts (or reuses) a
+# localhost server instead of opening with nothing to connect to
+bioview-configurator = "bioview_client.launch:main_configurator"
 
 
 [build-system]

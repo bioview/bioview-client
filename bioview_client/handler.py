@@ -18,6 +18,7 @@ This can be modified for remote operation.
 
 import contextlib
 import os
+import select
 import socket
 import threading
 import time
@@ -28,25 +29,81 @@ from bioview_common import (
     AUTH_TIMEOUT,
     CONTROL_PORT,
     DATA_PORT,
+    DEVICE_OP_COMMAND_TIMEOUT,
     RESPONSE_TIMEOUT,
     AuthenticationError,
     ClientStatus,
     Command,
     Configuration,
-    DataSource,
     DeviceStatus,
     Response,
+    describe_failure,
     get_app_info,
-    get_ip,
     get_challenge_response,
+    get_ip,
     get_unique_path,
-    is_dict_of_dicts,
     parse_and_validate_response,
     send_command,
 )
 from PyQt6.QtCore import QThread, QThreadPool, pyqtSignal
 
-from bioview_client.workers import DataSaver, DataStreamer, DeviceInitWorker, FunctionWorker, ScanWorker
+from bioview_client.workers import (
+    DataSaver,
+    DataStreamer,
+    DeviceInitWorker,
+    FunctionWorker,
+    ScanWorker,
+)
+
+
+#: Commands not worth a trace line of their own. The device-status poll repeats
+#: every couple of seconds for the length of a device operation -- minutes, for a
+#: USRP -- and tracing each one buries everything else. The poll loop reports its
+#: own progress instead.
+_UNTRACED_COMMANDS = {"GET_DEVICE_STATUS"}
+
+#: Longest single value rendered in a debug trace line. Device configurations
+#: run to thousands of characters, and a log window is unreadable full of them.
+_TRACE_VALUE_LIMIT = 120
+
+#: How often the handler thread checks that the control connection is still up.
+CONNECTION_CHECK_INTERVAL = 2.0
+
+
+def _describe_params(params) -> str:
+    """A one-line summary of a command's parameters for the debug trace."""
+    if not params:
+        return ""
+
+    parts = []
+    for key, value in params.items():
+        if isinstance(value, dict):
+            summary = f"{{{len(value)} key(s): {', '.join(list(value)[:4])}}}"
+        elif isinstance(value, (list, tuple, set)):
+            summary = f"[{len(value)} item(s)]"
+        else:
+            summary = str(value)
+        if len(summary) > _TRACE_VALUE_LIMIT:
+            summary = summary[:_TRACE_VALUE_LIMIT] + "..."
+        parts.append(f"{key}={summary}")
+
+    return " (" + ", ".join(parts) + ")"
+
+
+def _describe_response(response) -> str:
+    """A one-line summary of a raw response, for the debug trace."""
+    if response is None:
+        return "no response (timed out or connection lost)"
+
+    resp_type, payload = parse_and_validate_response(response)
+    if resp_type is None:
+        return f"unreadable response ({len(response)} bytes)"
+
+    detail = ""
+    if payload:
+        message = payload.get("message")
+        detail = f" -- {message}" if message else f" ({', '.join(list(payload)[:5])})"
+    return f"{resp_type}{detail}"
 
 
 def _sanitize_label(label: str) -> str:
@@ -69,10 +126,19 @@ class Client(QThread):
     # Since all failure signals only need logging, we do
     # not add explicit signals for failure, only success
     devices_discovered = pyqtSignal(dict)
+    # Configurator: full attached-device listing, and per-device edit results.
+    # (devices, backends) where backends maps device_type -> editable schema.
+    devices_listed = pyqtSignal(list, dict)
+    device_list_failed = pyqtSignal(str)
+    device_config_updated = pyqtSignal(dict, str)
+    device_config_failed = pyqtSignal(str)
     device_init_succeeded = pyqtSignal(dict)
     device_init_failed = pyqtSignal()
     device_status_updated = pyqtSignal(dict)
     device_disconnect_succeeded = pyqtSignal()
+    #: The server's advertised data sources changed (e.g. a device channel was
+    #: enabled or disabled), so the plot-source selector has to be rebuilt.
+    data_sources_changed = pyqtSignal(list)
 
     # Streaming states
     streaming_started = pyqtSignal(bool)
@@ -119,7 +185,9 @@ class Client(QThread):
         self.status = ClientStatus.DEFAULT
         self.data_connected = False
 
-        self.data_sources = None 
+        self.data_sources = None
+        #: Why each device group failed, as reported by the server.
+        self.device_errors = {}
         self.data_streamer = None
 
         # Client-side saving (fast disk on the client per design). Settings are
@@ -182,7 +250,9 @@ class Client(QThread):
 
         # Seed save settings from the experiment configuration if present
         if self.config.experiment is not None:
-            self.enable_save = bool(self.config.experiment.get_param("enable_save", False))
+            self.enable_save = bool(
+                self.config.experiment.get_param("enable_save", False)
+            )
             self.save_dir = self.config.experiment.get_param("save_dir", "") or ""
             self.file_name = self.config.experiment.get_param("file_name", "") or ""
 
@@ -213,7 +283,9 @@ class Client(QThread):
     def has_valid_save_target(self) -> bool:
         """Whether the user has provided both a file name and a save folder, which
         are required before any recording (or annotation) can be written to disk."""
-        return bool((self.file_name or "").strip()) and bool((self.save_dir or "").strip())
+        return bool((self.file_name or "").strip()) and bool(
+            (self.save_dir or "").strip()
+        )
 
     def is_recording(self) -> bool:
         """Whether a client-side recording is currently active."""
@@ -252,25 +324,112 @@ class Client(QThread):
         return Configuration.from_dict(config_dict)
 
     # Thread handling
-    def _send_command_locked(self, command, params=None):
+    def _send_command_locked(self, command, params=None, timeout=None):
+        """Send one command and read its reply, serialized against other senders.
+
+        ``timeout`` raises the control socket's timeout for this exchange only
+        (restored afterwards). Commands whose work happens on the server -- a
+        device enumeration walks every backend -- need far longer than the
+        default connection timeout allows.
+        """
         with self._control_lock:
             if not self.control_socket:
+                self.log_message.emit(
+                    "debug", f"{command.name} not sent: no control connection"
+                )
                 return None
-            return send_command(self.control_socket, command, params)
+
+            previous = None
+            if timeout is not None:
+                with contextlib.suppress(Exception):
+                    previous = self.control_socket.gettimeout()
+                    self.control_socket.settimeout(timeout)
+
+            # Every control exchange passes through here, so tracing it once
+            # covers the whole client: what was asked, what came back and how
+            # long it took, which is what a debug log is for.
+            traced = command.name not in _UNTRACED_COMMANDS
+            started = time.time()
+            if traced:
+                self.log_message.emit(
+                    "debug", f"-> {command.name}{_describe_params(params)}"
+                )
+            try:
+                response = send_command(self.control_socket, command, params)
+            except Exception as e:
+                self.log_message.emit(
+                    "debug",
+                    f"<- {command.name} raised after "
+                    f"{(time.time() - started) * 1000:.0f} ms: {e}",
+                )
+                raise
+            finally:
+                if previous is not None:
+                    with contextlib.suppress(Exception):
+                        self.control_socket.settimeout(previous)
+
+            if traced:
+                elapsed_ms = (time.time() - started) * 1000
+                self.log_message.emit(
+                    "debug",
+                    f"<- {command.name}: {_describe_response(response)} "
+                    f"in {elapsed_ms:.0f} ms",
+                )
+            return response
 
     def run(self):
         self.log_message.emit("info", "Starting client handler...")
 
         while self.running:
             try:
-                # A tiny, non-essential message to test the connection.
                 if not isinstance(self.status, ClientStatus):
                     self.status = ClientStatus.DEFAULT
+
+                # A server that goes away is otherwise never noticed: the client
+                # only finds out when it next sends a command, and nothing then
+                # takes it out of the connected state -- so the window sat there
+                # believing it was connected and every action failed. Watching
+                # for the closed socket here means the disconnect is seen, the
+                # UI is told, and localhost autoconnect can latch on again.
+                if (
+                    self.status >= ClientStatus.SERVER_CONNECTED
+                    and self._connection_dropped()
+                ):
+                    self.log_message.emit("warning", "Lost connection to server")
+                    self.disconnect_from_server()
             except (OSError, ConnectionResetError, BrokenPipeError):
                 # These exceptions mean the connection is closed.
                 self.disconnect_from_server()
             finally:
-                time.sleep(10)  # Check every few seconds
+                time.sleep(CONNECTION_CHECK_INTERVAL)
+
+    def _connection_dropped(self) -> bool:
+        """True when the control socket has been closed by the far end.
+
+        A zero-length peek is the only reliable "the peer hung up" signal for a
+        blocking socket that nobody is currently reading. The control lock is
+        taken without blocking so this never peeks at a reply another thread is
+        in the middle of receiving; a busy socket is by definition alive.
+        """
+        sock = self.control_socket
+        if sock is None:
+            return True
+
+        if not self._control_lock.acquire(blocking=False):
+            return False
+        try:
+            if self.control_socket is None:
+                return True
+            ready, _, _ = select.select([self.control_socket], [], [], 0)
+            if not ready:
+                return False
+            return self.control_socket.recv(1, socket.MSG_PEEK) == b""
+        except (BlockingIOError, InterruptedError):
+            return False
+        except OSError:
+            return True
+        finally:
+            self._control_lock.release()
 
     # Discover servers in parallel
     def discover_servers(self):
@@ -297,37 +456,7 @@ class Client(QThread):
         state = {"completed": 0, "done": False, "last_update": time.time()}
 
         def handle_result(found):
-            with scan_lock:
-                if self._cancel_scan or state["done"]:
-                    return
-
-                state["completed"] += 1
-
-                # Collect a discovered server (deduplicated by IP)
-                if found and isinstance(found, dict):
-                    addr = found.get("ip")
-                    if addr and not any(
-                        s.get("ip") == addr for s in self.discovered_servers
-                    ):
-                        self.discovered_servers.append(found)
-
-                completed = state["completed"]
-                is_done = completed >= total
-                if is_done:
-                    state["done"] = True
-
-                now = time.time()
-                emit_progress = (now - state["last_update"] >= 0.1) or is_done
-                if emit_progress:
-                    state["last_update"] = now
-
-            # Emit signals outside the lock to avoid holding it across Qt dispatch
-            if emit_progress:
-                self.server_scan_progress.emit(int((completed / total) * 100))
-
-            if is_done:
-                self.status = ClientStatus.DEFAULT
-                self.server_scan_completed.emit(self.discovered_servers)
+            self._record_scan_result(found, state, scan_lock, total)
 
         for target_ip in targets:
             if self._cancel_scan:
@@ -335,6 +464,48 @@ class Client(QThread):
             worker = ScanWorker(target_ip, self.control_port)
             worker.signals.result.connect(handle_result)
             self.scan_pool.start(worker)
+
+    def _add_discovered_server(self, found):
+        """Record a probe hit, deduplicated by IP."""
+        if not found or not isinstance(found, dict):
+            return
+        addr = found.get("ip")
+        if not addr:
+            return
+        if any(s.get("ip") == addr for s in self.discovered_servers):
+            return
+        self.discovered_servers.append(found)
+
+    def _record_scan_result(self, found, state, scan_lock, total):
+        """Account for one finished probe and emit progress/completion.
+
+        ``state`` and ``scan_lock`` belong to a single discover_servers() call,
+        so concurrent or rapid rescans never share counters.
+        """
+        with scan_lock:
+            if self._cancel_scan or state["done"]:
+                return
+
+            state["completed"] += 1
+            self._add_discovered_server(found)
+
+            completed = state["completed"]
+            is_done = completed >= total
+            if is_done:
+                state["done"] = True
+
+            now = time.time()
+            emit_progress = (now - state["last_update"] >= 0.1) or is_done
+            if emit_progress:
+                state["last_update"] = now
+
+        # Emit signals outside the lock to avoid holding it across Qt dispatch
+        if emit_progress:
+            self.server_scan_progress.emit(int((completed / total) * 100))
+
+        if is_done:
+            self.status = ClientStatus.DEFAULT
+            self.server_scan_completed.emit(self.discovered_servers)
 
     def cancel_scan(self):
         self._cancel_scan = True
@@ -366,7 +537,12 @@ class Client(QThread):
         if self.status >= ClientStatus.SERVER_CONNECTED or self._connecting:
             return
 
-        found.setdefault("ip", "127.0.0.1")
+        # This server answered a probe on loopback, so keep talking to it over
+        # loopback. setdefault() would not do: the discovery payload always
+        # carries the server's own NIC address, which may be unroutable from
+        # here (VPN, multiple NICs) or be refused by a --local server when the
+        # machine has a public IP.
+        found["ip"] = "127.0.0.1"
         self.discovered_servers = [found] + [
             s for s in self.discovered_servers if s.get("ip") != found.get("ip")
         ]
@@ -378,22 +554,22 @@ class Client(QThread):
         self.connect_to_server()
 
     def _authenticate_with_server(self, server_socket: socket.socket) -> Dict[str, Any]:
-        '''
+        """
         We try to authenticate ourselves with the server. In case the server closes
         the connection, we handle it gracefully (not that anything else can be done)
-        '''
+        """
         server_socket.settimeout(self.auth_timeout)
-        server_info = None 
+        server_info = None
 
-        try: 
+        try:
             # Broadcast client info to server and get response
             response = send_command(
                 sock=server_socket,
                 command=Command.CONNECT_SERVER,
                 params={"client_info": self.info, "timestamp": time.time()},
             )
-            
-            # If we are here, the server did not close connection. 
+
+            # If we are here, the server did not close connection.
             resp_type, resp_payload = parse_and_validate_response(response)
 
             # Check if server provided a challenge
@@ -418,19 +594,27 @@ class Client(QThread):
             )
 
             if auth_resp_type == Response.AUTHENTICATION_SUCCESS.name:
-                server_info = auth_resp_payload.get("server_info", None) if auth_resp_payload else None
+                server_info = (
+                    auth_resp_payload.get("server_info", None)
+                    if auth_resp_payload
+                    else None
+                )
 
                 # Update status
                 self.status = ClientStatus.SERVER_CONNECTED
 
                 hostname = server_info.get("hostname") if server_info else "server"
-                self.log_message.emit(
-                    "info", f"Successfully connected to {hostname}"
-                )
+                self.log_message.emit("info", f"Successfully connected to {hostname}")
+                if server_info:
+                    self.log_message.emit(
+                        "debug",
+                        f"Server {hostname} at {server_info.get('ip', '?')}, "
+                        f"version {server_info.get('version', '?')}",
+                    )
             else:
                 err = auth_resp_payload.get("message", "") if auth_resp_payload else ""
                 raise AuthenticationError(f"Server authentication failed: {err}")
-        except Exception as e: 
+        except Exception as e:
             self.log_message.emit("error", f"Authentication with server failed: {e}")
             server_info = None
 
@@ -507,8 +691,13 @@ class Client(QThread):
             # Data receiver starts after devices are initialized (see
             # _start_data_streamer_after_init), not on bare server connect.
 
-            # Update server info and data sources
+            # Update server info and data sources. The payload re-advertises the
+            # server's own NIC address; keep the address we actually reached it
+            # on so a later reconnect does not switch to an unreachable one.
+            connected_ip = self.selected_server.get("ip")
             self.selected_server.update(server_info)
+            if connected_ip:
+                self.selected_server["ip"] = connected_ip
             self.data_sources = server_info.get("data_sources", None)
 
             # Once everything succeeds, update the status
@@ -566,13 +755,75 @@ class Client(QThread):
 
         self.log_message.emit("info", "Disconnected from server")
 
+    ### Configurator commands
+    def list_devices(self):
+        """Enumerate everything attached, independent of any loaded config.
+
+        Runs off the UI thread: the server walks every backend's discovery,
+        which for USRP means a ``uhd.find`` that can take seconds.
+        """
+        if self.status < ClientStatus.SERVER_CONNECTED:
+            self.device_list_failed.emit("Connect to a server first")
+            return
+
+        worker = FunctionWorker(self._list_devices_blocking)
+        worker.signals.finished.connect(self._on_devices_listed)
+        worker.signals.error.connect(self.device_list_failed.emit)
+        QThreadPool.globalInstance().start(worker)
+
+    def _list_devices_blocking(self):
+        # Enumeration runs every backend's discovery on the server: uhd.find
+        # alone takes seconds, and BIOPAC's WMI walk adds more. The default
+        # control timeout is far too short for the total, and overrunning it
+        # looks exactly like "no devices attached".
+        response = self._send_command_locked(
+            Command.LIST_DEVICES, timeout=DEVICE_OP_COMMAND_TIMEOUT
+        )
+        resp_type, params = parse_and_validate_response(response)
+        if resp_type != Response.DEVICE_LIST.name:
+            raise RuntimeError((params or {}).get("message", "Device listing failed"))
+        return params or {}
+
+    def _on_devices_listed(self, params):
+        devices = params.get("devices", []) or []
+        backends = params.get("backends", {}) or {}
+        self.log_message.emit("info", f"Found {len(devices)} attached device(s)")
+        self.devices_listed.emit(devices, backends)
+
+    def set_device_config(self, device_info: Dict, config: Dict):
+        if self.status < ClientStatus.SERVER_CONNECTED:
+            self.device_config_failed.emit("Connect to a server first")
+            return
+
+        worker = FunctionWorker(self._set_device_config_blocking, device_info, config)
+        worker.signals.finished.connect(
+            lambda result: self.device_config_updated.emit(
+                result.get("device_info", {}), result.get("message", "")
+            )
+        )
+        worker.signals.error.connect(self.device_config_failed.emit)
+        QThreadPool.globalInstance().start(worker)
+
+    def _set_device_config_blocking(self, device_info: Dict, config: Dict):
+        response = self._send_command_locked(
+            Command.SET_DEVICE_CONFIG,
+            {"device_info": device_info, "config": config},
+        )
+        resp_type, params = parse_and_validate_response(response)
+        if resp_type != Response.DEVICE_CONFIG_UPDATED.name:
+            raise RuntimeError(
+                (params or {}).get("message", "Could not update the device")
+            )
+        return params or {}
+
     ### Device Commands
     def discover_devices(self):
         self.initialize_devices(only_discover=True)
+
     def initialize_devices(self, only_discover: bool = False):
         # Avoid starting another discovery while one is active
         if self._discovering_devices:
-            self.log_message.emit("warn", "Device discovery already in progress")
+            self.log_message.emit("warning", "Device discovery already in progress")
             return
 
         if self.status < ClientStatus.SERVER_CONNECTED:
@@ -598,55 +849,97 @@ class Client(QThread):
             self.log_message.emit("debug", "Initializing devices...")
 
         worker = DeviceInitWorker(client_ref=self, command=cmd)
+        worker.signals.finished.connect(
+            lambda status: self._on_device_command_finished(status, only_discover)
+        )
+        self.thread_pool.start(worker)
 
-        def _on_finished(group_status_dict):
-            """
-            The server reports device states as a flat mapping:
-                { device_id (== group_id): DeviceStatus value }
+    @staticmethod
+    def _is_connected(status_value) -> bool:
+        """True for DeviceStatus.CONNECTED, as an enum or as its wire value."""
+        if status_value == DeviceStatus.CONNECTED:
+            return True
+        if isinstance(status_value, DeviceStatus):
+            return status_value == DeviceStatus.CONNECTED
+        return str(status_value) == DeviceStatus.CONNECTED.value
 
-            The response only contains keys for device groups that were requested
-            in the provided payload.
-            """
-            if not group_status_dict or not isinstance(group_status_dict, dict):
-                self._discovering_devices = False
+    def _on_device_command_finished(self, group_status_dict, only_discover: bool):
+        """
+        The server reports device states as a flat mapping:
+            { device_id (== group_id): DeviceStatus value }
 
-                if self.config.devices:
-                    self.log_message.emit(
-                        "warning",
-                        "Device command failed: no status returned from server",
-                    )
-                    if not only_discover:
-                        self.device_init_failed.emit()
-                return
-
-            self.device_states = group_status_dict
-
-            def _is_connected(status_value) -> bool:
-                if status_value == DeviceStatus.CONNECTED:
-                    return True
-                if isinstance(status_value, DeviceStatus):
-                    return status_value == DeviceStatus.CONNECTED
-                return str(status_value) == DeviceStatus.CONNECTED.value
-
-            # Update state and emit appropriate signal
-            if only_discover:
-                self.status = ClientStatus.DEVICES_DISCOVERED
-                self.devices_discovered.emit(self.device_states)
-            elif any(_is_connected(v) for v in group_status_dict.values()):
-                self.status = ClientStatus.DEVICES_CONNECTED
-                self._start_data_streamer_after_init()
-                self.device_init_succeeded.emit(self.device_states)
-            else:
-                self.log_message.emit(
-                    "error",
-                    "Device initialization failed: no devices connected",
-                )
-                self.device_init_failed.emit()
-
+        The response only contains keys for device groups that were requested
+        in the provided payload.
+        """
+        if not group_status_dict or not isinstance(group_status_dict, dict):
             self._discovering_devices = False
 
-        worker.signals.finished.connect(_on_finished)
-        self.thread_pool.start(worker)
+            if self.config.devices:
+                self.log_message.emit(
+                    "warning",
+                    "Device command failed: no status returned from server",
+                )
+                if not only_discover:
+                    self.device_init_failed.emit()
+            return
+
+        self.device_states = group_status_dict
+        self._log_device_outcomes(group_status_dict, only_discover)
+
+        # Update state and emit appropriate signal
+        if only_discover:
+            self.status = ClientStatus.DEVICES_DISCOVERED
+            self.devices_discovered.emit(self.device_states)
+        elif any(self._is_connected(v) for v in group_status_dict.values()):
+            self.status = ClientStatus.DEVICES_CONNECTED
+            self._start_data_streamer_after_init()
+            self.device_init_succeeded.emit(self.device_states)
+        else:
+            # The per-device lines above already carry the explanations, so
+            # this stays a summary rather than repeating all of them.
+            failed = ", ".join(self.device_errors or {})
+            self.log_message.emit(
+                "error",
+                "Device initialization failed: no devices connected"
+                + (f" (failed: {failed})" if failed else ""),
+            )
+            self.device_init_failed.emit()
+
+        self._discovering_devices = False
+
+    def _log_device_outcomes(self, group_status_dict, only_discover: bool):
+        """Report what happened to each device group, and why when it failed.
+
+        A single "initialization failed" line for the whole config does not say
+        which device failed or what went wrong -- the server knows both, so both
+        are shown here rather than left in a server log the user cannot reach.
+        """
+        action = "Discovery" if only_discover else "Initialization"
+        good = {DeviceStatus.AVAILABLE.value, DeviceStatus.CONNECTED.value}
+        errors = self.device_errors or {}
+
+        for group, state in group_status_dict.items():
+            state_text = getattr(state, "value", state)
+            if str(state_text) in good:
+                self.log_message.emit("info", f"{group}: {state_text}")
+                continue
+
+            reason = errors.get(group)
+            # Explained through the shared catalogue, so the Monitor and the
+            # Configurator word a given cause identically.
+            explained = describe_failure(reason) if reason else ""
+            self.log_message.emit(
+                "error",
+                f"{group}: {state_text}" + (f" -- {explained}" if explained else ""),
+            )
+
+        ok = sum(
+            1 for v in group_status_dict.values() if str(getattr(v, "value", v)) in good
+        )
+        self.log_message.emit(
+            "debug",
+            f"{action} finished: {ok}/{len(group_status_dict)} device group(s) ready",
+        )
 
     def disconnect_device(self):
         self.log_message.emit("info", "Disconnecting devices...")
@@ -655,8 +948,7 @@ class Client(QThread):
         if self.status is ClientStatus.STREAMING:
             self.stop_streaming()
 
-        response = self._send_command_locked( command=Command.DISCONNECT_DEVICES
-        )
+        response = self._send_command_locked(command=Command.DISCONNECT_DEVICES)
         resp_type, resp_payload = parse_and_validate_response(response)
 
         if resp_type == Response.SUCCESS.name:
@@ -668,7 +960,8 @@ class Client(QThread):
 
     # Data receiver lifecycle (long-lived for the whole session)
     def _start_data_streamer_after_init(self):
-        """Start the data receiver once devices are initialized and the data socket exists."""
+        """Start the data receiver once devices are initialized and the data
+        socket exists."""
         if not self.data_connected or self.data_socket is None:
             return
         self._start_data_streamer()
@@ -706,10 +999,17 @@ class Client(QThread):
             return False
 
         if not self.control_socket:
-            self.log_message.emit("error", "Cannot start streaming: not connected to a server")
+            self.log_message.emit(
+                "error", "Cannot start streaming: not connected to a server"
+            )
             return False
 
         self.log_message.emit("info", "Attempting to start data streaming...")
+        self.log_message.emit(
+            "debug",
+            f"Streaming {len(self.data_sources or [])} data source(s); "
+            f"saving {'on' if self.enable_save else 'off'}",
+        )
         self.control_socket.settimeout(10)
         response = self._send_command_locked(
             command=Command.START_STREAMING,
@@ -769,8 +1069,7 @@ class Client(QThread):
             device_config = {}
             if self.config is not None:
                 device_config = {
-                    dev_id: cfg.to_dict()
-                    for dev_id, cfg in self.config.devices.items()
+                    dev_id: cfg.to_dict() for dev_id, cfg in self.config.devices.items()
                 }
             self.data_saver = DataSaver(
                 save_path=save_path,
@@ -808,7 +1107,7 @@ class Client(QThread):
 
         if self.control_socket:
             self.control_socket.settimeout(10)
-        response = self._send_command_locked( command=Command.STOP_STREAMING)
+        response = self._send_command_locked(command=Command.STOP_STREAMING)
         resp_type, resp_payload = parse_and_validate_response(response)
 
         if resp_type == Response.ERROR.name:
@@ -832,11 +1131,11 @@ class Client(QThread):
         self.log_message.emit("debug", "Streaming stopped successfully")
 
     def configure_device(self, device_id, config):
-        '''
+        """
         This function is used by BioView Configurator to modify operational parameters
         of connected devices using respective device handlers, which in turn will make
-        calls using the provided device drivers. 
-        '''
+        calls using the provided device drivers.
+        """
         if self._discovering_devices:
             self.log_message.emit(
                 "warning",
@@ -854,12 +1153,17 @@ class Client(QThread):
 
         if resp_type == Response.SUCCESS.name:
             self.log_message.emit("debug", "Successfully updated device parameter")
-            # TODO: Let UI know to update things correctly.
+            # A parameter change can add or remove streams (a BIOPAC channel
+            # mask, say). The server replies with the new source list; publish it
+            # so the plot-source selector follows the device.
+            data_sources = (resp_payload or {}).get("data_sources")
+            if data_sources is not None:
+                self.data_sources = data_sources
+                self.data_sources_changed.emit(list(data_sources))
             return True
         else:
-            msg = resp_payload.get("message", "")
+            msg = resp_payload.get("message", "") if resp_payload else ""
             self.log_message.emit("debug", f"Failed to update parameter: {msg}")
-            # TODO: Update UI
             return False
 
     def run_dpic_balance(self, device_id: str):

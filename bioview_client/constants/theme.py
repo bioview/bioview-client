@@ -7,18 +7,6 @@ from PyQt6.QtGui import QColor
 
 logger = logging.getLogger(__name__)
 
-# Ref: Cbrewer diverging color scheme (deprecated)
-PLOT_COLORS = {
-    "pink": [197, 27, 125],  # Lighter: 222,119,174
-    "violet": [118, 42, 131],  # Lighter: 153,112,171
-    "blue": [33, 102, 172],  # Lighter: 50,136,189
-    "teal": [53, 151, 143],  # Lighter: 102,194,165
-    "green": [26, 152, 80],  # Lighter: 102,189,99
-    "lime": [127, 188, 65],  # Lighter: 166,217,106
-    "yellow": [253, 184, 99],  # Darker: 253,174,97
-    "orange": [244, 109, 67],  # Lighter: 253,174,97
-    "red": [213, 62, 79],  # Darker: 178,24,43
-}
 
 COLOR_SCHEME = {
     "red": {"dark": (255, 105, 97), "light": (215, 0, 21)},
