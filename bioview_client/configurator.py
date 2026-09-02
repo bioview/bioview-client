@@ -41,6 +41,7 @@ from bioview_client.assets import APP_DESKTOP_NAME, get_app_icon
 from bioview_client.autoconnect import start_localhost_autoconnect
 from bioview_client.components import (
     LogDisplayPanel,
+    device_details,
     device_health_warning,
     device_is_healthy,
 )
@@ -194,7 +195,7 @@ class DeviceListPanel(QWidget):
 
         for device in self.devices:
             name = device.get("name", "Unnamed Device")
-            item = QListWidgetItem(f"{name}\n{self._device_details(device)}")
+            item = QListWidgetItem(f"{name}\n{device_details(device)}")
             item.setData(Qt.ItemDataRole.UserRole, device)
             font = QFont()
             font.setBold(True)
