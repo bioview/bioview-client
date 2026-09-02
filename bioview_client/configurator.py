@@ -6,7 +6,9 @@ LabVIEW. Today the only editable property is a USRP's ``device_name``.
 
 Flow: Discover lists what is attached; selecting a device enables Edit when its
 backend declares editable properties; Edit opens a modal with those fields plus
-Save and Cancel.
+Save and Cancel. The modal stays up while the change is applied, showing a busy
+indicator and then Completed or Failed, and the list is re-read afterwards so a
+renamed device shows its new name straight away.
 
 Names are stored by BioView (keyed on the radio's serial) and applied during
 discovery, rather than written to device EEPROM. Configuration files, the
@@ -15,8 +17,8 @@ channel map and the serial cache all see the chosen name.
 
 import sys
 
-from bioview_common import APP_VERSION, ClientStatus
-from PyQt6.QtCore import Qt, pyqtSignal
+from bioview_common import APP_VERSION, ClientStatus, DeviceType
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QGuiApplication
 from PyQt6.QtWidgets import (
     QApplication,
@@ -31,6 +33,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QStatusBar,
     QVBoxLayout,
@@ -49,7 +52,16 @@ from bioview_client.handler import Client
 
 
 class DeviceConfigDialog(QDialog):
-    """Modal editor for one device's editable properties."""
+    """Modal editor for one device's editable properties.
+
+    The dialog stays open while the server applies the change: Save hands the
+    values up through ``save_requested`` instead of closing, and the window
+    calls :meth:`update_finished` once the server answers. Closing on Save left
+    the log panel as the only sign that anything was happening.
+    """
+
+    #: device_info, config -- emitted when the user commits valid values.
+    save_requested = pyqtSignal(dict, dict)
 
     def __init__(self, device_info, editable_properties, parent=None):
         super().__init__(parent)
@@ -57,6 +69,7 @@ class DeviceConfigDialog(QDialog):
         self.editable_properties = editable_properties or {}
         self.property_widgets = {}
         self.result_config = None
+        self._updating = False
         self._init_ui()
 
     def _init_ui(self):
@@ -98,12 +111,32 @@ class DeviceConfigDialog(QDialog):
         self.error_label.hide()
         layout.addWidget(self.error_label)
 
-        buttons = QDialogButtonBox(
+        # Progress and outcome sit on the button row so the answer appears where
+        # the user is already looking after pressing Save.
+        button_row = QHBoxLayout()
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)  # indeterminate: a busy spinner, no ETA
+        self.progress.setTextVisible(False)
+        self.progress.setFixedWidth(90)
+        self.progress.hide()
+        button_row.addWidget(self.progress)
+
+        self.status_label = QLabel("")
+        self.status_label.hide()
+        button_row.addWidget(self.status_label)
+        button_row.addStretch()
+
+        self.button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.accepted.connect(self._on_save)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        self.save_btn = self.button_box.button(QDialogButtonBox.StandardButton.Save)
+        self.cancel_btn = self.button_box.button(QDialogButtonBox.StandardButton.Cancel)
+        self.button_box.accepted.connect(self._on_save)
+        self.button_box.rejected.connect(self.reject)
+        button_row.addWidget(self.button_box)
+
+        layout.addLayout(button_row)
 
     def _validate(self, config):
         for prop_name, spec in self.editable_properties.items():
@@ -126,7 +159,52 @@ class DeviceConfigDialog(QDialog):
             self.error_label.show()
             return
         self.result_config = config
-        self.accept()
+        self._set_updating(True)
+        self.save_requested.emit(dict(self.device_info), dict(config))
+
+    def _set_updating(self, updating):
+        self._updating = updating
+        for widget in self.property_widgets.values():
+            widget.setEnabled(not updating)
+        self.save_btn.setEnabled(not updating)
+        self.cancel_btn.setEnabled(not updating)
+        self.progress.setVisible(updating)
+        if updating:
+            self.error_label.hide()
+            self._set_status("Updating...", "#c9c9c9")
+
+    def _set_status(self, text, color):
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(f"color: {color};")
+        self.status_label.show()
+
+    def update_finished(self, ok, message=""):
+        """Report the server's answer. Closes the dialog only on success."""
+        self.progress.hide()
+        if ok:
+            # Stay latched shut (``_updating``) so nothing can be edited or
+            # cancelled in the moment the result is on screen.
+            self._set_status("Completed", "#4caf50")
+            QTimer.singleShot(900, self.accept)
+            return
+
+        self._set_updating(False)
+        self._set_status("Failed", "#ff6b6b")
+        if message:
+            self.error_label.setText(message)
+            self.error_label.show()
+
+    def reject(self):
+        # An update is in flight; its result still has to be shown here.
+        if self._updating:
+            return
+        super().reject()
+
+    def closeEvent(self, event):
+        if self._updating:
+            event.ignore()
+            return
+        super().closeEvent(event)
 
 
 class DeviceListPanel(QWidget):
@@ -274,6 +352,7 @@ class ConfiguratorWindow(QMainWindow):
         super().__init__()
         self.client_worker = None
         self._pending_device = None
+        self._config_dialog = None
         self._init_ui()
         self._setup_client()
 
@@ -358,24 +437,60 @@ class ConfiguratorWindow(QMainWindow):
 
     def show_device_config(self, device_info, editable_properties):
         dialog = DeviceConfigDialog(device_info, editable_properties, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        dialog.save_requested.connect(self._on_config_save_requested)
+        self._config_dialog = dialog
+        try:
+            # The dialog now closes itself, once the update has landed.
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        finally:
+            self._config_dialog = None
+
+        if not accepted:
             return
-        if not dialog.result_config:
-            return
+
+        # Re-list so the new name is reflected everywhere.
+        self.discover_devices()
+        self._warn_if_power_cycle_needed(device_info, dialog.result_config)
+
+    def _on_config_save_requested(self, device_info, config):
         self._pending_device = device_info
-        self.client_worker.set_device_config(device_info, dialog.result_config)
+        self.client_worker.set_device_config(device_info, config)
+
+    def _warn_if_power_cycle_needed(self, device_info, config=None):
+        """A renamed USRP keeps announcing its old name until it is power cycled.
+
+        BioView applies the new name at discovery, so it is already in effect
+        here -- but the radio itself only reports it after a power cycle, and a
+        user watching the device tell them the old name needs to know why.
+        """
+        device_type = str((device_info or {}).get("device_type", "")).lower()
+        if device_type != DeviceType.USRP.value:
+            return
+        name = (config or {}).get("device_name") or device_info.get("name", "The device")
+        QMessageBox.information(
+            self,
+            "Power cycle required",
+            f"{name} has been updated.\n\n"
+            "Power cycle the USRP for the new name to be reported by the "
+            "device itself.",
+        )
 
     def on_device_config_updated(self, device_info, message):
         self.log_panel.add_log_message(
             "info", f"{device_info.get('name', 'Device')}: {message}"
         )
         self._pending_device = None
-        # Re-list so the new name is reflected everywhere.
+        if self._config_dialog is not None:
+            self._config_dialog.update_finished(True, message)
+            return
         self.discover_devices()
 
     def on_device_config_failed(self, message):
         self._pending_device = None
         self.log_panel.add_log_message("error", f"Update failed: {message}")
+        if self._config_dialog is not None:
+            self._config_dialog.update_finished(False, message)
+            return
         QMessageBox.warning(self, "Could not update device", message)
 
     def on_server_connected(self):
