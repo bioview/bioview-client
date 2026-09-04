@@ -1,20 +1,4 @@
-""" Client-side handler
-
-The client side handler connects to available servers (which may be remote), and
-wraps communication to/from the server to provide to any suitable frontend that uses
-the client handler. The goal of this handler is to be front-end agnostic and provides
-the following functionality -
-1. Server Connection Ping: This checks whether a server is available to be connected to
-2. Device Discovery: Using the server's discovery functionality, provides the client
-                    with all available device backends
-3. Device Connection: Initiates connection with the device to get them ready to stream
-4. Streaming: Starts streaming from backend devices with display buffers sent to client
-                    for graphical output (if requested)
-5. Device Configuration: Allows device configuration to be modified from the client side
-
-By default, the client operates on localhost at ports 9999 (control) and 9998 (data).
-This can be modified for remote operation.
-"""
+"""Front-end agnostic client handler. See bioview-docs/architecture/client.md."""
 
 import contextlib
 import os
@@ -22,7 +6,7 @@ import select
 import socket
 import threading
 import time
-from typing import Any, Dict, List
+from typing import Any
 
 import numpy as np
 from bioview_common import (
@@ -31,6 +15,7 @@ from bioview_common import (
     DATA_PORT,
     DEVICE_OP_COMMAND_TIMEOUT,
     RESPONSE_TIMEOUT,
+    STREAMING_COMMAND_TIMEOUT,
     AuthenticationError,
     ClientStatus,
     Command,
@@ -56,17 +41,14 @@ from bioview_client.workers import (
 )
 
 
-#: Commands not worth a trace line of their own. The device-status poll repeats
-#: every couple of seconds for the length of a device operation -- minutes, for a
-#: USRP -- and tracing each one buries everything else. The poll loop reports its
-#: own progress instead.
+# The device-status poll repeats every couple of seconds and would bury
+# everything else in the trace; the poll loop reports its own progress.
 _UNTRACED_COMMANDS = {"GET_DEVICE_STATUS"}
 
-#: Longest single value rendered in a debug trace line. Device configurations
-#: run to thousands of characters, and a log window is unreadable full of them.
+# Longest single value rendered in a debug trace line.
 _TRACE_VALUE_LIMIT = 120
 
-#: How often the handler thread checks that the control connection is still up.
+# How often the handler thread checks that the control connection is still up.
 CONNECTION_CHECK_INTERVAL = 2.0
 
 
@@ -79,7 +61,7 @@ def _describe_params(params) -> str:
     for key, value in params.items():
         if isinstance(value, dict):
             summary = f"{{{len(value)} key(s): {', '.join(list(value)[:4])}}}"
-        elif isinstance(value, (list, tuple, set)):
+        elif isinstance(value, list | tuple | set):
             summary = f"[{len(value)} item(s)]"
         else:
             summary = str(value)
@@ -122,12 +104,9 @@ class Client(QThread):
     server_scan_progress = pyqtSignal(int)
     server_status = pyqtSignal(dict)
 
-    # Device control signals
-    # Since all failure signals only need logging, we do
-    # not add explicit signals for failure, only success
+    # Device control signals (success only; failures are logged, not signalled)
     devices_discovered = pyqtSignal(dict)
-    # Configurator: full attached-device listing, and per-device edit results.
-    # (devices, backends) where backends maps device_type -> editable schema.
+    # (devices, backends), where backends maps device_type -> editable schema
     devices_listed = pyqtSignal(list, dict)
     device_list_failed = pyqtSignal(str)
     device_config_updated = pyqtSignal(dict, str)
@@ -136,8 +115,7 @@ class Client(QThread):
     device_init_failed = pyqtSignal()
     device_status_updated = pyqtSignal(dict)
     device_disconnect_succeeded = pyqtSignal()
-    #: The server's advertised data sources changed (e.g. a device channel was
-    #: enabled or disabled), so the plot-source selector has to be rebuilt.
+    # Emitted when the server's advertised source list changes
     data_sources_changed = pyqtSignal(list)
 
     # Streaming states
@@ -147,16 +125,15 @@ class Client(QThread):
     # General info signals
     log_message = pyqtSignal(str, str)
 
-    # Data signal for graphical output. Carries (data, sources) where data is a
-    # (num_sources, num_samples) array and sources is the ordered list of source
-    # descriptor dicts describing each row.
+    # (data, sources): a (num_sources, num_samples) array plus one source
+    # descriptor dict per row, in the same order
     data_received = pyqtSignal(np.ndarray, object)
 
     def __init__(
         self,
         config: Configuration = None,
         experiment_config=None,
-        group_configs: Dict = None,
+        group_configs: dict = None,
         data_port: int = DATA_PORT,
         control_port: int = CONTROL_PORT,
         auth_timeout: int = AUTH_TIMEOUT,
@@ -170,8 +147,8 @@ class Client(QThread):
         self.address: str = get_ip()
         self.network_prefix: str = self.address[: self.address.rindex(".")]
 
-        self.discovered_servers: List[Dict] = []
-        self.selected_server: Dict = {}
+        self.discovered_servers: list[dict] = []
+        self.selected_server: dict = {}
 
         self.data_port: int = data_port
         self.control_port: int = control_port
@@ -186,51 +163,46 @@ class Client(QThread):
         self.data_connected = False
 
         self.data_sources = None
-        #: Why each device group failed, as reported by the server.
+        # Why each device group failed, as reported by the server
         self.device_errors = {}
         self.data_streamer = None
 
-        # Client-side saving (fast disk on the client per design). Settings are
-        # populated from the UI; the saver thread is created when streaming starts.
+        # Client-side saving; the saver thread is created when streaming starts
         self.data_saver = None
         self.enable_save = False
         self.save_dir = ""
         self.file_name = ""
-        # Optional routine label appended to the file name for timed-mode runs:
-        #   timed:   <file_name>_<label>.bvr
-        #   untimed: <file_name>.bvr
+        # Timed runs save as <file_name>_<label>.bvr, untimed as <file_name>.bvr
         self.save_label = None
 
-        # Thread pool for control/device operations (connect, init, start/stop).
-        # Kept small since these are serialized through the control socket lock.
+        # Control/device operations, serialized through the control socket lock
         self.thread_pool = QThreadPool()
         self.thread_pool.setMaxThreadCount(8)
 
-        # Separate, bounded pool for the LAN scan so probing up to 254 hosts does
-        # not spawn a 254-thread storm that contends with the rest of the app.
+        # Bounded separately so a 254-host LAN scan cannot starve the app
         self.scan_pool = QThreadPool()
         self.scan_pool.setMaxThreadCount(32)
         self._cancel_scan = False
 
-        # Guard so overlapping auto-connect attempts (e.g. fast localhost probe and
-        # a full LAN autoconnect firing close together) never run concurrently.
+        # Keeps the fast localhost probe and a LAN autoconnect from racing
         self._connecting = False
         self._connect_guard_lock = threading.Lock()
 
         # Device discovery state
         self._discovering_devices = False
 
-        # Lock to serialize control (and related socket) operations to avoid races
-        # between send/recv and close operations from different threads.
+        # One streaming start at a time; see start_streaming().
+        self._start_streaming_lock = threading.Lock()
+        self._start_streaming_pending = False
+
+        # Serializes send/recv against close across threads
         self._control_lock = threading.Lock()
 
         # Running state for the QThread
         self.running = False
 
-        # Keep track of unified configuration. The monitor UI passes a separate
-        # experiment_config object and a group_configs dict (device_id -> config
-        # object); merge them into a single Configuration here. A pre-built
-        # Configuration (used by other frontends) takes precedence if provided.
+        # A pre-built Configuration wins; otherwise experiment + group configs
+        # are merged into one.
         if config is None and (experiment_config is not None or group_configs):
             config = self._build_configuration(experiment_config, group_configs)
         self.config = config or Configuration()
@@ -238,8 +210,7 @@ class Client(QThread):
         # Backward compatibility for existing code that uses group_configs
         self.group_configs = self.config.to_dict()
 
-        # Now, while we understand devices in the form of groups, we keep track of
-        # states for individual devices for clearer presentation in the UI
+        # Devices are driven as groups but tracked individually for the UI
         self.device_states = {}
         for device_id, device_cfg in self.config.devices.items():
             self.device_states[device_id] = {
@@ -267,8 +238,7 @@ class Client(QThread):
             self.file_name = value or ""
 
     def set_save_label(self, label):
-        """Set (or clear with None) the routine label appended to recordings made
-        in timed mode."""
+        """Set (or clear with None) the routine label appended to recordings."""
         self.save_label = label or None
 
     def record_param_change(self, device_id: str, param: str, value):
@@ -281,8 +251,7 @@ class Client(QThread):
             self.data_saver.record_change(device_id, param, value)
 
     def has_valid_save_target(self) -> bool:
-        """Whether the user has provided both a file name and a save folder, which
-        are required before any recording (or annotation) can be written to disk."""
+        """Whether both a file name and a save folder have been provided."""
         return bool((self.file_name or "").strip()) and bool(
             (self.save_dir or "").strip()
         )
@@ -292,9 +261,7 @@ class Client(QThread):
         return self.data_saver is not None
 
     def record_annotation(self, text: str) -> bool:
-        """Store an event annotation ("Mark Event") in the active recording's
-        .bvr metadata (under the ``Annotations`` key). Returns True if it was
-        recorded, or False if there is no active recording to attach it to."""
+        """Store an annotation under the recording's ``Annotations`` metadata."""
         if self.data_saver is None:
             return False
         self.data_saver.record_annotation(text)
@@ -302,8 +269,7 @@ class Client(QThread):
 
     @staticmethod
     def _build_configuration(experiment_config, group_configs) -> Configuration:
-        """Merge a separate experiment config and per-device group configs into a
-        single unified Configuration."""
+        """Merge experiment and per-device group configs into one Configuration."""
         config_dict = {}
 
         if experiment_config is not None:
@@ -327,10 +293,7 @@ class Client(QThread):
     def _send_command_locked(self, command, params=None, timeout=None):
         """Send one command and read its reply, serialized against other senders.
 
-        ``timeout`` raises the control socket's timeout for this exchange only
-        (restored afterwards). Commands whose work happens on the server -- a
-        device enumeration walks every backend -- need far longer than the
-        default connection timeout allows.
+        ``timeout`` overrides the socket timeout for this exchange only.
         """
         with self._control_lock:
             if not self.control_socket:
@@ -345,9 +308,6 @@ class Client(QThread):
                     previous = self.control_socket.gettimeout()
                     self.control_socket.settimeout(timeout)
 
-            # Every control exchange passes through here, so tracing it once
-            # covers the whole client: what was asked, what came back and how
-            # long it took, which is what a debug log is for.
             traced = command.name not in _UNTRACED_COMMANDS
             started = time.time()
             if traced:
@@ -385,12 +345,8 @@ class Client(QThread):
                 if not isinstance(self.status, ClientStatus):
                     self.status = ClientStatus.DEFAULT
 
-                # A server that goes away is otherwise never noticed: the client
-                # only finds out when it next sends a command, and nothing then
-                # takes it out of the connected state -- so the window sat there
-                # believing it was connected and every action failed. Watching
-                # for the closed socket here means the disconnect is seen, the
-                # UI is told, and localhost autoconnect can latch on again.
+                # Without this poll a dropped server is only noticed on the
+                # next command, and nothing clears the connected state.
                 if (
                     self.status >= ClientStatus.SERVER_CONNECTED
                     and self._connection_dropped()
@@ -398,7 +354,6 @@ class Client(QThread):
                     self.log_message.emit("warning", "Lost connection to server")
                     self.disconnect_from_server()
             except (OSError, ConnectionResetError, BrokenPipeError):
-                # These exceptions mean the connection is closed.
                 self.disconnect_from_server()
             finally:
                 time.sleep(CONNECTION_CHECK_INTERVAL)
@@ -406,10 +361,8 @@ class Client(QThread):
     def _connection_dropped(self) -> bool:
         """True when the control socket has been closed by the far end.
 
-        A zero-length peek is the only reliable "the peer hung up" signal for a
-        blocking socket that nobody is currently reading. The control lock is
-        taken without blocking so this never peeks at a reply another thread is
-        in the middle of receiving; a busy socket is by definition alive.
+        The lock is taken without blocking, so this never peeks at a reply
+        another thread is receiving; a busy socket is by definition alive.
         """
         sock = self.control_socket
         if sock is None:
@@ -433,8 +386,6 @@ class Client(QThread):
 
     # Discover servers in parallel
     def discover_servers(self):
-        # Guard against overlapping scans (which would corrupt shared counters
-        # and make completion fire unreliably). A scan in progress is left to run.
         if self.status == ClientStatus.SCANNING:
             self.log_message.emit("debug", "Server scan already in progress")
             return
@@ -443,15 +394,14 @@ class Client(QThread):
         self.discovered_servers = []
         self._cancel_scan = False
 
-        # Probe every host on the local /24 plus loopback, so a local-only server
-        # is always reachable even if NIC detection is off or there is no LAN.
+        # Loopback is probed explicitly so a local-only server is found even
+        # with no LAN or failed NIC detection.
         targets = [f"{self.network_prefix}.{i}" for i in range(1, 255)]
         if "127.0.0.1" not in targets:
             targets.append("127.0.0.1")
         total = len(targets)
 
-        # All scan state is local to this invocation so concurrent/rapid rescans
-        # never clobber each other's counters.
+        # Scan state is per-invocation so rapid rescans cannot clobber it.
         scan_lock = threading.Lock()
         state = {"completed": 0, "done": False, "last_update": time.time()}
 
@@ -499,7 +449,7 @@ class Client(QThread):
             if emit_progress:
                 state["last_update"] = now
 
-        # Emit signals outside the lock to avoid holding it across Qt dispatch
+        # Emitted outside the lock: never hold it across a Qt dispatch.
         if emit_progress:
             self.server_scan_progress.emit(int((completed / total) * 100))
 
@@ -511,16 +461,13 @@ class Client(QThread):
         self._cancel_scan = True
         self.scan_pool.clear()
 
-        # Reset out of the scanning state so a fresh scan can be started
         if self.status == ClientStatus.SCANNING:
             self.status = ClientStatus.DEFAULT
 
         self.server_scan_completed.emit(self.discovered_servers)
 
     def quick_connect_localhost(self):
-        """Fast path for seamless localhost usage: probe 127.0.0.1 with a short
-        timeout and, if a server answers, register it and connect immediately --
-        without the full LAN scan and without blocking the UI thread."""
+        """Probe 127.0.0.1 with a short timeout and connect if a server answers."""
         if self.status >= ClientStatus.SERVER_CONNECTED:
             return
         if self._connecting:
@@ -530,49 +477,37 @@ class Client(QThread):
         self.scan_pool.start(worker)
 
     def _on_localhost_probe(self, found):
-        # Runs on the UI thread (queued from the worker). Bail unless we found a
-        # local server and are still unconnected.
         if not found or not isinstance(found, dict):
             return
         if self.status >= ClientStatus.SERVER_CONNECTED or self._connecting:
             return
 
-        # This server answered a probe on loopback, so keep talking to it over
-        # loopback. setdefault() would not do: the discovery payload always
-        # carries the server's own NIC address, which may be unroutable from
-        # here (VPN, multiple NICs) or be refused by a --local server when the
-        # machine has a public IP.
+        # Keep using loopback: the advertised NIC address may be unroutable
+        # from here, or refused outright by a --local server.
         found["ip"] = "127.0.0.1"
         self.discovered_servers = [found] + [
             s for s in self.discovered_servers if s.get("ip") != found.get("ip")
         ]
-        # Surface the localhost server in the UI's server dropdown
         self.server_scan_completed.emit(self.discovered_servers)
 
         self.selected_server = found
         self.log_message.emit("info", "Localhost server found; connecting...")
         self.connect_to_server()
 
-    def _authenticate_with_server(self, server_socket: socket.socket) -> Dict[str, Any]:
-        """
-        We try to authenticate ourselves with the server. In case the server closes
-        the connection, we handle it gracefully (not that anything else can be done)
-        """
+    def _authenticate_with_server(self, server_socket: socket.socket) -> dict[str, Any]:
+        """Run the challenge/response handshake over an open control socket."""
         server_socket.settimeout(self.auth_timeout)
         server_info = None
 
         try:
-            # Broadcast client info to server and get response
             response = send_command(
                 sock=server_socket,
                 command=Command.CONNECT_SERVER,
                 params={"client_info": self.info, "timestamp": time.time()},
             )
 
-            # If we are here, the server did not close connection.
             resp_type, resp_payload = parse_and_validate_response(response)
 
-            # Check if server provided a challenge
             challenge = None
             if resp_type == Response.SERVER_CHALLENGE.name and resp_payload:
                 challenge = resp_payload.get("challenge", None)
@@ -588,7 +523,6 @@ class Client(QThread):
                 params={"token": auth_token, "timestamp": time.time()},
             )
 
-            # Check results
             auth_resp_type, auth_resp_payload = parse_and_validate_response(
                 auth_response
             )
@@ -600,7 +534,6 @@ class Client(QThread):
                     else None
                 )
 
-                # Update status
                 self.status = ClientStatus.SERVER_CONNECTED
 
                 hostname = server_info.get("hostname") if server_info else "server"
@@ -629,13 +562,12 @@ class Client(QThread):
             self.selected_server = self.discovered_servers[index]
 
     def connect_to_server(self):
-        """Dispatch the (blocking) connection handshake onto the thread pool so the
-        UI thread is never blocked while sockets connect and authenticate."""
+        """Dispatch the blocking connection handshake onto the thread pool."""
         self.thread_pool.start(FunctionWorker(self._connect_to_server_impl))
 
     def _connect_to_server_impl(self):
-        # Serialize connection attempts: if one is already in flight, skip this one
-        # so the fast localhost path and a LAN autoconnect can't both connect.
+        # Skip if an attempt is already in flight, so the fast localhost path
+        # and a LAN autoconnect cannot both connect.
         with self._connect_guard_lock:
             if self._connecting:
                 return
@@ -648,7 +580,6 @@ class Client(QThread):
                 self._connecting = False
 
     def _do_connect_to_server(self):
-        # Pick a server if none has been explicitly selected
         if not self.selected_server:
             if len(self.discovered_servers) == 0:
                 self.log_message.emit("error", "No valid servers available.")
@@ -659,7 +590,6 @@ class Client(QThread):
             )
 
         try:
-            # Connect to control server - close pre-existing connections
             with self._control_lock:
                 if self.control_socket:
                     with contextlib.suppress(Exception):
@@ -671,14 +601,11 @@ class Client(QThread):
                     (self.selected_server["ip"], self.control_port)
                 )
 
-            # Perform authentication handshake over the connected control socket
             server_info = self._authenticate_with_server(self.control_socket)
 
-            # Authentication failed - do not enter a connected state
             if not server_info:
                 raise AuthenticationError("Authentication with server failed")
 
-            # Connect data socket - close pre-existing connections
             if self.data_socket:
                 with contextlib.suppress(Exception):
                     self.data_socket.close()
@@ -688,26 +615,18 @@ class Client(QThread):
             self.data_socket.connect((self.selected_server["ip"], self.data_port))
             self.data_connected = True
 
-            # Data receiver starts after devices are initialized (see
-            # _start_data_streamer_after_init), not on bare server connect.
-
-            # Update server info and data sources. The payload re-advertises the
-            # server's own NIC address; keep the address we actually reached it
-            # on so a later reconnect does not switch to an unreachable one.
+            # Keep the address we actually reached the server on: the payload
+            # re-advertises its NIC address, which may be unroutable from here.
             connected_ip = self.selected_server.get("ip")
             self.selected_server.update(server_info)
             if connected_ip:
                 self.selected_server["ip"] = connected_ip
             self.data_sources = server_info.get("data_sources", None)
 
-            # Once everything succeeds, update the status
             self.status = ClientStatus.SERVER_CONNECTED
             self.server_connected.emit(True)
         except Exception as e:
-            # Reset status
             self.status = ClientStatus.SERVER_DISCONNECTED
-
-            # Stop the receiver (if any) and reset sockets
             self._stop_data_streamer()
             with contextlib.suppress(Exception):
                 if self.control_socket:
@@ -719,21 +638,18 @@ class Client(QThread):
             self.data_socket = None
             self.data_connected = False
 
-            # Log message in UI and notify listeners of failure
             self.log_message.emit("error", f"Server connection failed: {e}")
             self.server_disconnected.emit(True)
 
     def disconnect_from_server(self):
-        # Stop the long-lived data receiver before closing the socket it reads
+        # Stop the receiver before closing the socket it reads.
         self._stop_data_streamer()
 
-        # Stop any client-side saving in progress
         if self.data_saver is not None:
             with contextlib.suppress(Exception):
                 self.data_saver.stop_saving()
             self.data_saver = None
 
-        # Locks for concurrency
         with self._control_lock:
             if self.control_socket:
                 with contextlib.suppress(Exception):
@@ -757,11 +673,7 @@ class Client(QThread):
 
     ### Configurator commands
     def list_devices(self):
-        """Enumerate everything attached, independent of any loaded config.
-
-        Runs off the UI thread: the server walks every backend's discovery,
-        which for USRP means a ``uhd.find`` that can take seconds.
-        """
+        """Enumerate everything attached, independent of any loaded config."""
         if self.status < ClientStatus.SERVER_CONNECTED:
             self.device_list_failed.emit("Connect to a server first")
             return
@@ -772,10 +684,8 @@ class Client(QThread):
         QThreadPool.globalInstance().start(worker)
 
     def _list_devices_blocking(self):
-        # Enumeration runs every backend's discovery on the server: uhd.find
-        # alone takes seconds, and BIOPAC's WMI walk adds more. The default
-        # control timeout is far too short for the total, and overrunning it
-        # looks exactly like "no devices attached".
+        # Enumeration runs every backend's discovery server-side (uhd.find,
+        # BIOPAC's WMI walk), which far outlasts the default control timeout.
         response = self._send_command_locked(
             Command.LIST_DEVICES, timeout=DEVICE_OP_COMMAND_TIMEOUT
         )
@@ -790,7 +700,7 @@ class Client(QThread):
         self.log_message.emit("info", f"Found {len(devices)} attached device(s)")
         self.devices_listed.emit(devices, backends)
 
-    def set_device_config(self, device_info: Dict, config: Dict):
+    def set_device_config(self, device_info: dict, config: dict):
         if self.status < ClientStatus.SERVER_CONNECTED:
             self.device_config_failed.emit("Connect to a server first")
             return
@@ -804,7 +714,7 @@ class Client(QThread):
         worker.signals.error.connect(self.device_config_failed.emit)
         QThreadPool.globalInstance().start(worker)
 
-    def _set_device_config_blocking(self, device_info: Dict, config: Dict):
+    def _set_device_config_blocking(self, device_info: dict, config: dict):
         response = self._send_command_locked(
             Command.SET_DEVICE_CONFIG,
             {"device_info": device_info, "config": config},
@@ -821,7 +731,6 @@ class Client(QThread):
         self.initialize_devices(only_discover=True)
 
     def initialize_devices(self, only_discover: bool = False):
-        # Avoid starting another discovery while one is active
         if self._discovering_devices:
             self.log_message.emit("warning", "Device discovery already in progress")
             return
@@ -864,12 +773,9 @@ class Client(QThread):
         return str(status_value) == DeviceStatus.CONNECTED.value
 
     def _on_device_command_finished(self, group_status_dict, only_discover: bool):
-        """
-        The server reports device states as a flat mapping:
-            { device_id (== group_id): DeviceStatus value }
+        """Handle the server's {device_id: DeviceStatus} reply.
 
-        The response only contains keys for device groups that were requested
-        in the provided payload.
+        Only the groups named in the request appear in it.
         """
         if not group_status_dict or not isinstance(group_status_dict, dict):
             self._discovering_devices = False
@@ -886,7 +792,6 @@ class Client(QThread):
         self.device_states = group_status_dict
         self._log_device_outcomes(group_status_dict, only_discover)
 
-        # Update state and emit appropriate signal
         if only_discover:
             self.status = ClientStatus.DEVICES_DISCOVERED
             self.devices_discovered.emit(self.device_states)
@@ -895,8 +800,6 @@ class Client(QThread):
             self._start_data_streamer_after_init()
             self.device_init_succeeded.emit(self.device_states)
         else:
-            # The per-device lines above already carry the explanations, so
-            # this stays a summary rather than repeating all of them.
             failed = ", ".join(self.device_errors or {})
             self.log_message.emit(
                 "error",
@@ -908,12 +811,7 @@ class Client(QThread):
         self._discovering_devices = False
 
     def _log_device_outcomes(self, group_status_dict, only_discover: bool):
-        """Report what happened to each device group, and why when it failed.
-
-        A single "initialization failed" line for the whole config does not say
-        which device failed or what went wrong -- the server knows both, so both
-        are shown here rather than left in a server log the user cannot reach.
-        """
+        """Report what happened to each device group, and why when it failed."""
         action = "Discovery" if only_discover else "Initialization"
         good = {DeviceStatus.AVAILABLE.value, DeviceStatus.CONNECTED.value}
         errors = self.device_errors or {}
@@ -925,8 +823,7 @@ class Client(QThread):
                 continue
 
             reason = errors.get(group)
-            # Explained through the shared catalogue, so the Monitor and the
-            # Configurator word a given cause identically.
+            # The shared catalogue keeps Monitor and Configurator wording identical.
             explained = describe_failure(reason) if reason else ""
             self.log_message.emit(
                 "error",
@@ -944,7 +841,6 @@ class Client(QThread):
     def disconnect_device(self):
         self.log_message.emit("info", "Disconnecting devices...")
 
-        # Stop streaming first is currently going
         if self.status is ClientStatus.STREAMING:
             self.stop_streaming()
 
@@ -960,15 +856,13 @@ class Client(QThread):
 
     # Data receiver lifecycle (long-lived for the whole session)
     def _start_data_streamer_after_init(self):
-        """Start the data receiver once devices are initialized and the data
-        socket exists."""
+        """Start the data receiver once devices are up and the socket exists."""
         if not self.data_connected or self.data_socket is None:
             return
         self._start_data_streamer()
 
     def _start_data_streamer(self):
-        """Start the long-lived data receiver bound to the session data socket.
-        Idempotent: any previous receiver is stopped first."""
+        """(Re)start the data receiver bound to the session data socket."""
         if self.data_socket is None:
             return
         self._stop_data_streamer()
@@ -981,17 +875,36 @@ class Client(QThread):
         if self.data_streamer is not None:
             with contextlib.suppress(Exception):
                 self.data_streamer.stop()
-                # Give the receive loop time to exit its (timed) recv cleanly
                 self.data_streamer.wait(2000)
             self.data_streamer = None
 
     # Data streaming handlers
     def start_streaming(self):
-        """Dispatch the streaming start (blocking control RPC + socket setup) onto
-        the thread pool to keep the UI responsive."""
+        """Dispatch the streaming start onto the thread pool.
+
+        Guarded: a start can take a minute (every worker is an OS process spawn
+        on Windows), and while it is in flight the Start button stays live. Each
+        extra click used to queue another START_STREAMING behind the control
+        lock, so the server was told to start the same session five or six times
+        over -- restarting the devices out from under the first attempt.
+        """
+        with self._start_streaming_lock:
+            if self._start_streaming_pending:
+                self.log_message.emit(
+                    "debug", "Streaming start already in progress; ignoring request"
+                )
+                return
+            self._start_streaming_pending = True
         self.thread_pool.start(FunctionWorker(self._start_streaming_impl))
 
     def _start_streaming_impl(self):
+        try:
+            return self._start_streaming_locked()
+        finally:
+            with self._start_streaming_lock:
+                self._start_streaming_pending = False
+
+    def _start_streaming_locked(self):
         if self._discovering_devices:
             self.log_message.emit(
                 "warning", "Cannot start streaming while device discovery is in progress"
@@ -1010,10 +923,10 @@ class Client(QThread):
             f"Streaming {len(self.data_sources or [])} data source(s); "
             f"saving {'on' if self.enable_save else 'off'}",
         )
-        self.control_socket.settimeout(10)
         response = self._send_command_locked(
             command=Command.START_STREAMING,
             params=self.config.to_dict(),
+            timeout=STREAMING_COMMAND_TIMEOUT,
         )
         resp_type, resp_payload = parse_and_validate_response(response)
 
@@ -1021,11 +934,8 @@ class Client(QThread):
             self.status = ClientStatus.STREAMING
             self.log_message.emit("info", "Data streaming started")
 
-            # The data socket is opened once per session at connect time and the
-            # server keeps a single data connection for the whole session. We must
-            # NOT tear it down on stop/restart (doing so left the server sending on
-            # a dead socket -> "connection reset by peer"). Just make sure the
-            # long-lived receiver is running on the existing socket.
+            # The data socket lives for the whole session; tearing it down on
+            # stop/restart leaves the server writing to a dead socket.
             if not self.data_connected:
                 self.log_message.emit(
                     "warning",
@@ -1034,10 +944,7 @@ class Client(QThread):
             elif self.data_streamer is None or not self.data_streamer.isRunning():
                 self._start_data_streamer()
 
-            # Set up client-side saving (full-rate) if enabled
             self._start_saving()
-
-            # Emit success
             self.streaming_started.emit(True)
             self.log_message.emit("debug", "Streaming started successfully")
         else:
@@ -1045,13 +952,7 @@ class Client(QThread):
             self.log_message.emit("error", f"Failed to start streaming: {msg}")
 
     def _start_saving(self):
-        """Create and start the client-side disk writer if saving is enabled.
-
-        File naming:
-            timed mode:   <file_name>_<mode label>.bvr
-            unlimited:    <file_name>.bvr
-        Duplicate names are de-duplicated with a numeric suffix.
-        """
+        """Create and start the client-side disk writer if saving is enabled."""
         self.data_saver = None
         if not self.enable_save:
             return
@@ -1065,7 +966,6 @@ class Client(QThread):
         try:
             save_path = get_unique_path(save_dir, file_name)
             sources = self.data_sources or []
-            # Snapshot the device configuration constants at recording start
             device_config = {}
             if self.config is not None:
                 device_config = {
@@ -1083,9 +983,8 @@ class Client(QThread):
             self.log_message.emit("error", f"Unable to start saving: {e}")
 
     def _handle_received_data(self, data, sources=None):
-        # Tee the full-rate chunk: one branch to disk, one to the UI for display.
-        # Use the per-chunk source list when present (more robust for multi-device),
-        # falling back to the data sources advertised at connection time.
+        # The per-chunk source list is authoritative when present; the list
+        # advertised at connect time is the fallback.
         if self.data_saver is not None:
             self.data_saver.add(data)
 
@@ -1093,7 +992,7 @@ class Client(QThread):
         self.data_received.emit(data, chunk_sources)
 
     def stop_streaming(self):
-        """Dispatch the streaming stop onto the thread pool to keep the UI responsive."""
+        """Dispatch the streaming stop onto the thread pool."""
         self.thread_pool.start(FunctionWorker(self._stop_streaming_impl))
 
     def _stop_streaming_impl(self):
@@ -1105,9 +1004,9 @@ class Client(QThread):
 
         self.log_message.emit("debug", "Attempting to stop streaming...")
 
-        if self.control_socket:
-            self.control_socket.settimeout(10)
-        response = self._send_command_locked(command=Command.STOP_STREAMING)
+        response = self._send_command_locked(
+            command=Command.STOP_STREAMING, timeout=STREAMING_COMMAND_TIMEOUT
+        )
         resp_type, resp_payload = parse_and_validate_response(response)
 
         if resp_type == Response.ERROR.name:
@@ -1115,27 +1014,18 @@ class Client(QThread):
             msg = f"Failed to stop streaming: {err}"
             self.log_message.emit("error", msg)
 
-        # Intentionally keep the data socket AND the receiver alive for the whole
-        # session. The server pauses its backends on stop (it stops sending) but
-        # keeps the same per-session data connection, so closing it here is what
-        # previously broke restart. The receiver simply idles until data resumes.
-
-        # Stop client-side saving and flush to disk
+        # The data socket and receiver stay up for the whole session: the
+        # server only pauses its backends, and keeps the same connection.
         if self.data_saver is not None:
             self.data_saver.stop_saving()
             self.data_saver = None
 
-        # Update status
         self.status = ClientStatus.DEVICES_CONNECTED
         self.streaming_stopped.emit(True)
         self.log_message.emit("debug", "Streaming stopped successfully")
 
     def configure_device(self, device_id, config):
-        """
-        This function is used by BioView Configurator to modify operational parameters
-        of connected devices using respective device handlers, which in turn will make
-        calls using the provided device drivers.
-        """
+        """Change a running device's parameters through the server."""
         if self._discovering_devices:
             self.log_message.emit(
                 "warning",
@@ -1153,9 +1043,8 @@ class Client(QThread):
 
         if resp_type == Response.SUCCESS.name:
             self.log_message.emit("debug", "Successfully updated device parameter")
-            # A parameter change can add or remove streams (a BIOPAC channel
-            # mask, say). The server replies with the new source list; publish it
-            # so the plot-source selector follows the device.
+            # A parameter change can add or remove streams, so republish the
+            # source list the server replies with.
             data_sources = (resp_payload or {}).get("data_sources")
             if data_sources is not None:
                 self.data_sources = data_sources
@@ -1200,7 +1089,3 @@ class Client(QThread):
     ### Helpers
     def get_data_sources(self):
         return self.data_sources
-
-    def update_device_state(self, device_id) -> bool:
-        """Helper function to keep track of device states internally"""
-        pass

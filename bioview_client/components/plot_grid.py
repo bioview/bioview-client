@@ -1,11 +1,18 @@
 import numpy as np
 import pyqtgraph as pg
+from bioview_common import DataSource
 from PyQt6.QtCore import QEvent, QTimer, pyqtSignal
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import QGridLayout, QWidget
 
-from bioview_common import DataSource
 from bioview_client.constants import get_color_by_idx
+
+
+# (left, top, right, bottom) padding around each PlotItem, in pixels.
+PLOT_MARGINS = (4, 4, 10, 6)
+# Ticks plus one line of axis label.
+BOTTOM_AXIS_HEIGHT = 46
+LEFT_AXIS_WIDTH = 62
 
 
 class PlotManager:
@@ -21,7 +28,8 @@ class PlotManager:
         # UI widget
         self.widget = pg.PlotWidget()
         self.widget.setAntialiasing(True)
-        self.widget.getPlotItem().setDownsampling(auto=True, mode="peak")
+        plot_item = self.widget.getPlotItem()
+        plot_item.setDownsampling(auto=True, mode="peak")
         self.widget.enableAutoRange(pg.ViewBox.YAxis, enable=True)
         self.widget.enableAutoRange(pg.ViewBox.XAxis, enable=False)
         self.widget.setMouseEnabled(x=False, y=False)
@@ -29,6 +37,14 @@ class PlotManager:
         self.widget.showGrid(x=True, y=True)
         self.widget.setLabel("bottom", xlabel)
         self.widget.setLabel("left", ylabel)
+
+        # PlotItem lays its axes flush against the widget edge, so in a tight
+        # grid the bottom axis label is clipped without these margins.
+        plot_item.setContentsMargins(*PLOT_MARGINS)
+        # pyqtgraph sizes an axis from its ticks and never grows it to fit
+        # the label, so the extents are reserved explicitly.
+        plot_item.getAxis("bottom").setHeight(BOTTOM_AXIS_HEIGHT)
+        plot_item.getAxis("left").setWidth(LEFT_AXIS_WIDTH)
 
         # Create pen and plot item ONCE - this is key for performance
         self.pen = pg.mkPen(color=color, width=1)
@@ -49,10 +65,7 @@ class PlotManager:
 
     def _init_plot(self):
         # Number of points held on screen, sized by the (decimated) display rate.
-        if self.data_src is None:
-            disp_freq = 10.0
-        else:
-            disp_freq = self.data_src.get_disp_freq()
+        disp_freq = 10.0 if self.data_src is None else self.data_src.get_disp_freq()
         self.num_points = max(2, int(self.display_duration * disp_freq))
 
         # Fixed-size numpy ring buffer (the sliding window) and reusable time axis
@@ -69,14 +82,14 @@ class PlotManager:
         self.widget.setXRange(0, self.display_duration, padding=0)
 
     def update_data_source(self, data_src: DataSource = None):
-        self.widget.setTitle(str(data_src) if data_src is not None else "")
+        # Same "Device: Source" name the plot-source selector shows.
+        title = data_src.get_display_label() if data_src is not None else ""
+        self.widget.setTitle(title)
         self.data_src = data_src
         self._init_plot()
 
     def _decimate(self, arr: np.ndarray) -> np.ndarray:
-        """Stride-decimate an incoming chunk so we never push more than one
-        screen's worth of points per chunk. This keeps the displayed rate roughly
-        independent of the (much higher) acquisition/save rate and bounds work."""
+        """Stride-decimate a chunk to at most one screen's worth of points."""
         n = arr.size
         if n > self.num_points:
             stride = int(np.ceil(n / self.num_points))
@@ -95,7 +108,7 @@ class PlotManager:
 
         if n >= self.num_points:
             # Chunk fills (or overfills) the window: keep the most recent points
-            self.buffer[:] = arr[-self.num_points:]
+            self.buffer[:] = arr[-self.num_points :]
         else:
             # Slide the window left by n and append the new samples at the end
             self.buffer[:-n] = self.buffer[n:]
@@ -114,6 +127,11 @@ class PlotManager:
         self.display_duration = duration
         self._init_plot()
 
+    def set_color(self, color):
+        """Re-pen the existing curve (used on a theme change)."""
+        self.pen = pg.mkPen(color=color, width=1)
+        self.plot_item.setPen(self.pen)
+
 
 class PlotGrid(QWidget):
     log_event = pyqtSignal(str, str)
@@ -128,22 +146,32 @@ class PlotGrid(QWidget):
 
         self.selected_channels = {}
 
+        # descriptor dict -> DataSource, so routing does not rebuild one
+        # object per row per chunk.
+        self._source_cache = {}
+
         # Set up the layout
         self.layout = QGridLayout(self)
-        self.layout.setContentsMargins(0, 0, 0, 0)
-        self.layout.setSpacing(5)
+        self.layout.setContentsMargins(4, 4, 4, 4)
+        self.layout.setSpacing(8)
 
         # Keep track of available plots that are not connected to an output
         self.available_slots = []
 
         # Optimize refresh rate and ensure real-time performance
         self.refresh_time = max(self._get_monitor_refresh_delay(), 10)
-        self.update_timer = QTimer()
+        # Parented so the timer dies with the widget; an unparented one keeps
+        # firing against destroyed C++ objects.
+        self.update_timer = QTimer(self)
         self.update_timer.timeout.connect(self.update_plots)
 
         # Initialize grid
         self.init_grid()
         self.update_timer.start(self.refresh_time)
+
+    def closeEvent(self, event):
+        self.update_timer.stop()
+        super().closeEvent(event)
 
     def _get_monitor_refresh_delay(self):
         screen = QGuiApplication.primaryScreen()
@@ -154,13 +182,15 @@ class PlotGrid(QWidget):
 
     # Handle theme changes
     def event(self, event):
-        if event.type() == QEvent.Type.PaletteChange:
+        # A PaletteChange can arrive before init_grid() has run.
+        if event.type() == QEvent.Type.PaletteChange and getattr(self, "plots", None):
             for r in range(self.rows):
                 for c in range(self.cols):
-                    self.plots[r][c].widget.setBackground(None)
-                    self.plots[r][c].pen = pg.mkPen(
-                        color=get_color_by_idx(r * self.cols + c), width=1
-                    )
+                    plot_obj = self.plots[r][c]
+                    plot_obj.widget.setBackground(None)
+                    # The pen has to be pushed onto the plot item, not just
+                    # reassigned.
+                    plot_obj.set_color(get_color_by_idx(r * self.cols + c))
         return super().event(event)
 
     def init_grid(self):
@@ -181,12 +211,13 @@ class PlotGrid(QWidget):
                 self.available_slots.append((r, c))
 
     def update_grid(self, rows, cols):
-        """Resize the plot grid while keeping already-plotted sources in their
-        same (row, col) cell when that cell still exists. Sources whose cell no
-        longer fits the smaller grid are dropped and returned so the caller can
-        keep the source selector in sync."""
+        """Resize the grid, keeping plotted sources in their cell where it
+        still exists. Sources that no longer fit are returned to the caller."""
         # Snapshot what is currently plotted and where
         old_locs = {src: info["loc"] for src, info in self.selected_channels.items()}
+
+        # update_plots() must never run against a half-rebuilt grid.
+        self.update_timer.stop()
 
         # Clear past grid
         while self.layout.count():
@@ -204,8 +235,7 @@ class PlotGrid(QWidget):
 
         self.init_grid()
 
-        # Re-place sources at their original cell if it still exists; otherwise
-        # they fall off the (smaller) grid and are reported as dropped.
+        # Sources whose cell no longer exists are reported as dropped.
         dropped = []
         for src, (r, c) in sorted(old_locs.items(), key=lambda kv: (kv[1][0], kv[1][1])):
             if r < self.rows and c < self.cols:
@@ -213,6 +243,7 @@ class PlotGrid(QWidget):
             else:
                 dropped.append(src)
 
+        self.update_timer.start(self.refresh_time)
         return dropped
 
     def _assign_source(self, source, row, col):
@@ -224,7 +255,7 @@ class PlotGrid(QWidget):
             self.available_slots.remove((row, col))
 
     def add_source(self, source):
-        if source in self.selected_channels.keys():
+        if source in self.selected_channels:
             self.log_event.emit(
                 "debug", "Unable to add channel as it is already being plotted"
             )
@@ -245,7 +276,7 @@ class PlotGrid(QWidget):
         return True
 
     def remove_source(self, channel):
-        if channel not in self.selected_channels.keys():
+        if channel not in self.selected_channels:
             self.log_event.emit(
                 "debug", "Unable to remove channel as it is not being plotted"
             )
@@ -264,9 +295,7 @@ class PlotGrid(QWidget):
         return True
 
     def add_new_data(self, data, sources=None):
-        """Route a (num_sources, num_samples) chunk to the selected plots using the
-        per-chunk source list. Rows whose source is not currently plotted are
-        ignored."""
+        """Route a chunk to the selected plots using the per-chunk source list."""
         if data is None or sources is None:
             return
 
@@ -275,7 +304,14 @@ class PlotGrid(QWidget):
 
         for idx in range(min(n_rows, len(sources))):
             src = sources[idx]
-            source = DataSource.from_dict(src) if isinstance(src, dict) else src
+            if isinstance(src, dict):
+                key = (src.get("group_id"), src.get("channel"))
+                source = self._source_cache.get(key)
+                if source is None:
+                    source = DataSource.from_dict(src)
+                    self._source_cache[key] = source
+            else:
+                source = src
 
             entry = self.selected_channels.get(source)
             if entry is None:
@@ -300,4 +336,6 @@ class PlotGrid(QWidget):
             with np.errstate(all="ignore"):
                 entry["plot"].update_data_source()
         self.selected_channels = {}
-        self.available_slots = [(r, c) for r in range(self.rows) for c in range(self.cols)]
+        self.available_slots = [
+            (r, c) for r in range(self.rows) for c in range(self.cols)
+        ]

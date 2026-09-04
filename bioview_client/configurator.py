@@ -1,18 +1,6 @@
-"""BioView Configurator.
+"""BioView Configurator: lists attached devices and edits their properties.
 
-Lists every device attached to the server and lets tweakable per-device
-properties be edited -- the role NI's USRP Configuration Utility plays for
-LabVIEW. Today the only editable property is a USRP's ``device_name``.
-
-Flow: Discover lists what is attached; selecting a device enables Edit when its
-backend declares editable properties; Edit opens a modal with those fields plus
-Save and Cancel. The modal stays up while the change is applied, showing a busy
-indicator and then Completed or Failed, and the list is re-read afterwards so a
-renamed device shows its new name straight away.
-
-Names are stored by BioView (keyed on the radio's serial) and applied during
-discovery, rather than written to device EEPROM. Configuration files, the
-channel map and the serial cache all see the chosen name.
+See bioview-docs/usage/configurator.md.
 """
 
 import sys
@@ -54,10 +42,8 @@ from bioview_client.handler import Client
 class DeviceConfigDialog(QDialog):
     """Modal editor for one device's editable properties.
 
-    The dialog stays open while the server applies the change: Save hands the
-    values up through ``save_requested`` instead of closing, and the window
-    calls :meth:`update_finished` once the server answers. Closing on Save left
-    the log panel as the only sign that anything was happening.
+    Save emits ``save_requested`` and leaves the dialog up; the window calls
+    :meth:`update_finished` once the server answers.
     """
 
     #: device_info, config -- emitted when the user commits valid values.
@@ -395,10 +381,8 @@ class ConfiguratorWindow(QMainWindow):
 
         self.client_worker.start_client()
 
-        # The Configurator is useless without a server, so latch onto a local one
-        # as soon as it answers -- and stay latched, so it recovers by itself if
-        # that server is ever restarted. The launcher starts one alongside this
-        # window; localhost is the only server this window can use.
+        # Localhost is the only server this window can use, so stay latched
+        # and recover by itself if that server restarts.
         self._connect_timer = start_localhost_autoconnect(
             self.client_worker, self, keep_latched=True
         )
@@ -457,12 +441,7 @@ class ConfiguratorWindow(QMainWindow):
         self.client_worker.set_device_config(device_info, config)
 
     def _warn_if_power_cycle_needed(self, device_info, config=None):
-        """A renamed USRP keeps announcing its old name until it is power cycled.
-
-        BioView applies the new name at discovery, so it is already in effect
-        here -- but the radio itself only reports it after a power cycle, and a
-        user watching the device tell them the old name needs to know why.
-        """
+        """A renamed USRP keeps announcing its old name until power cycled."""
         device_type = str((device_info or {}).get("device_type", "")).lower()
         if device_type != DeviceType.USRP.value:
             return
@@ -534,4 +513,8 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Routed through the launcher so a directly-run window still gets
+    # (and is counted against) the shared localhost server.
+    from bioview_client.launch import main as _launch
+
+    sys.exit(_launch(["--role", "configurator", *sys.argv[1:]]))

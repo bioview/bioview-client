@@ -92,9 +92,6 @@ class SettingsPanel(QTabWidget):
             """
         )
 
-    def _route_signals(self, source, signal, *args):
-        pass
-
     def update_source(self, action, source):
         """Forward selection state updates to the experiment settings panel."""
         if self.experiment_panel is not None:

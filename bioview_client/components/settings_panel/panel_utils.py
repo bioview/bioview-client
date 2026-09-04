@@ -2,8 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Tuple
+from collections.abc import Callable
 
+from bioview_common.datatypes.configuration.hardware_params import (
+    GLOBAL_RX_PARAMS,
+    GLOBAL_TX_PARAMS,
+    resolve_param_values,
+    update_device_rx_param,
+    update_device_tx_param,
+)
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QDoubleSpinBox,
@@ -15,17 +22,10 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from bioview_common.datatypes.configuration.hardware_params import (
-    GLOBAL_RX_PARAMS,
-    GLOBAL_TX_PARAMS,
-    resolve_param_values,
-    update_device_rx_param,
-    update_device_tx_param,
-)
 
 DEFAULT_MAX_PANEL_HEIGHT = 260
 
-ParamSpec = Tuple[str, Tuple[float, float], float, float, int]
+ParamSpec = tuple[str, tuple[float, float], float, float, int]
 
 
 def wrap_scrollable(
@@ -46,34 +46,52 @@ def wrap_scrollable(
 def add_param_rows(
     grid: QGridLayout,
     device_configuration,
-    param_mappings: Dict[str, Tuple[str, ParamSpec]],
+    param_mappings: dict[str, tuple[str, ParamSpec]],
     on_change: Callable[[str, object, int | None], None],
     start_row: int = 0,
-) -> Tuple[dict, int]:
-    """Add labeled spinbox row(s) per parameter; returns widgets dict and next row index."""
+) -> tuple[dict, int]:
+    """Add labeled spinbox row(s) per parameter.
+
+    Returns the widgets dict and the next row index.
+    """
     param_inputs = {}
     row = start_row
 
-    for param_name, (label_text, (min_val, max_val), multiplier, step, decimals) in (
-        param_mappings.items()
-    ):
+    for param_name, (
+        label_text,
+        (min_val, max_val),
+        multiplier,
+        step,
+        decimals,
+    ) in param_mappings.items():
         grid.addWidget(QLabel(label_text), row, 0)
         values = resolve_param_values(device_configuration, param_name)
         if not values:
             values = [min_val * multiplier if multiplier != 1 else min_val]
 
+        n_values = len(values)
         input_widgets = []
         for col, value in enumerate(values):
             if decimals == 0:
                 widget = QSpinBox()
                 widget.setRange(int(min_val), int(max_val))
                 widget.setSingleStep(int(step))
-                display_value = int(value) if isinstance(value, (int, float)) else int(min_val)
+                display_value = (
+                    int(value) if isinstance(value, int | float) else int(min_val)
+                )
                 widget.setValue(display_value)
 
-                def _spin_changed(val, param_name=param_name, col=col, mult=multiplier):
+                # Bound here, not read from the enclosing scope: that name is
+                # rebound on every outer iteration.
+                def _spin_changed(
+                    val,
+                    param_name=param_name,
+                    col=col,
+                    mult=multiplier,
+                    n_values=n_values,
+                ):
                     stored = float(val) * mult if mult != 1 else float(val)
-                    on_change(param_name, stored, col if len(values) > 1 else None)
+                    on_change(param_name, stored, col if n_values > 1 else None)
 
                 widget.valueChanged.connect(_spin_changed)
             else:
@@ -82,13 +100,21 @@ def add_param_rows(
                 widget.setDecimals(decimals)
                 widget.setSingleStep(float(step))
                 display_value = (
-                    value / multiplier if isinstance(value, (int, float)) else float(min_val)
+                    value / multiplier
+                    if isinstance(value, int | float)
+                    else float(min_val)
                 )
                 widget.setValue(float(display_value))
 
-                def _dbl_changed(val, param_name=param_name, col=col, mult=multiplier):
+                def _dbl_changed(
+                    val,
+                    param_name=param_name,
+                    col=col,
+                    mult=multiplier,
+                    n_values=n_values,
+                ):
                     stored = float(val) * mult if mult != 1 else float(val)
-                    on_change(param_name, stored, col if len(values) > 1 else None)
+                    on_change(param_name, stored, col if n_values > 1 else None)
 
                 widget.valueChanged.connect(_dbl_changed)
 

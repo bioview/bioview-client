@@ -1,5 +1,4 @@
 import contextlib
-from typing import Dict, List
 
 import qtawesome as qta
 from bioview_common import ClientStatus, DeviceStatus
@@ -19,10 +18,7 @@ from bioview_client.constants.theme import get_connection_status_color, get_qcol
 
 
 class ServerConnector(QWidget):
-    """GUI Component which displays available/connected servers and provides
-    an option to swap out among servers. Server connection state is emitted
-    back to the main app for further co-ordination.
-    """
+    """Server picker: lists available servers and emits connection state."""
 
     # Server-specific signals
     network_scan_requested = pyqtSignal()
@@ -131,8 +127,8 @@ class ServerConnector(QWidget):
     def update_scan_progress(self, progress):
         self.scan_progress_bar.setValue(progress)
 
-    def on_scan_complete(self, discovered_servers: List[Dict] = None):
-        """On completion of network scan, handler passes along list of discovered servers"""
+    def on_scan_complete(self, discovered_servers: list[dict] = None):
+        """On network scan completion, handler passes the discovered servers."""
         # stop scanning visuals
         self._scanning = False
 
@@ -183,7 +179,7 @@ class ServerConnector(QWidget):
         self.discover_devices_requested.emit()
 
     def closeEvent(self, event):
-        # Ensure all active scans are stopped and all connections are closed. 
+        # Ensure all active scans are stopped and all connections are closed.
         self.network_scan_cancel_requested.emit()
         super().closeEvent(event)
 
@@ -282,12 +278,9 @@ class DeviceStatusWidget(QWidget):
 
 
 class DeviceStatusPanel(QWidget):
-    def __init__(self, device_status: Dict):
+    def __init__(self, device_status: dict):
         super().__init__()
-        """
-        device_status is of form -
-        group_id: DeviceStatus
-        """
+        """``device_status`` is a flat {group_id: DeviceStatus} mapping."""
         self.device_widgets = {}
 
         # Create horizontal layout for all devices
@@ -303,7 +296,7 @@ class DeviceStatusPanel(QWidget):
 
     # Handle theme changes
     def _update_icons(self):
-        # TODO: Fix this logic. 
+        # TODO: Fix this logic.
         for device_id, device_map in self.devices.items():
             with contextlib.suppress(Exception):
                 status = device_map.get("status", DeviceStatus.DISCONNECTED)
@@ -324,13 +317,6 @@ class DeviceStatusPanel(QWidget):
 
         if widget:
             widget.update_status(new_status)
-
-    def remove_device(self, group_id):
-        if group_id in self.device_widgets:
-            widget = self.device_widgets[group_id]
-            self.layout.removeWidget(widget)
-            widget.deleteLater()
-            del self.device_widgets[group_id]
 
 
 class RoutineProgressBar(QWidget):
@@ -386,7 +372,7 @@ class RoutineProgressBar(QWidget):
 class StatusBar(QStatusBar):
     network_scan_requested = pyqtSignal()
 
-    def __init__(self, device_status: Dict = None, parent=...):
+    def __init__(self, device_status: dict = None, parent=...):
         super().__init__(parent)
 
         # Use a QWidget with a layout to group widgets
@@ -427,8 +413,7 @@ class StatusBar(QStatusBar):
         )
 
     def _forward_signals(self):
-        # Map and expose signals from the embedded ServerConnector so external
-        # code can connect to them via StatusBar.
+        # Re-exposed from the embedded ServerConnector.
         self.network_scan_requested = self.server_connector.network_scan_requested
 
         # Cancel / control signals
@@ -477,7 +462,7 @@ class StatusBar(QStatusBar):
                 self.server_connector.discover_btn.setEnabled(False)
 
             else:
-                # Default/other server states: set neutral text and allow connect if choices
+                # Other server states: neutral text; allow connect if choices exist
                 self.server_connector.connection_label.setText("Status: Idle")
                 self.server_connector.connection_label.setStyleSheet(
                     f"color: {get_qcolor('orange').name()}"

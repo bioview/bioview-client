@@ -153,3 +153,26 @@ def test_no_source_list_at_all_is_ignored(monitor):
     monitor.populate_plot_grid_sources([_src(0, "Ch1")])
     monitor.populate_plot_grid_sources(None)
     assert [s.label for s in monitor.settings_panel.available] == ["Ch1"]
+
+
+# --------------------------------------------------------------------------
+# Naming: the selector and the plot title must agree
+# --------------------------------------------------------------------------
+
+
+def test_a_plot_is_titled_with_the_device_qualified_source_name(monitor):
+    src = _src(0, "Ch1", group="BIOPAC")
+    monitor.plot_grid.add_source(src)
+
+    plot = monitor.plot_grid.selected_channels[src]["plot"]
+    assert plot.widget.getPlotItem().titleLabel.text == "BIOPAC: Ch1"
+    assert src.get_display_label() == "BIOPAC: Ch1"
+
+
+def test_removing_a_source_clears_the_title(monitor):
+    src = _src(0, "Ch1")
+    monitor.plot_grid.add_source(src)
+    monitor.plot_grid.remove_source(src)
+
+    plot = monitor.plot_grid.plots[0][0]
+    assert plot.widget.getPlotItem().titleLabel.text == ""

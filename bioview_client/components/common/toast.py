@@ -8,11 +8,7 @@ from PyQt6.QtWidgets import QGraphicsOpacityEffect, QLabel, QWidget
 
 
 class Toast(QLabel):
-    """A lightweight, auto-disappearing notification overlaid on a parent widget.
-
-    Far less intrusive than a modal dialog: it appears near the bottom of the
-    parent, holds briefly, fades out, and cleans itself up.
-    """
+    """An auto-disappearing notification overlaid on a parent widget."""
 
     _LEVEL_COLORS = {
         "success": "rgba(40, 167, 69, 235)",
@@ -21,8 +17,13 @@ class Toast(QLabel):
         "error": "rgba(176, 42, 55, 235)",
     }
 
-    def __init__(self, parent: QWidget, message: str, level: str = "success",
-                 duration_ms: int = 2200):
+    def __init__(
+        self,
+        parent: QWidget,
+        message: str,
+        level: str = "success",
+        duration_ms: int = 2200,
+    ):
         super().__init__(parent)
         bg = self._LEVEL_COLORS.get(level, self._LEVEL_COLORS["info"])
 
@@ -72,6 +73,11 @@ class Toast(QLabel):
         self.move(max(8, x), max(8, y))
 
     @classmethod
-    def show_message(cls, parent: QWidget, message: str, level: str = "success",
-                     duration_ms: int = 2200) -> "Toast":
+    def show_message(
+        cls,
+        parent: QWidget,
+        message: str,
+        level: str = "success",
+        duration_ms: int = 2200,
+    ) -> "Toast":
         return cls(parent, message, level=level, duration_ms=duration_ms)

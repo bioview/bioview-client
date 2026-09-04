@@ -1,11 +1,6 @@
-"""Branding asset helpers.
-
-Resolves the packaged BioView icon so both GUIs (Monitor + Configurator) and the
-Qt application share one consistent app icon in the window title bar, the
-dock/taskbar, and app launchers. A rasterized PNG is preferred for maximum
-portability across frozen builds; the source SVG is used as a fallback.
-"""
+"""Branding assets. The rasterized PNG is preferred; the SVG is a fallback."""
 from pathlib import Path
+
 
 # The application id used for Linux desktop integration (Wayland/KDE match the
 # running window to its .desktop entry -- and thus its launcher icon -- by this).
@@ -23,10 +18,7 @@ def get_app_icon_path() -> str:
 
 
 def get_app_icon():
-    """A ``QIcon`` for the application icon.
-
-    Imported lazily so this module stays importable without a Qt runtime (useful
-    for headless tests that only need the asset path)."""
+    """A ``QIcon`` for the application icon. Qt is imported lazily."""
     from PyQt6.QtGui import QIcon
 
     return QIcon(get_app_icon_path())

@@ -1,9 +1,9 @@
+# TODO: Remove DataSource as a dependency
+from bioview_common import DataSource
 from PyQt6.QtCore import QEvent, Qt, pyqtSignal
 from PyQt6.QtGui import QStandardItem, QStandardItemModel
 from PyQt6.QtWidgets import QComboBox, QListView
 
-# TODO: Remove DataSource as a dependency
-from bioview_common import DataSource
 
 class CheckableListView(QListView):
     def __init__(self, combo_box):
@@ -38,8 +38,7 @@ class CheckableComboBox(QComboBox):
 
     def addItem(self, source: DataSource, checked=False):
         """Add a DataSource item to the combo box"""
-        text = source.label
-        item = QStandardItem(text)
+        item = QStandardItem(source.get_display_label())
         item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
         item.setData(
             Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked,
@@ -86,16 +85,6 @@ class CheckableComboBox(QComboBox):
                 item.setCheckState(Qt.CheckState.Unchecked)
                 self.update_line_text()
                 break
-
-    def checkedItems(self):
-        """Return list of checked DataSource objects"""
-        checked_sources = []
-        for i in range(self.model().rowCount()):
-            item = self.model().item(i)
-            if item.checkState() == Qt.CheckState.Checked:
-                source = item.data(Qt.ItemDataRole.UserRole)
-                checked_sources.append(source)
-        return checked_sources
 
     def checkedItemTexts(self):
         """Return list of checked source names"""

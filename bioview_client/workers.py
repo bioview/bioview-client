@@ -94,10 +94,7 @@ class DeviceInitSignals(QObject):
 
 
 class DeviceInitWorker(QRunnable):
-    """
-    Handler to deal with device discovery and initialization in the background.
-    We do this to prevent UI from getting blocked
-    """
+    """Runs device discovery and initialization off the UI thread."""
 
     def __init__(self, client_ref, command):
         super().__init__()
@@ -120,9 +117,8 @@ class DeviceInitWorker(QRunnable):
         self.signals = DeviceInitSignals()
 
     def _poll_until_complete(self, deadline: float):
-        # Progress reporting for the wait itself: the per-command trace skips
-        # this poll (it repeats for the whole length of the operation), so
-        # without this a long device init looks like the client has hung.
+        # The per-command trace skips this poll, so without this a long
+        # device init looks like the client has hung.
         started = time.monotonic()
         last_status = None
 
@@ -167,8 +163,7 @@ class DeviceInitWorker(QRunnable):
         data_sources = (resp_payload or {}).get("data_sources")
         if data_sources is not None:
             self.client_ref.data_sources = data_sources
-        # Why any group failed, so the client can say so instead of reporting a
-        # bare "initialization failed" and leaving the reason on the server.
+        # Why any group failed, so the reason is not stranded server-side.
         self.client_ref.device_errors = (resp_payload or {}).get("device_errors") or {}
         if resp_type == Response.WARNING.name:
             self.client_ref.log_message.emit(
@@ -224,8 +219,8 @@ class DeviceInitWorker(QRunnable):
 
 class DataStreamer(QThread):
     log_message = pyqtSignal(str, str)
-    # Emits (data, sources) where data is (num_sources, num_samples) and sources
-    # is the ordered list of source descriptor dicts describing each row.
+    # (data, sources): a (num_sources, num_samples) array plus one source
+    # descriptor dict per row.
     data_received = pyqtSignal(np.ndarray, object)
 
     def __init__(self, data_conn, parent=None):
@@ -238,10 +233,8 @@ class DataStreamer(QThread):
         self.running = True
         self.log_message.emit("debug", "Data receiver thread started")
 
-        # Use a short socket timeout so the loop can periodically re-check
-        # self.running and ride out idle periods (e.g. while streaming is paused
-        # between Stop and Start) instead of treating them as a disconnect. This
-        # lets a single receiver live for the whole session.
+        # A short timeout lets the loop re-check self.running and ride out
+        # pauses instead of treating them as a disconnect.
         with contextlib.suppress(Exception):
             self.data_conn.settimeout(1.0)
 
@@ -268,13 +261,13 @@ class DataStreamer(QThread):
         self.log_message.emit("info", "Data receiving thread stopped")
 
     def _recv_exactly(self, num_bytes):
-        """Receive exactly num_bytes from the data socket. Returns None only on a
-        real disconnect or when the worker is stopped; transient socket timeouts
-        are tolerated so the receiver keeps waiting while idle."""
-        # Collect and join rather than ``data += chunk``: repeated concatenation
-        # reallocates the whole buffer per read, which is quadratic in the number
-        # of reads. Harmless for a two-read chunk, but it degrades badly as
-        # payloads grow or TCP fragments more.
+        """Receive exactly ``num_bytes``, or None on a real disconnect or stop.
+
+        Transient socket timeouts are tolerated, so the receiver waits out idle
+        periods rather than tearing itself down.
+        """
+        # Collect and join: repeated ``data += chunk`` is quadratic in the
+        # number of reads.
         chunks = []
         received = 0
         while received < num_bytes:
@@ -295,10 +288,7 @@ class DataStreamer(QThread):
         return b"".join(chunks)
 
     def _deserialize_data(self, data_bytes):
-        """Deserialize a numpy data chunk and its source metadata from the server.
-
-        Returns a (data, sources) tuple where sources is the ordered list of
-        source descriptor dicts (or None if absent)."""
+        """Deserialize one chunk into ``(data, sources)``."""
         try:
             # Read header length
             header_length = struct.unpack("!I", data_bytes[:4])[0]
@@ -333,25 +323,12 @@ BVR_TRAILER_MAGIC = b"BVRMETA1"
 
 
 class DataSaver(threading.Thread):
-    """Client-side disk writer. Runs on its own thread and appends full-rate
-    chunks to a self-describing binary file so disk I/O never blocks the data
-    receiving thread.
+    """Client-side disk writer for .bvr recordings.
 
-    File format ("bioview-raw-v2"):
-        [Header Length (4 bytes, big-endian)][JSON header]
-        [float32 samples, time-major: each chunk stored as (num_samples, num_sources)]
-        [JSON trailer]
-        [Trailer Length (8 bytes, big-endian)]
-        [8-byte magic "BVRMETA1"]
-
-    The JSON header records dtype, layout, the ordered source descriptors, the
-    recording start time, and a snapshot of device configuration constants. The
-    trailer (written when the recording closes) records the end time, any
-    timestamped device-parameter changes, and any event annotations ("Mark
-    Event") made while recording -- all stored centrally in this one file rather
-    than in per-annotation sidecar files. A reader locates the trailer via the
-    magic + length at EOF; the sample region is everything between the header and
-    the trailer."""
+    Runs on its own thread so disk I/O never blocks the data receiver. The
+    "bioview-raw-v2" file layout is documented in
+    bioview-docs/reference/bvr-format.md.
+    """
 
     def __init__(self, save_path, sources=None, device_config=None, log_signal=None):
         super().__init__(daemon=True)
@@ -382,8 +359,7 @@ class DataSaver(threading.Thread):
             parent = os.path.dirname(self.save_path)
             if parent:
                 os.makedirs(parent, exist_ok=True)
-            # Not a context manager: the recording file stays open from
-            # start_saving() until stop_saving() closes it.
+            # Not a context manager: the file stays open until stop_saving().
             self._file = open(self.save_path, "wb")  # noqa: SIM115
             self._start_time = datetime.now()
             header = {
@@ -429,9 +405,7 @@ class DataSaver(threading.Thread):
             self._changes.append(entry)
 
     def record_annotation(self, text: str) -> dict:
-        """Append a timestamped event annotation to the recording's metadata
-        trailer (stored under the ``Annotations`` key of the .bvr file). Returns
-        the stored entry."""
+        """Append a timestamped annotation to the recording trailer."""
         now = datetime.now()
         elapsed = None
         if self._start_time is not None:

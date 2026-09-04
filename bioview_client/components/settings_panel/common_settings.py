@@ -35,13 +35,13 @@ class CommonSettingsPanel(QGroupBox):
 
     def get_emittable_signals(self):
         return {
-            'parameter_changed': self.parameter_changed,
-            'display_duration_changed': self.display_duration_changed, 
-            'grid_layout_changed': self.grid_layout_changed, 
-            'add_data_source': self.add_data_source, 
-            'remove_data_source': self.remove_data_source 
+            "parameter_changed": self.parameter_changed,
+            "display_duration_changed": self.display_duration_changed,
+            "grid_layout_changed": self.grid_layout_changed,
+            "add_data_source": self.add_data_source,
+            "remove_data_source": self.remove_data_source,
         }
-    
+
     def init_ui(self):
         layout = QGridLayout()
         row = 0
@@ -114,10 +114,6 @@ class CommonSettingsPanel(QGroupBox):
         # Channel selection
         layout.addWidget(QLabel("Plot Sources"), row, 0)
         self.plot_source = CheckableComboBox()
-
-        # Assuming available_channels cntains DataSource objects
-        # for source in self.data_sources:
-        #     self.plot_source.addItem(source)
 
         self.plot_source.selectionChanged.connect(self.request_channel_update)
 

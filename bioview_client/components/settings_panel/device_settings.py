@@ -1,4 +1,3 @@
-from bioview_common import DeviceType
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -122,8 +121,8 @@ class USRPSettingsPanel(DeviceSettingsPanel):
 
     def set_streaming_locked(self, locked: bool):
         self._streaming_locked = locked
-        self.calibration_checkbox.setEnabled(not locked)
-        self.cal_shape_combo.setEnabled(not locked)
+        # The calibration overlay is toggleable while live; only the channel
+        # map, which changes the emitted row count, is frozen.
         self.channel_map_panel.set_streaming_locked(locked)
 
     def get_emittable_signals(self):
@@ -148,9 +147,13 @@ class BIOPACSettingsPanel(DeviceSettingsPanel):
             ("samp_rate", "Sample Rate (Hz)", (1, 10000), 10, 0),
             ("connection_type", "Connection Type", (10, 20), 10, 0),
         ]
-        for row, (param_name, label_text, (min_val, max_val), step, decimals) in enumerate(
-            param_specs
-        ):
+        for row, (
+            param_name,
+            label_text,
+            (min_val, max_val),
+            step,
+            decimals,
+        ) in enumerate(param_specs):
             layout.addWidget(QLabel(label_text), row, 0)
             value = self.device_configuration.get_param(param_name)
             if decimals == 0:
@@ -158,7 +161,7 @@ class BIOPACSettingsPanel(DeviceSettingsPanel):
                 widget.setRange(int(min_val), int(max_val))
                 widget.setSingleStep(int(step))
                 widget.setValue(
-                    int(value) if isinstance(value, (int, float)) else int(min_val)
+                    int(value) if isinstance(value, int | float) else int(min_val)
                 )
             else:
                 widget = QDoubleSpinBox()
@@ -166,7 +169,7 @@ class BIOPACSettingsPanel(DeviceSettingsPanel):
                 widget.setDecimals(decimals)
                 widget.setSingleStep(float(step))
                 widget.setValue(
-                    float(value) if isinstance(value, (int, float)) else float(min_val)
+                    float(value) if isinstance(value, int | float) else float(min_val)
                 )
             widget.valueChanged.connect(
                 lambda val, param_name=param_name: self.update_param(param_name, val)
@@ -228,9 +231,13 @@ class DummySettingsPanel(DeviceSettingsPanel):
             ("noise_std", "Noise Std-Dev", (0.0, 100.0), 0.1, 2),
             ("chunk_duration", "Chunk Duration (s)", (0.001, 1.0), 0.01, 3),
         ]
-        for row, (param_name, label_text, (min_val, max_val), step, decimals) in enumerate(
-            param_specs
-        ):
+        for row, (
+            param_name,
+            label_text,
+            (min_val, max_val),
+            step,
+            decimals,
+        ) in enumerate(param_specs):
             layout.addWidget(QLabel(label_text), row, 0)
             value = self.device_configuration.get_param(param_name)
             if decimals == 0:
@@ -238,7 +245,7 @@ class DummySettingsPanel(DeviceSettingsPanel):
                 widget.setRange(int(min_val), int(max_val))
                 widget.setSingleStep(int(step))
                 widget.setValue(
-                    int(value) if isinstance(value, (int, float)) else int(min_val)
+                    int(value) if isinstance(value, int | float) else int(min_val)
                 )
             else:
                 widget = QDoubleSpinBox()
@@ -246,7 +253,7 @@ class DummySettingsPanel(DeviceSettingsPanel):
                 widget.setDecimals(decimals)
                 widget.setSingleStep(float(step))
                 widget.setValue(
-                    float(value) if isinstance(value, (int, float)) else float(min_val)
+                    float(value) if isinstance(value, int | float) else float(min_val)
                 )
             widget.valueChanged.connect(
                 lambda val, param_name=param_name: self.update_param(param_name, val)
@@ -331,17 +338,3 @@ class DummySettingsPanel(DeviceSettingsPanel):
         if self._rf_mode:
             signals["run_dpic_balance"] = self.run_dpic_balance
         return signals
-
-
-settings_panel_generators = {
-    DeviceType.USRP: USRPSettingsPanel,
-    DeviceType.BIOPAC: BIOPACSettingsPanel,
-    DeviceType.DUMMY: DummySettingsPanel,
-}
-
-
-def get_device_settings_panel(device_configuration):
-    device_type = device_configuration.get_param("device_type")
-    if device_type not in settings_panel_generators:
-        return None
-    return settings_panel_generators[device_type](device_configuration)

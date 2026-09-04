@@ -1,14 +1,14 @@
 import qtawesome as qta
+from PyQt6.QtCore import QEvent, Qt, pyqtSignal
 from PyQt6.QtWidgets import QGroupBox, QHBoxLayout, QPlainTextEdit, QToolButton
-from PyQt6.QtCore import Qt, pyqtSignal, QEvent
 
 from bioview_client.constants import get_qcolor
 
+
 class AnnotateEventPanel(QGroupBox):
     log_event = pyqtSignal(str, str)
-    # Emitted with the annotation text when the user marks an event. The monitor
-    # validates the save target and forwards it to the active recording so it is
-    # stored centrally in the .bvr file's "Annotations" metadata.
+    # The monitor validates the save target and forwards the text to the
+    # active recording.
     annotation_requested = pyqtSignal(str)
 
     def __init__(self, parent=None):

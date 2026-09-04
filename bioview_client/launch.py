@@ -1,20 +1,16 @@
-"""BioView unified launcher.
+"""BioView entry point.
 
-A single multi-call entry point used by both source installs and the frozen
-single-binary bundles. Selecting a ``--role`` dispatches to one of:
+A single multi-call binary. ``--role`` selects what to run:
 
-- ``launcher`` (default): start a hidden localhost server in a *separate* OS
-  process -- so UHD and PyQt never share one interpreter/GIL -- then open the
-  Monitor GUI, and terminate the server again on exit.
-- ``server``: run the headless BioView server (used both directly and as the
-  child process spawned by the launcher).
-- ``monitor``: run only the Monitor GUI (no embedded server).
-- ``configurator``: run the Configurator GUI.
+- ``monitor`` (default): the Monitor GUI.
+- ``configurator``: the Configurator GUI.
+- ``server``: the headless server, used only as the child process the GUI roles
+  spawn for themselves.
 
-The same binary is reused for the child server: when frozen, ``sys.executable``
-is the bundled app, so we re-exec it with ``--role server``; from source we run
-``python -m bioview_server.server`` instead (a soft dependency -- the client
-never imports the server package at module load time).
+Both GUI roles always come up against a localhost server, started here in a
+*separate* OS process so UHD and PyQt never share one interpreter and GIL. The
+server is shared: the first window starts it, every later window reuses it, and
+it only goes away once the last window has closed.
 """
 
 import argparse
@@ -38,12 +34,13 @@ from bioview_common import (
 )
 
 
+CLIENT_ROLES = ("monitor", "configurator")
+
 # Windows flag to start the child server without flashing a console window.
 _CREATE_NO_WINDOW = 0x08000000
 
-# How long a spawned server waits with no client connected before retiring. It
-# covers the gap between one window closing and another opening, and guarantees
-# no server is left behind once the last window has gone.
+# Seconds with no client before a spawned server retires itself. Long enough
+# to cover one window closing and another opening.
 SERVER_IDLE_TIMEOUT = 20
 
 
@@ -51,17 +48,8 @@ def _is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False))
 
 
-# ---------------------------------------------------------------------------
-# Window registry
-#
-# The server is shared by every BioView window, so it must outlive the window
-# that happened to start it and go away once the last one closes. Connection
-# counts alone cannot decide that: a window that is still starting up (or one
-# that has momentarily dropped its connection) has no session on the server, and
-# the probe that asks for the count can itself fail. Each GUI process therefore
-# records itself in a small file here, and the server is only shut down when no
-# other window is registered against its port.
-# ---------------------------------------------------------------------------
+# Window registry: a shared server is only shut down once no other window is
+# registered against its port. See bioview-docs/architecture/launching.md.
 
 _REGISTRY_FILE = "windows.json"
 
@@ -221,10 +209,9 @@ def _server_running(
 ) -> bool:
     """Return True if a *BioView* server is already answering on the control port.
 
-    This is what decides whether to reuse an existing server or start one, so it
-    speaks the discovery handshake rather than only completing a TCP connect: any
-    unrelated process holding the port would satisfy a bare connect, and we would
-    then wait forever for a server that is never coming.
+    This speaks the discovery handshake rather than only completing a TCP
+    connect: any unrelated process holding the port would satisfy a bare
+    connect, and we would then wait forever for a server that is never coming.
     """
     return _server_info(host, port, timeout) is not None
 
@@ -233,45 +220,30 @@ def server_log_path():
     """Where a GUI-spawned server writes its log.
 
     The server is a detached child process, so its log is the only record of
-    what happened on the device side -- which backend failed to load, why a
-    device would not initialize -- and the user has to be able to find it.
+    what happened on the device side, and the user has to be able to find it.
     """
     return get_cache_file("server.log")
 
 
 def _spawn_server(control_port: int, data_port: int) -> subprocess.Popen:
     """Start a hidden, local-only server as a child process."""
+    server_args = [
+        "--local",
+        "--control-port",
+        str(control_port),
+        "--data-port",
+        str(data_port),
+        "--exit-when-idle",
+        str(SERVER_IDLE_TIMEOUT),
+    ]
     if _is_frozen():
-        cmd = [
-            sys.executable,
-            "--role",
-            "server",
-            "--local",
-            "--control-port",
-            str(control_port),
-            "--data-port",
-            str(data_port),
-            "--exit-when-idle",
-            str(SERVER_IDLE_TIMEOUT),
-        ]
+        # sys.executable is the bundled app, so re-exec it in the server role.
+        cmd = [sys.executable, "--role", "server", *server_args]
     else:
-        cmd = [
-            sys.executable,
-            "-m",
-            "bioview_server.server",
-            "--local",
-            "--control-port",
-            str(control_port),
-            "--data-port",
-            str(data_port),
-            "--exit-when-idle",
-            str(SERVER_IDLE_TIMEOUT),
-        ]
+        cmd = [sys.executable, "-m", "bioview_server.server", *server_args]
 
     # A windowed GUI build may have no valid console, so the child's output
-    # cannot be inherited. Send it to a log file rather than discarding it:
-    # everything the server knows about a device that failed to initialize used
-    # to end up in DEVNULL, leaving the user with no way to find out why.
+    # cannot be inherited. Send it to a log file rather than discarding it.
     log_handle = None
     with contextlib.suppress(Exception):
         log_path = server_log_path()
@@ -297,8 +269,7 @@ def _spawn_server(control_port: int, data_port: int) -> subprocess.Popen:
 def _release_server(child: subprocess.Popen, control_port: int = CONTROL_PORT) -> None:
     """Give up this window's claim on the server, shutting it down if we are last.
 
-    The server is shared, so only the last BioView window standing may shut it
-    down. Three things are checked, in order of how much they can be trusted:
+    Three things are checked, in order of how much they can be trusted:
 
     1. This window deregisters itself, then asks whether any other window is
        registered against this port. That covers a window which is still
@@ -306,8 +277,8 @@ def _release_server(child: subprocess.Popen, control_port: int = CONTROL_PORT) -
     2. The server's own client count, as a second opinion.
     3. If either answer is unavailable, nothing is killed. The server was
        spawned with --exit-when-idle, so it retires on its own once it really
-       has been left with nobody; a failed probe must never take a server out
-       from under a window that is still using it.
+       has been abandoned; a failed probe must never take a server out from
+       under a window that is still using it.
     """
     _unregister_window()
 
@@ -337,20 +308,6 @@ def _terminate(child: subprocess.Popen, timeout: float = 5.0) -> None:
             child.kill()
 
 
-def run_server(control_port: int, data_port: int, rest) -> int:
-    """Run the headless server in this process."""
-    from bioview_server.server import main as server_main
-
-    server_argv = [
-        "--control-port",
-        str(control_port),
-        "--data-port",
-        str(data_port),
-        *rest,
-    ]
-    return server_main(server_argv) or 0
-
-
 def _wait_for_server(control_port: int, timeout: float) -> bool:
     """Poll until a BioView server answers on the control port, or time out."""
     deadline = time.monotonic() + timeout
@@ -365,14 +322,10 @@ def _ensure_server(control_port: int, data_port: int, role: str = "window"):
     """Make sure exactly one localhost server is running, and say whether it is ours.
 
     Returns the child process when this launch started the server (the caller
-    shuts it down again on exit), or None when an existing server was reused. A
-    server is shared by every BioView window -- Monitor and Configurator alike --
-    so a second window never starts one of its own.
+    releases it on exit), or None when an existing server was reused.
     """
     # Registered before anything else: a window that is still starting up is
-    # already a reason to keep the shared server alive, and a window which
-    # reuses an existing server must count towards it just as much as the one
-    # that started it.
+    # already a reason to keep the shared server alive.
     _register_window(role, control_port)
 
     if _server_running(port=control_port):
@@ -380,9 +333,8 @@ def _ensure_server(control_port: int, data_port: int, role: str = "window"):
 
     child = _spawn_server(control_port, data_port)
 
-    # Wait for a server to come up. Two windows opened at the same moment can
-    # both get this far; only one of them wins the port, and the loser's child
-    # exits on the bind error rather than running alongside the winner.
+    # Two windows opened at the same moment can both get this far; only one of
+    # them wins the port, and the loser's child exits on the bind error.
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
         if _server_running(port=control_port):
@@ -393,54 +345,51 @@ def _ensure_server(control_port: int, data_port: int, role: str = "window"):
 
     if child.poll() is not None:
         # Our child is gone: it lost the race, or failed to start. Either way it
-        # is not ours to shut down. If a rival is still binding, give it a moment
-        # -- the GUI retries its localhost autoconnect regardless.
+        # is not ours to shut down.
         _wait_for_server(control_port, timeout=3.0)
         return None
 
-    # This server belongs to us, so it goes away when this window does.
     atexit.register(_release_server, child, control_port)
     return child
 
 
-def run_launcher(control_port: int, data_port: int, rest) -> int:
-    """Ensure a localhost server exists, then run the Monitor GUI."""
-    child = _ensure_server(control_port, data_port, role="monitor")
+def run_server(control_port: int, data_port: int, rest) -> int:
+    """Run the headless server in this process."""
+    from bioview_server.server import main as server_main
 
-    from bioview_client.monitor import run_monitor
+    server_argv = [
+        "--control-port",
+        str(control_port),
+        "--data-port",
+        str(data_port),
+        *rest,
+    ]
+    return server_main(server_argv) or 0
+
+
+def run_client(role: str, control_port: int, data_port: int, rest) -> int:
+    """Open one client window against a shared localhost server."""
+    child = _ensure_server(control_port, data_port, role=role)
+
+    if role == "configurator":
+        from bioview_client.configurator import run_configurator as run_gui
+    else:
+        from bioview_client.monitor import run_monitor as run_gui
 
     try:
-        return run_monitor(rest)
+        return run_gui(rest) or 0
     finally:
         _release_server(child, control_port)
 
 
-def run_configurator_role(control_port: int, data_port: int, rest) -> int:
-    """Run the Configurator GUI against a localhost server.
-
-    The Configurator lists attached hardware, which only the server can do, so
-    it needs a server for the same reason the Monitor does.
-    """
-    child = _ensure_server(control_port, data_port, role="configurator")
-
-    from bioview_client.configurator import main as configurator_main
-
-    try:
-        return configurator_main(rest) or 0
-    finally:
-        _release_server(child, control_port)
+def main_monitor(argv=None) -> int:
+    """Console-script entry point for the Monitor."""
+    return main(["--role", "monitor", *(sys.argv[1:] if argv is None else argv)])
 
 
 def main_configurator(argv=None) -> int:
-    """Console-script entry point for the Configurator.
-
-    Dispatches through the launcher so the Configurator gets a localhost server
-    the same way the Monitor does -- it lists and configures attached hardware,
-    which only the server can do, so without one it has nothing to talk to.
-    """
-    if argv is None:
-        argv = sys.argv[1:]
-    return main(["--role", "configurator", *argv])
+    """Console-script entry point for the Configurator."""
+    return main(["--role", "configurator", *(sys.argv[1:] if argv is None else argv)])
 
 
 def main(argv=None) -> int:
@@ -455,14 +404,10 @@ def main(argv=None) -> int:
 
     parser = argparse.ArgumentParser(
         prog="bioview",
-        description="BioView launcher (server + GUI orchestration)",
+        description="BioView launcher (opens a client window and its server)",
         add_help=False,
     )
-    parser.add_argument(
-        "--role",
-        choices=["launcher", "server", "monitor", "configurator"],
-        default="launcher",
-    )
+    parser.add_argument("--role", choices=[*CLIENT_ROLES, "server"], default="monitor")
     parser.add_argument("--control-port", type=int, default=CONTROL_PORT)
     parser.add_argument("--data-port", type=int, default=DATA_PORT)
     parser.add_argument(
@@ -477,15 +422,7 @@ def main(argv=None) -> int:
     if args.role == "server":
         return run_server(args.control_port, args.data_port, rest)
 
-    if args.role == "configurator":
-        return run_configurator_role(args.control_port, args.data_port, rest)
-
-    if args.role == "monitor":
-        from bioview_client.monitor import run_monitor
-
-        return run_monitor(rest)
-
-    return run_launcher(args.control_port, args.data_port, rest)
+    return run_client(args.role, args.control_port, args.data_port, rest)
 
 
 if __name__ == "__main__":

@@ -5,8 +5,10 @@ alongside a Configurator reuses the server that is already there, and the server
 itself refuses to start a second time on the same ports.
 """
 import socket
+import sys
 import threading
 import time
+import types
 
 import pytest
 from bioview_common import CONTROL_PORT
@@ -76,24 +78,50 @@ def test_no_server_at_all_is_reported_as_not_running():
     assert not launch._server_running(port=_free_port())
 
 
-def test_the_configurator_entry_point_starts_a_server_like_the_monitor(monkeypatch):
-    """The bioview-configurator script used to open the GUI with no server at
-    all, so it had nothing to connect to."""
+@pytest.mark.parametrize(
+    ("entry_point", "role"),
+    [("main_monitor", "monitor"), ("main_configurator", "configurator")],
+)
+def test_every_client_entry_point_starts_a_server(monkeypatch, entry_point, role):
+    """Both windows need a server: the Monitor to stream, the Configurator to
+    list attached hardware. Neither may open with nothing to connect to."""
     calls = {}
 
-    def fake_ensure(control_port, data_port):
-        calls["ensured"] = (control_port, data_port)
-        return None
-
-    monkeypatch.setattr(launch, "_ensure_server", fake_ensure)
     monkeypatch.setattr(
         launch,
-        "run_configurator_role",
-        lambda cp, dp, rest: (calls.setdefault("role", "configurator"), 0)[1],
+        "run_client",
+        lambda role, cp, dp, rest: calls.setdefault("role", role) and 0,
     )
 
-    assert launch.main_configurator([]) == 0
-    assert calls["role"] == "configurator"
+    assert getattr(launch, entry_point)([]) == 0
+    assert calls["role"] == role
+
+
+def test_a_client_role_ensures_a_server_and_releases_it(monkeypatch):
+    events = []
+    sentinel = object()
+
+    monkeypatch.setattr(
+        launch,
+        "_ensure_server",
+        lambda cp, dp, role: events.append(("ensure", role)) or sentinel,
+    )
+    monkeypatch.setattr(
+        launch, "_release_server", lambda child, cp: events.append(("release", child))
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "bioview_client.configurator",
+        types.SimpleNamespace(run_configurator=lambda rest: 0),
+    )
+
+    assert launch.run_client("configurator", 9001, 9002, []) == 0
+    assert events == [("ensure", "configurator"), ("release", sentinel)]
+
+
+def test_only_client_roles_and_the_child_server_are_offered():
+    """The launcher orchestrates windows; it is not a menu of server options."""
+    assert launch.CLIENT_ROLES == ("monitor", "configurator")
 
 
 def test_the_spawned_server_is_told_to_retire_when_idle(monkeypatch):

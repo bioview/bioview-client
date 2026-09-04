@@ -1,25 +1,19 @@
-"""
-Drives presentation of a single instruction (audio / video / text) for the
-duration of a timed mode. Everything runs on the Qt event loop -- audio and
-video via ``QMediaPlayer`` and text reveal via ``QTimer`` -- so no extra
-threads are needed.
+"""Presents one instruction (audio, video or text) during a timed mode.
 
-The controller is intentionally agnostic about the run duration: the owner
-(monitor) starts it when a timed mode begins and calls ``stop()`` when the run
-ends (either the duration elapsed or the user pressed Stop).
+Entirely on the Qt event loop. The owner starts it and calls ``stop()``.
 """
 import contextlib
 from pathlib import Path
 
 from PyQt6.QtCore import QObject, QTimer, QUrl, pyqtSignal
 
+from .instruction_dialog import InstructionDialog
 from .routine import (
     INSTRUCTION_AUDIO,
     INSTRUCTION_TEXT,
     INSTRUCTION_VIDEO,
     InstructionSpec,
 )
-from .instruction_dialog import InstructionDialog
 
 
 class InstructionController(QObject):
@@ -66,12 +60,8 @@ class InstructionController(QObject):
             self._text_timer.deleteLater()
             self._text_timer = None
 
-        # Tear the media player down explicitly. Dropping the only Python
-        # reference and letting the garbage collector destroy a still-active
-        # QMediaPlayer is what hangs the UI on some platforms (notably the
-        # macOS/ffmpeg backend) after playback ends. Disconnect first to avoid
-        # re-entrant status callbacks, stop, release the source/outputs, then
-        # schedule deletion on the event loop.
+        # Torn down explicitly: letting the GC destroy a still-active
+        # QMediaPlayer hangs the UI on some platforms.
         if self._player is not None:
             with contextlib.suppress(Exception):
                 self._player.mediaStatusChanged.disconnect(self._on_media_status)
@@ -112,7 +102,9 @@ class InstructionController(QObject):
         self._player.mediaStatusChanged.connect(self._on_media_status)
 
         if with_video:
-            self._dialog = InstructionDialog(mode=INSTRUCTION_VIDEO, parent=self.host_widget)
+            self._dialog = InstructionDialog(
+                mode=INSTRUCTION_VIDEO, parent=self.host_widget
+            )
             self._player.setVideoOutput(self._dialog.video_widget)
             self._dialog.show_instruction()
 

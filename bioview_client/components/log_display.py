@@ -1,10 +1,4 @@
-"""The log panel, shared by the Monitor and the Configurator.
-
-There were two of these -- one here and another written inline in the
-Configurator -- with different formatting, different colouring and different
-method names, so a fix to one silently left the other behind. This is the only
-one; both windows construct it the same way.
-"""
+"""The log panel, shared by the Monitor and the Configurator."""
 import html
 import logging
 
@@ -65,12 +59,7 @@ class HtmlLogFormatter(logging.Formatter):
 
 
 class LogDisplayPanel(QGroupBox):
-    """A log view backed by a real logger.
-
-    Going through ``logging`` rather than appending strings directly means a
-    window's log can also be routed to a file or the console by adding handlers,
-    and that level filtering behaves the way the rest of the application expects.
-    """
+    """A log view backed by ``logging``, so handlers and levels work normally."""
 
     def __init__(self, logger=None, parent=None, title="Log", max_height=None):
         super().__init__(title, parent)
@@ -96,11 +85,7 @@ class LogDisplayPanel(QGroupBox):
         self.logger.addHandler(self.log_handler)
 
     def log_message(self, level, msg):
-        """Record a message at a named level.
-
-        ``warn`` is accepted alongside ``warning``: call sites use both, and the
-        odd one out used to fall through the colour table and render grey.
-        """
+        """Record a message at a named level. ``warn`` aliases ``warning``."""
         level = str(level).lower()
         if level == "warn":
             level = "warning"

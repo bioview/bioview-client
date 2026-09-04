@@ -1,10 +1,7 @@
-"""
-BioView Monitor can be launched via CLI, with/without configuration
-JSONs pre-specified. They may also be launched using GUI without any
-specified configuration. In case no valid configuration files are
-found, the app will prompt the user to provide configuration JSONs.
-Regardless of any configurations, the UI will load with appropriate
-components/default values
+"""BioView Monitor: the live acquisition window.
+
+Runs with or without a configuration file; missing configuration is prompted
+for at startup. See bioview-docs/architecture/client.md.
 """
 import argparse
 import contextlib
@@ -12,7 +9,6 @@ import logging  # TODO: Remove
 import sys
 import time
 from pathlib import Path
-from typing import Dict
 
 from bioview_common import (
     SUPPORTED_CONFIGURATION_TYPES,
@@ -50,23 +46,33 @@ from bioview_client.components.common import Toast
 from bioview_client.handler import Client
 
 
-class BioViewMonitor(QMainWindow):
-    """'
-    The main UI can be launched with or without CL arguments.
+def split_configurations(configurations):
+    """Split a parsed config into (all configs, experiment config, device groups).
 
-    Inputs -
-    group_configs: List[Dict] or Dict
-        A list of device group configurations. Each element in the list pertains to one
-        device group (dictionary). Key-value pairs in the device group correspond to
-        device ID and device configurations respectively. If None, the application will
-        prompt the user for configurations via a dialog.
-    experiment_config: Dict
-        A dictionary containing common configuration parameters. If None, the application
-        will prompt the user for configurations via a dialog.
-    autodiscover: bool
-        If True, automatically scan for available servers on startup. Default is True.
-    autoconnect: bool
-        If True, attempt to connect to the first discovered server. Default is False.
+    A missing EXPERIMENT block is defaulted *into the returned mapping*, which
+    is what SettingsPanel builds the plot-source selector from.
+    """
+    configurations = dict(configurations)
+
+    experiment_cfg_id = None
+    for cfg_id, cfg in configurations.items():
+        if cfg.get_type() == SUPPORTED_CONFIGURATION_TYPES.EXPERIMENT:
+            experiment_cfg_id = cfg_id
+            break
+
+    if experiment_cfg_id is None:
+        experiment_cfg_id = "Experiment"
+        configurations[experiment_cfg_id] = ExperimentConfiguration({})
+
+    experiment_config = configurations[experiment_cfg_id]
+    group_configs = {k: v for k, v in configurations.items() if k != experiment_cfg_id}
+    return configurations, experiment_config, group_configs
+
+
+class BioViewMonitor(QMainWindow):
+    """The main acquisition window.
+
+    Missing ``group_configs``/``experiment_config`` are prompted for via a dialog.
     """
 
     def __init__(
@@ -78,47 +84,33 @@ class BioViewMonitor(QMainWindow):
         autoconnect: bool = False,
     ):
         super().__init__()
-        # Persist CLI/UI flags
         self.autodiscover = autodiscover
         self.autoconnect = autoconnect
 
         self.config_file = config_file
-        if isinstance(self.config_file, (list, tuple)):
+        if isinstance(self.config_file, list | tuple):
             self.config_file = self.config_file[0] if self.config_file else None
 
-        # If no valid configuration file present, prompt user.
         if not self.config_file:
             dialog = ConfigurationPrompt()
 
             if dialog.exec() == QDialog.DialogCode.Accepted:
                 self.config_file = dialog.get_config_file()
 
-        # Now, parse and validate configurations.
         self.configurations = parse_configuration_file(self.config_file)
 
-        experiment_cfg_id = None
-        for cfg_id, cfg in self.configurations.items():
-            if cfg.get_type() == SUPPORTED_CONFIGURATION_TYPES.EXPERIMENT:
-                experiment_cfg_id = cfg_id
-                break
+        (
+            self.configurations,
+            self.experiment_config,
+            self.group_configs,
+        ) = split_configurations(self.configurations)
 
-        if not experiment_cfg_id:
-            self.experiment_config = ExperimentConfiguration({})  # Load a default one
-            self.group_configs = self.configurations
-        else:
-            self.experiment_config = self.configurations[experiment_cfg_id]
-            self.group_configs = {
-                k: v for k, v in self.configurations.items() if k != experiment_cfg_id
-            }
-
-        # Store group states
         self.device_status = {k: DeviceStatus.NOINIT for k in self.group_configs}
 
         self.saving_status = False
 
-        # Timed-mode (routine) state. Routines are declared in the experiment
-        # config and pair a fixed duration with optional audio/video/text
-        # instructions. Unlimited mode (free-running) remains always available.
+        # Routines pair a fixed duration with optional instructions; the
+        # free-running "unlimited" mode is always available alongside them.
         self.timed_modes = parse_timed_modes(
             self.experiment_config.get_timed_modes(),
             base_dir=self._config_base_dir(),
@@ -132,10 +124,8 @@ class BioViewMonitor(QMainWindow):
         self.routine_timer.setInterval(200)
         self.routine_timer.timeout.connect(self._on_routine_tick)
 
-        # Set up UI
         self._init_ui()
 
-        # Client is setup with handlers passed along
         self.client_worker = Client(
             experiment_config=self.experiment_config, group_configs=self.group_configs
         )
@@ -143,18 +133,14 @@ class BioViewMonitor(QMainWindow):
         self.client_worker.start_client()
         self.command_bar.update_button_states(self.client_worker.status)
 
-        # Connect UI calls - including logging
         self._connect_signals()
 
-        # Available data sources advertised by the connected server
         self.available_sources = []
 
     def _init_ui(self):
-        # Define main wndow
         self.setWindowTitle("BioView Data Monitor")
-        # Window title-bar icon. On Windows and KDE this shows in the title bar;
-        # GNOME and macOS ignore per-window icons and use the app/.desktop icon
-        # instead, which is set application-wide in run_monitor().
+        # Per-window icon; GNOME and macOS ignore it and use the app icon
+        # set in run_monitor() instead.
         self.setWindowIcon(get_app_icon())
         screen = QGuiApplication.primaryScreen().geometry()
         width = screen.width()
@@ -163,7 +149,6 @@ class BioViewMonitor(QMainWindow):
             int(0.2 * width), int(0.1 * height), int(0.6 * width), int(0.8 * height)
         )
 
-        # Create central widget and main layout
         central_widget = QWidget(self)
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
@@ -172,17 +157,13 @@ class BioViewMonitor(QMainWindow):
 
         splitter = QSplitter(Qt.Orientation.Vertical)
 
-        # Top shelf container
         top_widget = QWidget()
         top_layout = QHBoxLayout(top_widget)
         top_layout.setContentsMargins(0, 0, 0, 0)
 
-        # All controls are in one container
         controls_layout = QVBoxLayout()
 
-        # Connect/Start/Stop/Balance Signal Buttons
         self.command_bar = AppControlPanel()
-        # Expose declared timed modes in the routine selector next to Start
         self.command_bar.set_routines([m.label for m in self.timed_modes])
         controls_layout.addWidget(self.command_bar, stretch=1)
 
@@ -192,22 +173,18 @@ class BioViewMonitor(QMainWindow):
 
         top_layout.addLayout(controls_layout, stretch=3)
 
-        # Metadata Panels
         self.meta_panels = QVBoxLayout()
-        # Status Panel - Experiment Log goes here
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.DEBUG)
         self.log_display_panel = LogDisplayPanel(logger=self.logger)
         self.meta_panels.addWidget(self.log_display_panel, stretch=3)
 
-        # Annotation Panel. Annotations are stored centrally in the active
-        # recording's .bvr file (not in per-annotation sidecar files), so the
-        # panel just emits the text and the monitor routes it to the client.
+        # Annotations live in the recording's .bvr file, so the panel only
+        # emits text and the monitor routes it to the client.
         self.annotate_event_panel = AnnotateEventPanel()
         self.meta_panels.addWidget(self.annotate_event_panel, stretch=2)
         top_layout.addLayout(self.meta_panels, stretch=2)
 
-        # Plot Grid
         self.plot_grid = PlotGrid(self.experiment_config)
 
         # Enforce plot heights (50% to 60% of the initial window height)
@@ -215,48 +192,40 @@ class BioViewMonitor(QMainWindow):
         self.plot_grid.setMinimumHeight(int(0.5 * window_height))
         self.plot_grid.setMaximumHeight(int(0.6 * window_height))
 
-        # Add to splitter
         splitter.addWidget(top_widget)
         splitter.addWidget(self.plot_grid)
 
-        # Give plots priority to expand
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
 
         main_layout.addWidget(splitter)
         central_widget.setLayout(main_layout)
 
-        # Status Bar
         self.status_bar = StatusBar(device_status=self.device_status, parent=self)
         self.setStatusBar(self.status_bar)
 
     def _connect_client_signals(self):
         """Connect client signals to UI handlers."""
-        # Server control signals
         self.client_worker.server_scan_completed.connect(
             self.status_bar.on_scan_complete
         )
         self.client_worker.server_connected.connect(self.on_server_connected)
         self.client_worker.server_disconnected.connect(self.on_server_disconnected)
 
-        # Server info signals
         self.client_worker.server_scan_progress.connect(
             self.status_bar.update_scan_progress
         )
 
-        # Device control signals
         self.client_worker.device_init_succeeded.connect(
             self.update_status_bar_and_buttons
         )
         self.client_worker.device_init_failed.connect(self.on_device_init_failed)
-        # Populate plot sources once devices are initialized/discovered
         self.client_worker.device_init_succeeded.connect(self.on_devices_ready)
         self.client_worker.devices_discovered.connect(self.on_devices_ready)
         self.client_worker.device_disconnect_succeeded.connect(
             self.update_status_bar_and_buttons
         )
-        # A live parameter change (e.g. the BIOPAC channel mask) can add or drop
-        # streams; keep the plot-source selector in step with the device.
+        # A live parameter change can add or drop streams.
         self.client_worker.data_sources_changed.connect(self.populate_plot_grid_sources)
         self.client_worker.streaming_started.connect(
             lambda x: self._handle_streaming_status_changed(x)
@@ -266,20 +235,16 @@ class BioViewMonitor(QMainWindow):
         )
         self.client_worker.devices_discovered.connect(self.update_status_bar_and_buttons)
 
-        # Data signal for live display (data, sources). Use a queued connection so
-        # data bursts are marshalled to the UI thread one event at a time and never
-        # block or re-enter the receiving path.
+        # Queued: data bursts are marshalled to the UI thread one at a time
+        # and never re-enter the receiving path.
         self.client_worker.data_received.connect(
             self.on_data_received, Qt.ConnectionType.QueuedConnection
         )
 
-        # General info signals
         self.client_worker.log_message.connect(self.log_display_panel.log_message)
 
     def _connect_signals(self):
-        """
-        Connect signals from all UI components to respective calls in client worker
-        """
+        """Wire UI component signals to the client worker."""
         self._connect_command_bar_signals()
         self._connect_settings_panel_signals()
         self._connect_statusbar_signals()
@@ -293,28 +258,15 @@ class BioViewMonitor(QMainWindow):
         )
         self.annotate_event_panel.log_event.connect(self.log_display_panel.log_message)
 
-    def _handle_server_connection_request(self, server_info: dict):
-        """Handle server connect requests from the UI"""
-        if not server_info:
-            return
-        # Set selected server on client worker and ask it to connect
-        if self.client_worker:
-            self.client_worker.selected_server = server_info
-
-            with contextlib.suppress(Exception):
-                self.client_worker.connect_to_server()
-
     def _connect_command_bar_signals(self):
         self.command_bar.initialize_devices.connect(self.on_device_init_requested)
-        # Manual (unlimited mode) start; stop is routed through a handler that also
-        # tears down any running timed mode before stopping the stream.
+        # Stop is routed through a handler that also tears down a running routine.
         self.command_bar.start_streaming.connect(self.handle_start_streaming)
         self.command_bar.stop_streaming.connect(self.handle_stop_streaming)
         self.command_bar.enable_data_saving.connect(self.update_save_state)
         self.command_bar.routine_selected.connect(self.on_routine_selected)
 
     def _connect_settings_panel_signals(self):
-        # Save-related parameters (file name / save dir) flow to the client worker
         if getattr(self.settings_panel, "parameter_changed", None):
             self.settings_panel.parameter_changed.connect(self.on_parameter_changed)
 
@@ -331,7 +283,6 @@ class BioViewMonitor(QMainWindow):
         if getattr(self.settings_panel, "remove_data_source", None):
             self.settings_panel.remove_data_source.connect(self.remove_plot_source)
 
-        # Device parameter tweaks are recorded into the active recording's metadata
         if getattr(self.settings_panel, "device_param_changed", None):
             self.settings_panel.device_param_changed.connect(
                 self.on_device_param_changed
@@ -346,32 +297,26 @@ class BioViewMonitor(QMainWindow):
         self.plot_grid.log_event.connect(self.log_display_panel.log_message)
 
     def _connect_statusbar_signals(self):
-        # Discovery/start scan
         self.status_bar.network_scan_requested.connect(
             self.client_worker.discover_servers
         )
 
-        # Cancel scan
         self.status_bar.network_scan_cancel_requested.connect(
             self.client_worker.cancel_scan
         )
 
-        # Update selected server
         self.status_bar.selected_server_changed.connect(
             self.client_worker.change_selected_server
         )
 
-        # Server connection request
         self.status_bar.server_connection_requested.connect(
             self.client_worker.connect_to_server
         )
 
-        # Server disconnection request
         self.status_bar.server_disconnection_requested.connect(
             self.client_worker.disconnect_from_server
         )
 
-        # Device discovery request
         self.status_bar.discover_devices_requested.connect(
             lambda: self.client_worker.initialize_devices(True)
         )
@@ -381,8 +326,7 @@ class BioViewMonitor(QMainWindow):
             self.settings_panel.set_streaming_locked(is_streaming)
         if is_streaming:
             self.on_streaming_started()
-        # Only transition statuses for devices that are actually connected/streaming.
-        # Never "promote" failed devices (e.g. unavailable BIOPAC) to connected.
+        # Never promote a failed device to connected.
         for group_id, current in list(self.device_status.items()):
             if group_id == "metadata":
                 continue
@@ -400,8 +344,7 @@ class BioViewMonitor(QMainWindow):
                         group_id, DeviceStatus.CONNECTED
                     )
 
-        # If streaming stopped for any reason while a routine was active (e.g. a
-        # server drop), tear down the routine UI/instructions to stay consistent.
+        # A routine cannot outlive the stream it was recording.
         if not is_streaming and self.active_timed_mode is not None:
             self._cleanup_timed_mode()
 
@@ -409,12 +352,7 @@ class BioViewMonitor(QMainWindow):
         self.command_bar.update_button_states(client_status)
 
     def keyPressEvent(self, event):
-        """F11 toggles true fullscreen; Esc only leaves it.
-
-        The app launches *maximized* (normal window frame, title bar and taskbar
-        still visible), so leaving fullscreen must restore the maximized state
-        rather than the smaller "normal" geometry.
-        """
+        """F11 toggles true fullscreen; Esc only leaves it (back to maximized)."""
         key = event.key()
         if key == Qt.Key.Key_F11:
             if self.isFullScreen():
@@ -442,21 +380,17 @@ class BioViewMonitor(QMainWindow):
         self.plot_grid.set_display_time(seconds)
 
     def handle_grid_layout_change(self, rows, cols):
-        # Resizing keeps still-fitting sources plotted in place; any that no
-        # longer fit the new (smaller) grid are returned so we can uncheck them
-        # in the source selector and keep the UI state consistent.
+        # Sources that no longer fit the smaller grid come back here so their
+        # ticks can be cleared.
         dropped = self.plot_grid.update_grid(rows, cols)
         for src in dropped or []:
             self.settings_panel.update_source("remove", src)
 
     def populate_plot_grid_sources(self, sources):
-        """Rebuild the plot-source selector from the sources the server advertises.
+        """Reconcile the plot-source selector with the server's advertised list.
 
-        `sources` may be DataSource objects or descriptor dicts. This runs again
-        whenever the server's source list changes (enabling or disabling a device
-        channel, for instance), so it reconciles rather than just repopulating:
-        a source that has gone away is unplotted, and one that is still plotted
-        keeps its tick when the selector is rebuilt.
+        Accepts DataSource objects or descriptor dicts. Sources that have gone
+        away are unplotted; surviving ones keep their tick.
         """
         if sources is None:
             return
@@ -476,8 +410,7 @@ class BioViewMonitor(QMainWindow):
             if src not in available:
                 self.plot_grid.remove_source(src)
 
-        # set_available_sources() rebuilds the model and so clears every check
-        # state; restore the ticks for whatever is still on the grid.
+        # Rebuilding the model clears every tick; restore what is still plotted.
         still_plotted = list(self.plot_grid.selected_channels.keys())
         self.settings_panel.set_available_sources(source_objs)
         for src in still_plotted:
@@ -499,19 +432,13 @@ class BioViewMonitor(QMainWindow):
             self.client_worker.set_save_param(name, value)
 
     def add_plot_source(self, source: DataSource):
-        """
-        Connects a new data source to a PlotGrid object
-        """
+        """Connect a new data source to the plot grid."""
         if self.plot_grid.add_source(source):
-            # If source can be successfully shown, mark it as selected in the panel
             self.settings_panel.update_source("add", source)
 
     def remove_plot_source(self, source: DataSource):
-        """
-        Removes an existing data source from a PlotGrid object
-        """
+        """Remove a data source from the plot grid."""
         if self.plot_grid.remove_source(source):
-            # If source can be successfully removed, deselect in the panel
             self.settings_panel.update_source("remove", source)
 
     # Command Bar helper functions
@@ -519,8 +446,7 @@ class BioViewMonitor(QMainWindow):
         if not self.client_worker:
             return
 
-        # Update UI to show CONNECTING state for all known devices
-        # device_status is a flat mapping {group_id: DeviceStatus}
+        # device_status is a flat {group_id: DeviceStatus} mapping.
         for group_id in self.device_status:
             if group_id == "metadata":
                 continue
@@ -528,7 +454,6 @@ class BioViewMonitor(QMainWindow):
 
         self.command_bar.initialize_button.setEnabled(False)
 
-        # Request server to connect all initialized devices
         self.client_worker.initialize_devices()
 
     def on_device_init_failed(self):
@@ -561,8 +486,8 @@ class BioViewMonitor(QMainWindow):
         return True
 
     def update_save_state(self, enabled: bool = True):
-        # Enabling saving requires a file name + folder. If either is missing,
-        # warn the user and revert the checkbox so state stays consistent.
+        # Saving needs both a file name and a folder; revert the checkbox if
+        # either is missing.
         if enabled and self._warn_missing_save_target():
             with contextlib.suppress(Exception):
                 self.command_bar.save_checkbox.setChecked(False)
@@ -576,10 +501,7 @@ class BioViewMonitor(QMainWindow):
             self.client_worker.set_save_enabled(bool(enabled))
 
     def on_annotation_requested(self, text: str):
-        """Store a "Mark Event" annotation in the active recording's .bvr file.
-
-        Guards: a file name + folder must be set (otherwise nothing can be saved),
-        and a recording must be active (annotations attach to a recording)."""
+        """Store a "Mark Event" annotation in the active recording."""
         if self._warn_missing_save_target():
             return
 
@@ -598,7 +520,7 @@ class BioViewMonitor(QMainWindow):
     def _config_base_dir(self) -> Path:
         """Directory used to resolve relative instruction file paths."""
         cf = self.config_file
-        if isinstance(cf, (list, tuple)):
+        if isinstance(cf, list | tuple):
             cf = cf[0] if cf else None
         if cf:
             with contextlib.suppress(Exception):
@@ -611,7 +533,6 @@ class BioViewMonitor(QMainWindow):
         self.start_timed_mode(self.timed_modes[index])
 
     def start_timed_mode(self, mode):
-        # A routine requires connected devices and no active stream
         if self.client_worker.status < ClientStatus.DEVICES_CONNECTED:
             self.log_display_panel.log_message(
                 "warning", "Connect and initialize devices before running a routine"
@@ -625,24 +546,20 @@ class BioViewMonitor(QMainWindow):
             self.command_bar.reset_routine_selection()
             return
 
-        # Timed modes always save, so a valid save target is mandatory here.
         if self._warn_missing_save_target():
             self.command_bar.reset_routine_selection()
             return
 
         self.active_timed_mode = mode
 
-        # Timed modes always save. Reflect this in the UI; the recording is named
-        # <file name>_<routine label>.bvr (the label is applied by the handler).
+        # Timed modes always save, as <file name>_<routine label>.bvr.
         self.command_bar.save_checkbox.setChecked(True)
         self.update_save_state(True)
         self.client_worker.set_save_label(mode.label)
 
-        # Begin instructions (if any) and the data stream
         self._start_instruction(mode.instruction)
         self.client_worker.start_streaming()
 
-        # Show the progress bar and arm the countdown
         self.status_bar.start_routine(mode.label, mode.duration)
         self._routine_deadline = time.monotonic() + mode.duration
         self.routine_timer.start()
@@ -694,7 +611,6 @@ class BioViewMonitor(QMainWindow):
     def handle_start_streaming(self):
         """Start button (unlimited mode): this is not a timed routine, so clear any
         routine label before streaming. Recordings are then named <file name>.bvr."""
-        # If saving is enabled, a valid save target is mandatory before we start.
         if self.saving_status and self._warn_missing_save_target():
             return
         self.client_worker.set_save_label(None)
@@ -738,7 +654,6 @@ class BioViewMonitor(QMainWindow):
 
         self.command_bar.update_button_states(self.client_worker.status)
 
-        # Populate plot sources from the data sources advertised by the server
         data_sources = self.client_worker.get_data_sources()
         if data_sources:
             self.populate_plot_grid_sources(data_sources)
@@ -749,7 +664,6 @@ class BioViewMonitor(QMainWindow):
         except Exception:
             self.log_display_panel.log_message("warning", "Unable to update status bar")
 
-        # Reset plot/source UI state so a new server connection starts cleanly.
         self.available_sources = []
         self.settings_panel.set_available_sources([])
         self.plot_grid.clear_sources()
@@ -761,8 +675,7 @@ class BioViewMonitor(QMainWindow):
         if hasattr(self.settings_panel, "set_streaming_locked"):
             self.settings_panel.set_streaming_locked(True)
 
-    def update_status_bar_and_buttons(self, device_status: Dict):
-        # device_status is a flat mapping {group_id: DeviceStatus value}
+    def update_status_bar_and_buttons(self, device_status: dict):
         for group_id, new_status in device_status.items():
             if group_id == "metadata":
                 continue
@@ -801,11 +714,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def run_monitor(argv=None) -> int:
-    """Build the Qt application, show the monitor window, and run the event loop.
+    """Build the Qt application, show the window and run the event loop.
 
-    Shared by ``python -m bioview_client.monitor`` and the ``bioview`` launcher so
-    both entry points behave identically. Returns the Qt exit code (does not call
-    ``sys.exit`` itself, so callers can perform cleanup afterwards)."""
+    Returns the Qt exit code rather than calling ``sys.exit``, so the caller
+    can clean up afterwards.
+    """
     import qdarktheme  # Provide consistent styling across all OSes
 
     parser = build_arg_parser()
@@ -813,44 +726,36 @@ def run_monitor(argv=None) -> int:
 
     qdarktheme.enable_hi_dpi()
     app = QApplication(sys.argv)
-    # Application-wide branding: the app icon (dock/taskbar + GNOME/macOS window
-    # icon) and the desktop-file association Wayland/KDE use to pick the launcher
-    # icon for the running window.
+    # App-wide branding: taskbar/dock icon plus the .desktop association
+    # Wayland and KDE use to pick the launcher icon.
     app.setApplicationName("BioView")
     app.setApplicationDisplayName("BioView Data Monitor")
     app.setDesktopFileName(APP_DESKTOP_NAME)
     app.setWindowIcon(get_app_icon())
     qdarktheme.setup_theme(theme="dark")
 
-    # Create and show main window with parsed configs and flags
     window = BioViewMonitor(
         config_file=args.config_file,
         autodiscover=args.autodiscover,
         autoconnect=args.autoconnect,
     )
-    # Launch maximized (not fullscreen): the title bar, window controls and the
-    # OS taskbar all stay visible. F11 opts into true fullscreen; Esc leaves it.
+    # Maximized, not fullscreen: the title bar and taskbar stay visible.
     window.showMaximized()
 
-    # Seamless localhost: always probe 127.0.0.1 quickly and autoconnect the moment
-    # a local server answers -- no manual "discover servers" needed. The probe is
-    # cheap and runs off the UI thread; retry briefly until connected so the client
-    # can be launched before the server and still latch on as soon as it appears.
+    # Probe loopback and latch on as soon as a local server answers, so the
+    # window can be started before its server.
     window._localhost_timer = start_localhost_autoconnect(window.client_worker, window)
 
-    # If auto-discover, trigger the scan. The scan is asynchronous, so autoconnect
-    # must wait for the scan to actually complete before selecting/connecting.
+    # The scan is asynchronous, so autoconnect waits for it to complete.
     if window.autodiscover and window.client_worker:
         handler = window.client_worker
 
         if window.autoconnect:
 
             def _autoconnect_when_scan_done(servers):
-                # Connect to the first discovered server once results arrive. If a
-                # scan finds nothing we stay subscribed so a later retry (below)
-                # that finds the server will still autoconnect.
+                # Stay subscribed when a scan finds nothing, so a later retry
+                # still autoconnects.
                 if handler.status >= ClientStatus.SERVER_CONNECTED:
-                    # Already connected (e.g. the localhost fast path beat us to it)
                     with contextlib.suppress(Exception):
                         handler.server_scan_completed.disconnect(
                             _autoconnect_when_scan_done
@@ -866,20 +771,17 @@ def run_monitor(argv=None) -> int:
 
             handler.server_scan_completed.connect(_autoconnect_when_scan_done)
 
-        # Periodically re-scan until a server is found / we are connected, so the
-        # client can be started before the server and still discover it later.
+        # Re-scan until connected, so the window can outlive a missing server.
         rescan_timer = QTimer()
 
         def _maybe_rescan():
-            # Stop retrying once connected (or further along) or once we have
-            # results the user can act on. A scan already in flight is left alone.
+            # A scan already in flight is left alone.
             if handler.status >= ClientStatus.SERVER_CONNECTED:
                 rescan_timer.stop()
                 return
             if handler.status == ClientStatus.SCANNING:
                 return
-            # Found something already; keep retrying only in autoconnect mode
-            # (so a dropped server can be re-found), otherwise let the user act.
+            # Keep retrying only in autoconnect mode; otherwise let the user act.
             if handler.discovered_servers and not window.autoconnect:
                 rescan_timer.stop()
                 return
@@ -887,7 +789,6 @@ def run_monitor(argv=None) -> int:
 
         rescan_timer.timeout.connect(_maybe_rescan)
         rescan_timer.start(5000)
-        # Keep a reference so the timer isn't garbage-collected
         window._rescan_timer = rescan_timer
 
         handler.discover_servers()
@@ -896,4 +797,8 @@ def run_monitor(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(run_monitor())
+    # Routed through the launcher so a directly-run window still gets
+    # (and is counted against) the shared localhost server.
+    from bioview_client.launch import main as _launch
+
+    sys.exit(_launch(["--role", "monitor", *sys.argv[1:]]))

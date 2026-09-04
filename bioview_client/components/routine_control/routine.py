@@ -1,15 +1,12 @@
-"""
-Data model + parsing for timed-mode routines declared in the experiment config.
+"""Data model and parsing for timed-mode routines.
 
-A timed mode pairs a fixed run duration with an optional instruction (audio,
-video, or text) that is presented while data is collected. These are pure data
-holders; playback is handled by ``InstructionController``.
+Pure data holders; playback is handled by ``InstructionController``.
+See bioview-docs/reference/configuration.md.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
 
 
 # Supported instruction kinds
@@ -22,19 +19,14 @@ DEFAULT_TEXT_FONT_SIZE = 28
 
 
 def parse_duration(value) -> float:
-    """Convert a duration specification into seconds.
-
-    Accepts a number (interpreted as seconds), a unit-suffixed string such as
-    ``"3m"``, ``"90s"`` or ``"1h"``, or a clock string such as ``"mm:ss"`` /
-    ``"hh:mm:ss"``. Raises ``ValueError`` for anything unparseable.
-    """
+    """Convert a duration into seconds: a number, ``"3m"``, or ``"mm:ss"``."""
     if value is None:
         raise ValueError("Duration is required for a timed mode")
 
     if isinstance(value, bool):  # guard against True/False slipping through
         raise ValueError(f"Invalid duration: {value!r}")
 
-    if isinstance(value, (int, float)):
+    if isinstance(value, int | float):
         return float(value)
 
     text = str(value).strip().lower()
@@ -65,7 +57,7 @@ class InstructionSpec:
     file: str
     loop: bool = False
     font_size: int = DEFAULT_TEXT_FONT_SIZE
-    line_gap: Optional[float] = None  # seconds between lines; None => all at once
+    line_gap: float | None = None  # seconds between lines; None => all at once
 
 
 @dataclass
@@ -75,10 +67,10 @@ class TimedMode:
 
     label: str
     duration: float
-    instruction: Optional[InstructionSpec] = None
+    instruction: InstructionSpec | None = None
 
 
-def _resolve_path(file_path: str, base_dir: Optional[Path]) -> str:
+def _resolve_path(file_path: str, base_dir: Path | None) -> str:
     """Resolve an instruction file path. Absolute paths are used as-is; relative
     paths are resolved against the config file's directory when provided."""
     if not file_path:
@@ -89,7 +81,9 @@ def _resolve_path(file_path: str, base_dir: Optional[Path]) -> str:
     return str((base_dir / path).resolve())
 
 
-def parse_instruction(raw: Optional[dict], base_dir: Optional[Path] = None) -> Optional[InstructionSpec]:
+def parse_instruction(
+    raw: dict | None, base_dir: Path | None = None
+) -> InstructionSpec | None:
     if not raw or not isinstance(raw, dict):
         return None
 
@@ -112,11 +106,11 @@ def parse_instruction(raw: Optional[dict], base_dir: Optional[Path] = None) -> O
     )
 
 
-def parse_timed_modes(raw_modes, base_dir: Optional[Path] = None) -> List[TimedMode]:
+def parse_timed_modes(raw_modes, base_dir: Path | None = None) -> list[TimedMode]:
     """Parse the raw ``timed_modes`` list from the experiment config into a list
     of ``TimedMode`` objects. Malformed entries are skipped (callers should log)."""
-    modes: List[TimedMode] = []
-    if not raw_modes or not isinstance(raw_modes, (list, tuple)):
+    modes: list[TimedMode] = []
+    if not raw_modes or not isinstance(raw_modes, list | tuple):
         return modes
 
     for idx, raw in enumerate(raw_modes):
@@ -126,7 +120,9 @@ def parse_timed_modes(raw_modes, base_dir: Optional[Path] = None) -> List[TimedM
             label = str(raw.get("label") or f"Routine {idx + 1}")
             duration = parse_duration(raw.get("duration"))
             instruction = parse_instruction(raw.get("instruction"), base_dir)
-            modes.append(TimedMode(label=label, duration=duration, instruction=instruction))
+            modes.append(
+                TimedMode(label=label, duration=duration, instruction=instruction)
+            )
         except (ValueError, TypeError):
             # Skip malformed routine; keep the rest usable
             continue

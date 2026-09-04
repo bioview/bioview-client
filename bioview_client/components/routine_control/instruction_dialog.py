@@ -1,7 +1,4 @@
-"""
-Popup window used to present text or video instructions during a timed mode.
-Audio instructions need no window and therefore do not use this dialog.
-"""
+"""Popup for text or video instructions during a timed mode."""
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import QDialog, QLabel, QVBoxLayout
@@ -10,7 +7,9 @@ from .routine import DEFAULT_TEXT_FONT_SIZE, INSTRUCTION_VIDEO
 
 
 class InstructionDialog(QDialog):
-    def __init__(self, mode: str = "text", font_size: int = DEFAULT_TEXT_FONT_SIZE, parent=None):
+    def __init__(
+        self, mode: str = "text", font_size: int = DEFAULT_TEXT_FONT_SIZE, parent=None
+    ):
         super().__init__(parent)
         self.setWindowTitle("Instructions")
         # Keep the instructions visible above the (fullscreen) main window
