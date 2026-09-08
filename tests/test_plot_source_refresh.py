@@ -10,6 +10,7 @@ from bioview_common import DataSource, Response
 
 from bioview_client.components.plot_grid import PlotGrid
 from bioview_client.handler import Client
+from bioview_client.monitor import _normalize_source_name
 
 
 def _src(channel, label, group="BIOPAC"):
@@ -88,11 +89,17 @@ class _Monitor:
     from bioview_client.monitor import BioViewMonitor
 
     populate_plot_grid_sources = BioViewMonitor.populate_plot_grid_sources
+    _apply_default_sources = BioViewMonitor._apply_default_sources
+    add_plot_source = BioViewMonitor.add_plot_source
 
-    def __init__(self, qapp):
+    def __init__(self, qapp, display_sources=()):
         self.plot_grid = PlotGrid(config=None)
         self.settings_panel = _FakeSettingsPanel()
         self.available_sources = []
+        self._default_source_names = {
+            _normalize_source_name(name) for name in display_sources
+        }
+        self._applied_default_sources = set()
 
 
 @pytest.fixture
@@ -176,3 +183,48 @@ def test_removing_a_source_clears_the_title(monitor):
 
     plot = monitor.plot_grid.plots[0][0]
     assert plot.widget.getPlotItem().titleLabel.text == ""
+
+
+# --------------------------------------------------------------------------
+# Monitor: the configuration's display_sources are plotted as they appear
+# --------------------------------------------------------------------------
+
+
+def test_a_configured_source_is_plotted_when_it_is_discovered(qapp):
+    monitor = _Monitor(qapp, display_sources=["BIOPAC Ch1"])
+    ch1, ch2 = _src(0, "Ch1"), _src(1, "Ch2")
+
+    # Nothing to match at startup: the advertised list only exists once the
+    # devices have been initialized.
+    monitor.populate_plot_grid_sources([ch2])
+    assert list(monitor.plot_grid.selected_channels) == []
+
+    monitor.populate_plot_grid_sources([ch2, ch1])
+    assert list(monitor.plot_grid.selected_channels) == [ch1]
+
+
+def test_a_bare_channel_label_names_the_source(qapp):
+    # A config is written before the group ids are known, so "Ch1" has to
+    # match the "BIOPAC: Ch1" the server ends up advertising.
+    monitor = _Monitor(qapp, display_sources=["ch1"])
+    monitor.populate_plot_grid_sources([_src(0, "Ch1")])
+    assert [s.label for s in monitor.plot_grid.selected_channels] == ["Ch1"]
+
+
+def test_a_default_the_user_unticks_stays_unticked(qapp):
+    monitor = _Monitor(qapp, display_sources=["Ch1"])
+    ch1 = _src(0, "Ch1")
+    monitor.populate_plot_grid_sources([ch1])
+    monitor.plot_grid.remove_source(ch1)
+
+    monitor.populate_plot_grid_sources([ch1])
+
+    # The config states the starting view; it is not a rule that keeps
+    # re-checking a box the user has deliberately cleared.
+    assert list(monitor.plot_grid.selected_channels) == []
+
+
+def test_an_unknown_configured_source_is_simply_never_matched(qapp):
+    monitor = _Monitor(qapp, display_sources=["Nonexistent"])
+    monitor.populate_plot_grid_sources([_src(0, "Ch1")])
+    assert list(monitor.plot_grid.selected_channels) == []

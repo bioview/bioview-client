@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import (
 )
 
 
-DEFAULT_MAX_PANEL_HEIGHT = 260
+DEFAULT_MAX_PANEL_HEIGHT = 220
 
 ParamSpec = tuple[str, tuple[float, float], float, float, int]
 
@@ -35,7 +35,9 @@ def wrap_scrollable(
     scroll = QScrollArea()
     scroll.setWidgetResizable(True)
     scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    # As-needed, not always-off: a wide RF tab was clipped at the viewport
+    # edge with no way to reach the controls that fell off it.
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
     scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
     scroll.setWidget(panel)
     scroll.setMaximumHeight(max_height)

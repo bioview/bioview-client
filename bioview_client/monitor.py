@@ -3,6 +3,7 @@
 Runs with or without a configuration file; missing configuration is prompted
 for at startup. See bioview-docs/architecture/client.md.
 """
+
 import argparse
 import contextlib
 import logging  # TODO: Remove
@@ -37,6 +38,7 @@ from bioview_client.components import (
     ConfigurationPrompt,
     InstructionController,
     LogDisplayPanel,
+    LogWindow,
     PlotGrid,
     SettingsPanel,
     StatusBar,
@@ -44,6 +46,28 @@ from bioview_client.components import (
 )
 from bioview_client.components.common import Toast
 from bioview_client.handler import Client
+
+
+def _normalize_source_name(name) -> str:
+    """Fold a source name to a form a config file can be written against.
+
+    Case, the group separator and runs of whitespace all vary between how a
+    source is advertised and how someone types it into a configuration.
+    """
+    return " ".join(str(name).replace(":", " ").split()).casefold()
+
+
+def _source_aliases(source: DataSource) -> set[str]:
+    """The names a ``display_sources`` entry may legitimately use for a source.
+
+    Sources are advertised as "<group>: <label>", but a configuration is
+    written before the groups are known, so the bare channel label names the
+    source just as well.
+    """
+    return {
+        _normalize_source_name(source.get_display_label()),
+        _normalize_source_name(source.label),
+    }
 
 
 def split_configurations(configurations):
@@ -109,6 +133,16 @@ class BioViewMonitor(QMainWindow):
 
         self.saving_status = False
 
+        # Sources the configuration asks to plot as soon as they are
+        # discovered, and the names already honoured. Ticking is a one-shot
+        # per name: the config states the starting view, it does not keep
+        # re-checking a box the user has deliberately cleared.
+        self._default_source_names = {
+            _normalize_source_name(name)
+            for name in (self.experiment_config.get_param("display_sources", []) or [])
+        }
+        self._applied_default_sources = set()
+
         # Routines pair a fixed duration with optional instructions; the
         # free-running "unlimited" mode is always available alongside them.
         self.timed_modes = parse_timed_modes(
@@ -157,40 +191,55 @@ class BioViewMonitor(QMainWindow):
 
         splitter = QSplitter(Qt.Orientation.Vertical)
 
+        # Controls stack vertically: one button-high row of panels, then the
+        # settings tabs across the full width. Settings need width far more
+        # than the action row does, and a full-width tab page keeps its own
+        # height down.
         top_widget = QWidget()
-        top_layout = QHBoxLayout(top_widget)
+        top_layout = QVBoxLayout(top_widget)
         top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(4)
 
-        controls_layout = QVBoxLayout()
+        action_row = QHBoxLayout()
+        action_row.setContentsMargins(0, 0, 0, 0)
+        action_row.setSpacing(4)
 
         self.command_bar = AppControlPanel()
         self.command_bar.set_routines([m.label for m in self.timed_modes])
-        controls_layout.addWidget(self.command_bar, stretch=1)
+        # 40/60 between the action buttons and Mark Events: the buttons are
+        # fixed-width, while the annotation box is a free-text field that gets
+        # used mid-recording and benefits from every pixel it can have.
+        action_row.addWidget(self.command_bar, stretch=2)
 
-        self.settings_panel = SettingsPanel(self.configurations)
-
-        controls_layout.addWidget(self.settings_panel, stretch=3)
-
-        top_layout.addLayout(controls_layout, stretch=3)
-
-        self.meta_panels = QVBoxLayout()
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.DEBUG)
+
+        # The log lives in its own window, opened from the Control panel, so
+        # the monitor's limited width goes to plots and settings instead.
         self.log_display_panel = LogDisplayPanel(logger=self.logger)
-        self.meta_panels.addWidget(self.log_display_panel, stretch=3)
+        self.log_window = LogWindow(self.log_display_panel, parent=self)
+        self.command_bar.show_log.connect(self._toggle_log_window)
+        self.log_display_panel.message_logged.connect(self._note_log_message)
 
         # Annotations live in the recording's .bvr file, so the panel only
         # emits text and the monitor routes it to the client.
         self.annotate_event_panel = AnnotateEventPanel()
-        self.meta_panels.addWidget(self.annotate_event_panel, stretch=2)
-        top_layout.addLayout(self.meta_panels, stretch=2)
+        action_row.addWidget(self.annotate_event_panel, stretch=3)
+
+        # Both panels are pinned to the taller of the two natural heights, so
+        # the row is exactly one control tall and the two group boxes align.
+        action_height = max(
+            self.command_bar.sizeHint().height(),
+            self.annotate_event_panel.sizeHint().height(),
+        )
+        self.command_bar.setFixedHeight(action_height)
+        self.annotate_event_panel.setFixedHeight(action_height)
+        top_layout.addLayout(action_row)
+
+        self.settings_panel = SettingsPanel(self.configurations)
+        top_layout.addWidget(self.settings_panel, stretch=1)
 
         self.plot_grid = PlotGrid(self.experiment_config)
-
-        # Enforce plot heights (50% to 60% of the initial window height)
-        window_height = int(0.8 * height)
-        self.plot_grid.setMinimumHeight(int(0.5 * window_height))
-        self.plot_grid.setMaximumHeight(int(0.6 * window_height))
 
         splitter.addWidget(top_widget)
         splitter.addWidget(self.plot_grid)
@@ -201,8 +250,51 @@ class BioViewMonitor(QMainWindow):
         main_layout.addWidget(splitter)
         central_widget.setLayout(main_layout)
 
+        self._splitter = splitter
+        self._controls_widget = top_widget
+        self._action_height = action_height + top_layout.spacing()
+        self._apply_vertical_budget(int(0.8 * height))
+
         self.status_bar = StatusBar(device_status=self.device_status, parent=self)
         self.setStatusBar(self.status_bar)
+
+    # Vertical budget: 65% of the window to plots, 30% to controls, the
+    # remainder to the status bar. The settings panel used to spend ~36 px of
+    # the controls budget on a tab bar and the padding around it; the panels
+    # sit side by side now, so that height goes to the plots instead.
+    PLOTS_SHARE = 0.65
+    CONTROLS_SHARE = 0.30
+
+    def _apply_vertical_budget(self, window_height: int):
+        """Split the window height between controls and plots.
+
+        Driven off the window's own height rather than the screen's, so the
+        proportions survive a monitor with a different aspect ratio, a restored
+        window size, or a display-scale change.
+        """
+        controls_height = int(self.CONTROLS_SHARE * window_height)
+        plots_height = int(self.PLOTS_SHARE * window_height)
+
+        # The settings strip gets whatever the action row leaves of the
+        # controls budget; the floor keeps at least one row of settings
+        # readable when the window is very short.
+        self.settings_panel.setMaximumHeight(
+            max(120, controls_height - self._action_height)
+        )
+        self._controls_widget.setMaximumHeight(controls_height)
+        self.plot_grid.setMinimumHeight(int(0.45 * window_height))
+        self._splitter.setSizes([controls_height, plots_height])
+
+    def showEvent(self, event):
+        """Re-apply the budget once, against the height the window really got.
+
+        _init_ui can only estimate from the screen; a tiling window manager, a
+        restored geometry or a --geometry flag can all land somewhere else.
+        """
+        super().showEvent(event)
+        if not getattr(self, "_budget_applied", False):
+            self._budget_applied = True
+            self._apply_vertical_budget(self.height())
 
     def _connect_client_signals(self):
         """Connect client signals to UI handlers."""
@@ -292,6 +384,18 @@ class BioViewMonitor(QMainWindow):
             self.settings_panel.run_dpic_balance.connect(
                 self.client_worker.run_dpic_balance
             )
+            # The client answers asynchronously; these put the Balance button
+            # back once the server reports the search has ended. Bound methods,
+            # not lambdas: the finished signal is emitted from the thread pool,
+            # and only a QObject receiver gets the queued connection that keeps
+            # the widget touched on the GUI thread.
+            self.client_worker.dpic_balance_started.connect(self.on_dpic_balance_started)
+            self.client_worker.dpic_balance_finished.connect(
+                self.on_dpic_balance_finished
+            )
+            self.client_worker.dpic_balance_progress.connect(
+                self.on_dpic_balance_progress
+            )
 
         self.settings_panel.log_event.connect(self.log_display_panel.log_message)
         self.plot_grid.log_event.connect(self.log_display_panel.log_message)
@@ -320,6 +424,15 @@ class BioViewMonitor(QMainWindow):
         self.status_bar.discover_devices_requested.connect(
             lambda: self.client_worker.initialize_devices(True)
         )
+
+    def on_dpic_balance_started(self, device_id: str):
+        self.settings_panel.set_balance_running(device_id, True)
+
+    def on_dpic_balance_finished(self, device_id: str, _ok: bool, _message: str):
+        self.settings_panel.set_balance_running(device_id, False)
+
+    def on_dpic_balance_progress(self, device_id: str, progress: dict):
+        self.settings_panel.apply_balance_progress(device_id, progress)
 
     def _handle_streaming_status_changed(self, is_streaming: bool):
         if hasattr(self.settings_panel, "set_streaming_locked"):
@@ -366,6 +479,21 @@ class BioViewMonitor(QMainWindow):
             event.accept()
             return
         super().keyPressEvent(event)
+
+    def _toggle_log_window(self):
+        """Show or hide the log window, clearing the unseen badge when shown."""
+        if self.log_window.toggle():
+            self.command_bar.clear_log_badge()
+
+    def _note_log_message(self, level, msg=None):
+        """Badge the Log button for anything the user would want to see.
+
+        Hiding the log behind a button must not make an error quieter, so a
+        warning or error raised while the window is closed is counted on the
+        button itself.
+        """
+        if not self.log_window.isVisible():
+            self.command_bar.note_log_message(level, msg)
 
     def closeEvent(self, event):
         """Handle application close"""
@@ -415,6 +543,29 @@ class BioViewMonitor(QMainWindow):
         self.settings_panel.set_available_sources(source_objs)
         for src in still_plotted:
             self.settings_panel.update_source("add", src)
+
+        self._apply_default_sources(source_objs)
+
+    def _apply_default_sources(self, sources):
+        """Plot the configured ``display_sources`` as they show up.
+
+        The advertised source list only exists after the devices are
+        initialized, so a configured default cannot be applied at startup; it
+        is applied the first time a matching source is advertised.
+        """
+        if not self._default_source_names:
+            return
+
+        for source in sources:
+            names = _source_aliases(source)
+            wanted = names & self._default_source_names
+            if not wanted or wanted & self._applied_default_sources:
+                continue
+            # Marked before the add, not after: a source that could not be
+            # plotted (a full grid) must not reappear unbidden on the next
+            # refresh.
+            self._applied_default_sources |= wanted
+            self.add_plot_source(source)
 
     def on_data_received(self, data, sources):
         """Route a received data chunk to the plot grid for display."""

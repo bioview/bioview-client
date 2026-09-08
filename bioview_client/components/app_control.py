@@ -15,12 +15,16 @@ class AppControlPanel(QGroupBox):
     stop_streaming = pyqtSignal()
     enable_data_saving = pyqtSignal(bool)
     routine_selected = pyqtSignal(int)
+    show_log = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__("Control", parent)
         self.main_window = parent
         self._has_routines = False
         self._suppress_routine_signal = False
+        # Errors and warnings raised while the log window is closed. Moving the
+        # log off-screen must not make a failure quieter than it was.
+        self._unseen = 0
 
         layout = QHBoxLayout()
 
@@ -56,7 +60,14 @@ class AppControlPanel(QGroupBox):
         layout.addWidget(self.stop_button)
 
         layout.addStretch()
+
+        self.log_button = QPushButton("Log")
+        self.log_button.setToolTip("Open the log window")
+        self.log_button.clicked.connect(self.show_log.emit)
+        layout.addWidget(self.log_button)
+
         self.setLayout(layout)
+        self._refresh_log_button()
 
     def _update_icons(self):
         self.initialize_button.setIcon(
@@ -64,6 +75,25 @@ class AppControlPanel(QGroupBox):
         )
         self.start_button.setIcon(qta.icon("fa6s.play", color=get_qcolor("green")))
         self.stop_button.setIcon(qta.icon("fa6s.stop", color=get_qcolor("red")))
+        self._refresh_log_button()
+
+    def _refresh_log_button(self):
+        """Show the unseen error/warning count on the button itself."""
+        colour = "red" if self._unseen else "blue"
+        self.log_button.setIcon(
+            qta.icon("fa6s.rectangle-list", color=get_qcolor(colour))
+        )
+        self.log_button.setText(f"Log ({self._unseen})" if self._unseen else "Log")
+
+    def note_log_message(self, level, _msg=None):
+        """Count an error/warning raised while the log window is not visible."""
+        if str(level).lower() in ("warning", "warn", "error", "critical"):
+            self._unseen += 1
+            self._refresh_log_button()
+
+    def clear_log_badge(self):
+        self._unseen = 0
+        self._refresh_log_button()
 
     def event(self, event):
         if event.type() == QEvent.Type.ApplicationPaletteChange:

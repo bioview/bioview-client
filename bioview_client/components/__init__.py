@@ -4,7 +4,7 @@ from .app_control import AppControlPanel
 from .common import CheckableComboBox
 from .config_prompt import ConfigurationPrompt
 from .device_info import device_details, device_health_warning, device_is_healthy
-from .log_display import LogDisplayPanel
+from .log_display import LogDisplayPanel, LogWindow
 from .plot_grid import PlotGrid
 from .routine_control import InstructionController, parse_timed_modes
 from .settings_panel import SettingsPanel
@@ -19,6 +19,7 @@ __all__ = [
     "device_health_warning",
     "device_is_healthy",
     "LogDisplayPanel",
+    "LogWindow",
     "PlotGrid",
     "StatusBar",
     "CheckableComboBox",

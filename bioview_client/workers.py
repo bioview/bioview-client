@@ -53,6 +53,8 @@ class FunctionWorker(QRunnable):
 class ScanWorkerSignals(QObject):
     # Emit a server info dict when a BioView server is discovered, or None otherwise
     result = pyqtSignal(object)
+    # Emit (level, text) when a host answered but the exchange then failed.
+    log_message = pyqtSignal(str, str)
 
 
 class ScanWorker(QRunnable):
@@ -63,29 +65,64 @@ class ScanWorker(QRunnable):
         self.timeout = timeout
         self.signals = ScanWorkerSignals()
 
+    def _emit(self, name, *args):
+        """Emit a signal by name unless the window went away mid-scan.
+
+        A scan outlives a closed window often enough to matter, and PyQt then
+        raises RuntimeError -- from the *attribute access*, not just the emit --
+        on a pool thread, where it becomes a bare traceback on a stderr nobody
+        is reading.
+        """
+        with contextlib.suppress(RuntimeError):
+            getattr(self.signals, name).emit(*args)
+
     def run(self):
-        # Probe the control port on the target IP and emit a server info dict or None
+        """Probe one IP; emit its server info dict, or None.
+
+        Nothing listening is the expected case while sweeping a subnet and is
+        silent. A host that *answers* and then fails is a real fault -- a
+        protocol mismatch, a truncated frame, a version skew -- and used to be
+        indistinguishable from an empty address because one suppress() covered
+        the connect and the exchange alike.
+        """
         server_info = None
         s = None
-
-        with contextlib.suppress(Exception):
+        try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(self.timeout)
             s.connect((self.ip, self.control_port))
+        except OSError:
+            # No listener, refused, or unreachable: normal during a scan.
+            if s is not None:
+                with contextlib.suppress(OSError):
+                    s.close()
+            self._emit("result", None)
+            return
 
-            # Request discovery and wait for a valid response
+        try:
             response = send_command(sock=s, command=Command.DISCOVER_SERVERS)
-
             resp_type, resp_payload = parse_and_validate_response(response)
             if resp_type == Response.SUCCESS.name:
                 server_info = resp_payload
-
-        # Close the socket only if it was successfully created
-        if s is not None:
-            with contextlib.suppress(Exception):
+            else:
+                self._emit(
+                    "log_message",
+                    "warning",
+                    f"{self.ip}:{self.control_port} answered discovery with "
+                    f"{resp_type}, not SUCCESS",
+                )
+        except Exception as e:
+            self._emit(
+                "log_message",
+                "warning",
+                f"{self.ip}:{self.control_port} accepted a connection but the "
+                f"discovery exchange failed: {e}",
+            )
+        finally:
+            with contextlib.suppress(OSError):
                 s.close()
 
-        self.signals.result.emit(server_info)
+        self._emit("result", server_info)
 
 
 class DeviceInitSignals(QObject):
@@ -123,9 +160,12 @@ class DeviceInitWorker(QRunnable):
         last_status = None
 
         while time.monotonic() < deadline:
-            self.client_ref.control_socket.settimeout(DEVICE_OP_COMMAND_TIMEOUT)
+            # Through the per-command override, which restores the previous
+            # value: setting it on the socket left every later command on the
+            # 30 s device-operation timeout for the rest of the session.
             response = self.client_ref._send_command_locked(
                 command=Command.GET_DEVICE_STATUS,
+                timeout=DEVICE_OP_COMMAND_TIMEOUT,
             )
             if not response:
                 time.sleep(DEVICE_OP_POLL_INTERVAL)

@@ -1,9 +1,15 @@
 """The log panel, shared by the Monitor and the Configurator."""
+
 import html
 import logging
 
-from PyQt6.QtCore import QObject, pyqtSignal
-from PyQt6.QtWidgets import QGroupBox, QTextEdit, QVBoxLayout
+from PyQt6.QtCore import QObject, Qt, pyqtSignal
+from PyQt6.QtWidgets import (
+    QDialog,
+    QGroupBox,
+    QTextEdit,
+    QVBoxLayout,
+)
 
 
 #: Level colours, applied to the level tag rather than the whole line so the
@@ -23,6 +29,8 @@ class QTextEditLogger(QObject, logging.Handler):
     """A logging handler that appends to a text box on the UI thread."""
 
     update_log = pyqtSignal(str)
+    #: Level name of every record handled, for callers that badge unseen ones.
+    record_logged = pyqtSignal(str)
 
     def __init__(self, text_box):
         super().__init__()
@@ -32,6 +40,7 @@ class QTextEditLogger(QObject, logging.Handler):
 
     def emit(self, record):
         self.update_log.emit(self.format(record))
+        self.record_logged.emit(record.levelname.lower())
 
     def append_text(self, text):
         self.text_box.append(text)
@@ -61,6 +70,10 @@ class HtmlLogFormatter(logging.Formatter):
 class LogDisplayPanel(QGroupBox):
     """A log view backed by ``logging``, so handlers and levels work normally."""
 
+    #: Level name of each record shown. Emitted for every route into the panel,
+    #: because it is hooked to the handler rather than to ``log_message``.
+    message_logged = pyqtSignal(str)
+
     def __init__(self, logger=None, parent=None, title="Log", max_height=None):
         super().__init__(title, parent)
 
@@ -82,6 +95,7 @@ class LogDisplayPanel(QGroupBox):
 
         self.log_handler = QTextEditLogger(self.log_text_box)
         self.log_handler.setFormatter(HtmlLogFormatter())
+        self.log_handler.record_logged.connect(self.message_logged)
         self.logger.addHandler(self.log_handler)
 
     def log_message(self, level, msg):
@@ -100,3 +114,34 @@ class LogDisplayPanel(QGroupBox):
 
     def clear(self):
         self.log_text_box.clear()
+
+
+class LogWindow(QDialog):
+    """A resizable window hosting a ``LogDisplayPanel``.
+
+    Deliberately modeless: the log is most useful *while* a run is in progress,
+    and an application-modal dialog would freeze the Monitor mid-stream.
+    Closing hides it rather than destroying it, so the panel keeps collecting
+    records and the scrollback survives being reopened.
+    """
+
+    def __init__(self, panel, parent=None, title="Log"):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setWindowFlag(Qt.WindowType.Window)
+        self.setModal(False)
+        self.resize(820, 460)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        self.panel = panel
+        layout.addWidget(panel)
+
+    def toggle(self):
+        if self.isVisible():
+            self.hide()
+            return False
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        return True

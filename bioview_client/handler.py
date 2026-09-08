@@ -14,6 +14,8 @@ from bioview_common import (
     CONTROL_PORT,
     DATA_PORT,
     DEVICE_OP_COMMAND_TIMEOUT,
+    DPIC_BALANCE_POLL_INTERVAL,
+    DPIC_BALANCE_TIMEOUT,
     RESPONSE_TIMEOUT,
     STREAMING_COMMAND_TIMEOUT,
     AuthenticationError,
@@ -122,6 +124,15 @@ class Client(QThread):
     streaming_started = pyqtSignal(bool)
     streaming_stopped = pyqtSignal(bool)
 
+    # DPIC balance: (device_id) when the server accepts the start, then
+    # (device_id, ok, message) when it reports the outcome. The UI uses the
+    # pair to keep the Balance button disabled for the run's duration.
+    dpic_balance_started = pyqtSignal(str)
+    dpic_balance_finished = pyqtSignal(str, bool, str)
+    # (device_id, progress): the balancer's live phase/amplitude/gain, once per
+    # poll, so the settings panel shows the search moving instead of freezing.
+    dpic_balance_progress = pyqtSignal(str, dict)
+
     # General info signals
     log_message = pyqtSignal(str, str)
 
@@ -194,6 +205,11 @@ class Client(QThread):
         # One streaming start at a time; see start_streaming().
         self._start_streaming_lock = threading.Lock()
         self._start_streaming_pending = False
+
+        # One balance at a time, and never on the GUI thread; see
+        # run_dpic_balance().
+        self._dpic_balance_lock = threading.Lock()
+        self._dpic_balance_running = False
 
         # Serializes send/recv against close across threads
         self._control_lock = threading.Lock()
@@ -413,6 +429,7 @@ class Client(QThread):
                 break
             worker = ScanWorker(target_ip, self.control_port)
             worker.signals.result.connect(handle_result)
+            worker.signals.log_message.connect(self.log_message)
             self.scan_pool.start(worker)
 
     def _add_discovered_server(self, found):
@@ -474,6 +491,7 @@ class Client(QThread):
             return
         worker = ScanWorker("127.0.0.1", self.control_port, timeout=0.5)
         worker.signals.result.connect(self._on_localhost_probe)
+        worker.signals.log_message.connect(self.log_message)
         self.scan_pool.start(worker)
 
     def _on_localhost_probe(self, found):
@@ -1056,25 +1074,115 @@ class Client(QThread):
             return False
 
     def run_dpic_balance(self, device_id: str):
+        """Start a balance on the thread pool and follow it by polling.
+
+        This is called straight from the Balance button's signal, which lands
+        on the GUI thread: the balance drives hardware for a minute or more, so
+        doing the round trip here froze the whole window -- and, because the
+        control socket was left on the short device-operation timeout, the read
+        gave up long before the server answered and left the next reply to be
+        read as the answer to a later command.
+        """
         if self._discovering_devices:
-            self.log_message.emit(
-                "warning",
+            self._report_dpic_refusal(
+                device_id,
                 "Cannot run DPIC balance while device discovery is in progress",
             )
             return False
 
+        with self._dpic_balance_lock:
+            already_running = self._dpic_balance_running
+            self._dpic_balance_running = True
+        if already_running:
+            # The flag is left set: the run that owns it is still going and
+            # will clear it. The button stays disabled for the same reason --
+            # re-enabling it here would only invite another refusal.
+            self.log_message.emit("warning", "A DPIC balance is already running")
+            self.dpic_balance_started.emit(device_id)
+            return False
+
         self.log_message.emit("info", f"Running DPIC balance for {device_id}")
+        self.dpic_balance_started.emit(device_id)
+
+        worker = FunctionWorker(self._run_dpic_balance_blocking, device_id)
+        worker.signals.finished.connect(
+            lambda result, dev=device_id: self._on_dpic_balance_done(
+                dev, bool(result[0]), result[1]
+            )
+        )
+        worker.signals.error.connect(
+            lambda message, dev=device_id: self._on_dpic_balance_done(
+                dev, False, message
+            )
+        )
+        self.thread_pool.start(worker)
+        return True
+
+    def _report_dpic_refusal(self, device_id: str, message: str):
+        """Turn a request that never started into a finished one.
+
+        The Balance button disables itself on click, so a silent return would
+        leave it stuck; the running flag is untouched, since a refusal by
+        definition did not claim it.
+        """
+        self.log_message.emit("warning", message)
+        self.dpic_balance_finished.emit(device_id, False, message)
+
+    def _on_dpic_balance_done(self, device_id: str, ok: bool, message: str):
+        with self._dpic_balance_lock:
+            self._dpic_balance_running = False
+        self.log_message.emit("info" if ok else "error", message)
+        self.dpic_balance_finished.emit(device_id, ok, message)
+
+    def _run_dpic_balance_blocking(self, device_id: str):
+        """Ask the server to start a balance, then poll until it reports one.
+
+        The command itself only acknowledges the start, so it uses the ordinary
+        device-operation timeout; the long wait is the poll loop below, which
+        leaves the control socket free for Stop and for parameter changes
+        between polls.
+        """
         response = self._send_command_locked(
             command=Command.RUN_DPIC_BALANCE,
             params={"id": device_id},
+            timeout=DEVICE_OP_COMMAND_TIMEOUT,
         )
         resp_type, resp_payload = parse_and_validate_response(response)
-        if resp_type == Response.SUCCESS.name:
-            self.log_message.emit("info", "DPIC balance completed")
-            return True
-        msg = resp_payload.get("message", "DPIC balance failed")
-        self.log_message.emit("error", msg)
-        return False
+        if resp_type != Response.SUCCESS.name:
+            message = (resp_payload or {}).get("message") or "DPIC balance failed"
+            return False, message
+
+        deadline = time.monotonic() + DPIC_BALANCE_TIMEOUT
+        while time.monotonic() < deadline:
+            time.sleep(DPIC_BALANCE_POLL_INTERVAL)
+            status = self._send_command_locked(
+                command=Command.GET_DEVICE_STATUS,
+                timeout=DEVICE_OP_COMMAND_TIMEOUT,
+            )
+            status_type, status_payload = parse_and_validate_response(status)
+            if status_type != Response.SUCCESS.name:
+                continue
+            state = (status_payload or {}).get("dpic_balance") or {}
+            # A server that does not report balance state at all cannot be
+            # polled; treat the acknowledged start as all the answer there is.
+            if not state:
+                return True, "DPIC balance started"
+
+            progress = state.get("progress")
+            if isinstance(progress, dict) and progress:
+                self.dpic_balance_progress.emit(device_id, progress)
+
+            if state.get("pending"):
+                continue
+            ok = bool(state.get("ok"))
+            return ok, state.get("message") or (
+                "DPIC balance complete" if ok else "DPIC balance failed"
+            )
+
+        return False, (
+            f"DPIC balance on {device_id} did not finish within "
+            f"{DPIC_BALANCE_TIMEOUT:.0f}s"
+        )
 
     # Client function for PyQt loops
     def start_client(self):

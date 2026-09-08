@@ -77,11 +77,11 @@ def test_annotation_panel_emits_signal(qapp):
     panel.annotation_requested.connect(received.append)
 
     # Empty text does not emit.
-    panel.annotation_box.setPlainText("   ")
+    panel.annotation_box.setText("   ")
     panel.record_annotation()
     assert received == []
 
     # Non-empty text emits the trimmed annotation.
-    panel.annotation_box.setPlainText("  marked event  ")
+    panel.annotation_box.setText("  marked event  ")
     panel.record_annotation()
     assert received == ["marked event"]

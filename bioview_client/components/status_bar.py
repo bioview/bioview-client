@@ -6,11 +6,14 @@ from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPen
 from PyQt6.QtWidgets import (
     QComboBox,
+    QDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QProgressBar,
     QPushButton,
     QStatusBar,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -95,7 +98,12 @@ class ServerConnector(QWidget):
         self.scan_progress_bar.setRange(0, 100)
         self.scan_progress_bar.setValue(0)
         self.scan_progress_bar.setVisible(False)
+        self.scan_progress_bar.setFixedWidth(160)
         control_layout.addWidget(self.scan_progress_bar)
+
+        # The controls are a fixed-size row, not a stretch bar: given the full
+        # width of the flyout they would otherwise smear across it.
+        control_layout.addStretch()
 
         self.connection_label = QLabel("Status: Disconnected")
         self.connection_label.setContentsMargins(6, 0, 6, 0)
@@ -369,8 +377,107 @@ class RoutineProgressBar(QWidget):
         self.setVisible(False)
 
 
+class ServerConnectionFlyout(QDialog):
+    """Bottom sheet holding the server picker.
+
+    The status bar carries a single fact -- whether the server is there -- and
+    everything needed to change that lives in here, one click away. Modal,
+    because half-finished connection changes are exactly what a permanently
+    visible picker invited; it spans the window and sits against its bottom
+    edge, so it rises out of the status line that opened it.
+    """
+
+    #: Gap left between the sheet and the window edges it is anchored to.
+    MARGIN = 12
+
+    def __init__(self, connector: "ServerConnector", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Server Connection")
+        self.setModal(True)
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+
+        # Frameless: the sheet has to draw its own edge, or it reads as widgets
+        # floating loose over the plots.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        self.sheet = QFrame()
+        self.sheet.setObjectName("serverSheet")
+        self.sheet.setFrameShape(QFrame.Shape.StyledPanel)
+        outer.addWidget(self.sheet)
+
+        layout = QVBoxLayout(self.sheet)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
+
+        header = QHBoxLayout()
+        self.title_label = QLabel("Server Connection")
+        self.title_label.setStyleSheet("font-weight: 600;")
+        header.addWidget(self.title_label)
+        header.addStretch()
+
+        # Frameless, so the sheet has to carry its own way out.
+        self.close_button = QPushButton()
+        self.close_button.setIcon(qta.icon("fa6s.xmark", color=get_qcolor("red")))
+        self.close_button.setToolTip("Close")
+        self.close_button.setFlat(True)
+        # Off the focus chain, so opening the sheet does not land the caret on
+        # the one control that throws the sheet away.
+        self.close_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.close_button.clicked.connect(self.reject)
+        header.addWidget(self.close_button)
+        layout.addLayout(header)
+
+        divider = QFrame()
+        divider.setFrameShape(QFrame.Shape.HLine)
+        divider.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(divider)
+
+        # The status bar's own connector, not a copy of it: it holds the scan
+        # state, the discovered servers and every signal the monitor is
+        # already wired to.
+        self.connector = connector
+        layout.addWidget(connector)
+
+    def _update_icons(self):
+        self.close_button.setIcon(qta.icon("fa6s.xmark", color=get_qcolor("red")))
+
+    def event(self, event):
+        if event.type() == QEvent.Type.ApplicationPaletteChange:
+            self._update_icons()
+        return super().event(event)
+
+    def reanchor(self):
+        """Sit flush against the bottom edge of the window that owns the bar."""
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        window = parent.window()
+        self.setFixedWidth(max(360, window.width() - 2 * self.MARGIN))
+        self.adjustSize()
+
+        bottom_left = window.mapToGlobal(window.rect().bottomLeft())
+        self.move(
+            bottom_left.x() + self.MARGIN,
+            bottom_left.y() - self.height() - self.MARGIN,
+        )
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # After the show, so the sheet is measured at the size it will render
+        # at rather than at its pre-layout hint.
+        self.reanchor()
+
+
 class StatusBar(QStatusBar):
     network_scan_requested = pyqtSignal()
+
+    #: The one server fact the bar itself carries, per ClientStatus.
+    SERVER_TEXT = {
+        ClientStatus.SERVER_CONNECTED: "BioView Server Connected",
+        ClientStatus.SCANNING: "Searching for BioView Servers…",
+    }
+    SERVER_TEXT_DEFAULT = "BioView Server Disconnected"
 
     def __init__(self, device_status: dict = None, parent=...):
         super().__init__(parent)
@@ -380,10 +487,30 @@ class StatusBar(QStatusBar):
         self._layout = QHBoxLayout(self.container)
         self._layout.setContentsMargins(0, 0, 0, 0)
 
-        self.server_connector = ServerConnector()
+        # A scan button, a server dropdown and three more buttons used to live
+        # here permanently, for a decision that is made once a session. The bar
+        # now states the outcome and hands the controls to a flyout.
+        self.server_indicator = StatusIndicator(DeviceStatus.UNAVAILABLE)
         self._layout.addWidget(
-            self.server_connector, alignment=Qt.AlignmentFlag.AlignLeft
+            self.server_indicator, alignment=Qt.AlignmentFlag.AlignLeft
         )
+
+        self.server_status_label = QLabel(self.SERVER_TEXT_DEFAULT)
+        self.server_status_label.setContentsMargins(6, 0, 6, 0)
+        self._layout.addWidget(
+            self.server_status_label, alignment=Qt.AlignmentFlag.AlignLeft
+        )
+
+        self.server_connector = ServerConnector()
+        self.server_flyout = ServerConnectionFlyout(self.server_connector, parent=self)
+
+        self.more_button = QPushButton(" More…")
+        self.more_button.setToolTip("Choose and connect to a BioView server")
+        self.more_button.setFlat(True)
+        self.more_button.clicked.connect(self.open_server_flyout)
+        self._layout.addWidget(self.more_button, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        self._update_icons()
         self._layout.addStretch()
 
         # Timed-mode progress indicator (centered, hidden until a routine runs)
@@ -438,8 +565,39 @@ class StatusBar(QStatusBar):
         # Expose device update helper from the panel
         self.update_device_status = self.device_status_panel.update_device_status
 
+    def open_server_flyout(self):
+        """Raise the bottom sheet holding the server picker."""
+        self.server_flyout.reanchor()
+        self.server_flyout.show()
+        self.server_flyout.raise_()
+        self.server_flyout.activateWindow()
+
+    def _update_icons(self):
+        self.more_button.setIcon(qta.icon("fa6s.circle-info", color=get_qcolor("blue")))
+
+    def event(self, event):
+        if event.type() == QEvent.Type.ApplicationPaletteChange:
+            self._update_icons()
+        return super().event(event)
+
+    def _set_summary(self, status: ClientStatus):
+        """Update the one-line server summary the bar shows."""
+        self.server_status_label.setText(
+            self.SERVER_TEXT.get(status, self.SERVER_TEXT_DEFAULT)
+        )
+        if status == ClientStatus.SERVER_CONNECTED:
+            colour, indicator = "green", DeviceStatus.CONNECTED
+        elif status == ClientStatus.SCANNING:
+            colour, indicator = "yellow", DeviceStatus.CONNECTING
+        else:
+            colour, indicator = "red", DeviceStatus.UNAVAILABLE
+        self.server_status_label.setStyleSheet(f"color: {get_qcolor(colour).name()}")
+        self.server_indicator.update_status(indicator)
+
     def set_server_status(self, status: ClientStatus):
         """Centralize server-related UI updates based on ClientStatus."""
+        self._set_summary(status)
+
         with contextlib.suppress(Exception):
             if status == ClientStatus.SERVER_CONNECTED:
                 self.server_connector.connection_label.setText("Status: Connected")

@@ -1,10 +1,15 @@
+import contextlib
+
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QLabel,
     QPushButton,
     QSpinBox,
     QVBoxLayout,
@@ -15,6 +20,9 @@ from .usrp_channel_map_panel import USRPChannelMapPanel
 
 
 class DeviceSettingsPanel(QGroupBox):
+    #: Parameter display metadata, filled in by the panels that show a grid.
+    PARAM_MAPPINGS: dict = {}
+
     update_device_param = pyqtSignal(str, object)
     device_param_changed = pyqtSignal(str, str, object)
     log_event = pyqtSignal(str, str)
@@ -29,6 +37,34 @@ class DeviceSettingsPanel(QGroupBox):
 
     def get_emittable_signals(self):
         return {"update_device_param": self.update_device_param}
+
+    def set_live_param(self, param, idx, value):
+        """Reflect a value the *server* changed, without echoing it back.
+
+        Signals are blocked around the write: letting the spin box emit would
+        send an UPDATE_RUNNING_PARAMETER back to the server for a value the
+        server itself just set, which during a balance means the UI fighting
+        the search point by point. The configuration is updated alongside, so
+        a later manual edit starts from what the hardware actually has.
+        """
+        widgets = self.param_inputs.get(param) or []
+        if not isinstance(widgets, list) or idx is None or not 0 <= idx < len(widgets):
+            return
+        multiplier = self.PARAM_MAPPINGS.get(param, (None, None, 1))[2]
+        widget = widgets[idx]
+        display = float(value) / multiplier if multiplier != 1 else float(value)
+
+        was_blocked = widget.blockSignals(True)
+        try:
+            widget.setValue(
+                int(round(display)) if isinstance(widget, QSpinBox) else display
+            )
+        finally:
+            widget.blockSignals(was_blocked)
+
+        # A value the config cannot hold must not break the display of it.
+        with contextlib.suppress(Exception):
+            hardware_aware_update_param(self.device_configuration, param, value, idx)
 
     def update_param(self, param, value, idx=None):
         try:
@@ -46,27 +82,29 @@ class DeviceSettingsPanel(QGroupBox):
             self.log_event.emit("error", f"{self.device_name}: Updating {param} failed")
 
 
-class USRPSettingsPanel(DeviceSettingsPanel):
+class RFSettingsPanel(DeviceSettingsPanel):
+    """Shared RF device tab: parameter grid, calibration row, channel map.
+
+    The USRP panel and the dummy backend's RF panel differ only in which
+    parameters they expose, so the layout and every calibration/channel-map
+    handler live here -- they were duplicated line for line and drifted apart.
+    """
+
     run_dpic_balance = pyqtSignal(str)
 
-    def __init__(self, device_configuration, parent=None):
-        super().__init__(device_configuration, parent)
-        self._streaming_locked = False
-        self.init_ui()
+    PARAM_INPUT_WIDTH = 85
 
-    def init_ui(self):
-        outer = QVBoxLayout()
+    def _build_rf_ui(self, param_mappings):
+        # Side by side, not stacked: the settings tabs span the full window
+        # width but are only a few rows tall, so a stacked channel map would sit
+        # below the fold and the DPIC loops would need scrolling to find.
+        outer = QHBoxLayout(self)
+        outer.setSpacing(12)
+
+        left = QVBoxLayout()
+        left.setSpacing(4)
         grid = QGridLayout()
-
-        param_mappings = {
-            "tx_gain": ("TX Gain (dB)", (0, 70), 1, 1, 0),
-            "rx_gain": ("RX Gain (dB)", (0, 70), 1, 1, 0),
-            "tx_amplitude": ("IF Amplitude", (0, 1), 1, 0.1, 2),
-            "tx_phase": ("IF Phase (deg)", (-180, 180), 1, 1, 1),
-            "if_freq": ("IF Frequency (kHz)", (20, 400), 1e3, 0.1, 2),
-            "samp_rate": ("Sample Rate (MSps)", (0.1, 10), 1e6, 0.1, 2),
-            "carrier_freq": ("Carrier Freq. (MHz)", (30, 6000), 1e6, 1, 1),
-        }
+        grid.setSpacing(4)
 
         self.param_inputs, row = add_param_rows(
             grid,
@@ -74,9 +112,39 @@ class USRPSettingsPanel(DeviceSettingsPanel):
             param_mappings,
             self.update_param,
         )
+        for widgets in self.param_inputs.values():
+            for widget in widgets:
+                widget.setMaximumWidth(self.PARAM_INPUT_WIDTH)
 
+        left.addLayout(grid)
+        left.addStretch(1)
+        outer.addLayout(left)
+
+        divider = QFrame()
+        divider.setFrameShape(QFrame.Shape.VLine)
+        divider.setFrameShadow(QFrame.Shadow.Sunken)
+        outer.addWidget(divider)
+
+        # Balance and the calibration overlay sit above the channel map rather
+        # than under the parameter grid: they act on the DPIC loops shown here,
+        # and a USRP's seven parameter rows would push them off the tab.
+        right = QVBoxLayout()
+        right.setSpacing(4)
+        right.addLayout(self._calibration_row())
+
+        self.channel_map_panel = USRPChannelMapPanel(self.device_configuration)
+        self.channel_map_panel.channel_map_changed.connect(self._on_channel_map_changed)
+        right.addWidget(self.channel_map_panel)
+        right.addStretch(1)
+        outer.addLayout(right, 1)
+
+    def _calibration_row(self):
         ctrl_row = QHBoxLayout()
+        ctrl_row.setSpacing(4)
         self.balance_button = QPushButton("Balance")
+        self.balance_button.setToolTip(
+            "Run the DPIC balance search for this device's cancellation loops"
+        )
         self.balance_button.clicked.connect(self._on_balance_clicked)
         ctrl_row.addWidget(self.balance_button)
 
@@ -88,33 +156,86 @@ class USRPSettingsPanel(DeviceSettingsPanel):
 
         self.cal_shape_combo = QComboBox()
         self.cal_shape_combo.addItems(["triangle", "sawtooth", "rectangle"])
-        shape = cal_cfg.get("shape", "triangle")
-        shape_idx = self.cal_shape_combo.findText(shape)
+        shape_idx = self.cal_shape_combo.findText(cal_cfg.get("shape", "triangle"))
         if shape_idx >= 0:
             self.cal_shape_combo.setCurrentIndex(shape_idx)
         self.cal_shape_combo.currentTextChanged.connect(self._on_cal_shape_changed)
         ctrl_row.addWidget(self.cal_shape_combo)
-        ctrl_row.addStretch()
-        grid.addLayout(ctrl_row, row, 0, 1, 4)
 
-        outer.addLayout(grid)
-        self.channel_map_panel = USRPChannelMapPanel(self.device_configuration)
-        self.channel_map_panel.channel_map_changed.connect(self._on_channel_map_changed)
-        outer.addWidget(self.channel_map_panel)
-        self.setLayout(outer)
+        # Pilot amplitude as a fraction of the Tx carrier, adjustable live: the
+        # right level depends on the coupling in the rig, not on the config.
+        ctrl_row.addWidget(QLabel("Cal amp:"))
+        self.cal_depth_spin = QDoubleSpinBox()
+        self.cal_depth_spin.setRange(0.0, 1.0)
+        self.cal_depth_spin.setSingleStep(0.01)
+        self.cal_depth_spin.setDecimals(3)
+        self.cal_depth_spin.setMaximumWidth(self.PARAM_INPUT_WIDTH)
+        self.cal_depth_spin.setToolTip(
+            "Calibration pilot amplitude relative to the Tx signal.\n"
+            "1.0 is 100% modulation; 0 disables the overlay."
+        )
+        self.cal_depth_spin.setValue(float(cal_cfg.get("modulation_depth", 0.2)))
+        self.cal_depth_spin.valueChanged.connect(self._on_cal_depth_changed)
+        ctrl_row.addWidget(self.cal_depth_spin)
+        ctrl_row.addStretch()
+        return ctrl_row
+
+    #: Fields a balance progress report maps onto, as
+    #: report key -> (parameter, the report key naming the channel index).
+    BALANCE_LIVE_FIELDS = {
+        "phase_deg": ("tx_phase", "inject_tx"),
+        "amplitude": ("tx_amplitude", "inject_tx"),
+        "tx_gain_db": ("tx_gain", "measure_tx"),
+        "rx_gain_db": ("rx_gain", "measure_rx"),
+    }
+
+    def apply_balance_progress(self, progress: dict):
+        """Show what the running balance is doing to this device.
+
+        The search drives phase, amplitude and both analog gains for a minute
+        or more. Without this the panel sits on the values from before the
+        balance started, so there is no way to tell a search that is working
+        from one that is doing nothing at all.
+        """
+        for key, (param, index_key) in self.BALANCE_LIVE_FIELDS.items():
+            value = progress.get(key)
+            index = progress.get(index_key)
+            if value is None or index is None:
+                continue
+            self.set_live_param(param, int(index), float(value))
+
+        stage = progress.get("stage")
+        point, planned = progress.get("point"), progress.get("planned")
+        if stage and point and planned:
+            self.balance_button.setText(f"{stage} {point}/{planned}")
+        elif stage:
+            self.balance_button.setText(str(stage))
 
     def _on_balance_clicked(self):
+        # Disabled optimistically: the client answers asynchronously now, so
+        # without this the button stays live and a second click queues a
+        # balance the server will reject.
+        self.set_balance_running(True)
         self.run_dpic_balance.emit(self.cfg_id or self.device_name)
 
-    def _on_calibration_toggled(self, checked):
+    def set_balance_running(self, running: bool):
+        """Reflect a balance in flight; the search takes a minute or more."""
+        self.balance_button.setEnabled(not running)
+        self.balance_button.setText("Balancing..." if running else "Balance")
+
+    def _update_calibration(self, key, value):
         cal = dict(self.device_configuration.get_param("calibration") or {})
-        cal["enabled"] = checked
+        cal[key] = value
         self.update_param("calibration", cal)
 
+    def _on_calibration_toggled(self, checked):
+        self._update_calibration("enabled", checked)
+
     def _on_cal_shape_changed(self, shape):
-        cal = dict(self.device_configuration.get_param("calibration") or {})
-        cal["shape"] = shape
-        self.update_param("calibration", cal)
+        self._update_calibration("shape", shape)
+
+    def _on_cal_depth_changed(self, depth):
+        self._update_calibration("modulation_depth", float(depth))
 
     def _on_channel_map_changed(self, channel_map):
         self.update_param("channel_map", channel_map)
@@ -132,6 +253,26 @@ class USRPSettingsPanel(DeviceSettingsPanel):
         }
 
 
+class USRPSettingsPanel(RFSettingsPanel):
+    PARAM_MAPPINGS = {
+        "tx_gain": ("TX Gain (dB)", (0, 70), 1, 1, 0),
+        "rx_gain": ("RX Gain (dB)", (0, 70), 1, 1, 0),
+        "tx_amplitude": ("IF Amplitude", (0, 1), 1, 0.1, 2),
+        "tx_phase": ("IF Phase (deg)", (-180, 180), 1, 1, 1),
+        "if_freq": ("IF Frequency (kHz)", (20, 400), 1e3, 0.1, 2),
+        "samp_rate": ("Sample Rate (MSps)", (0.1, 10), 1e6, 0.1, 2),
+        "carrier_freq": ("Carrier Freq. (MHz)", (30, 6000), 1e6, 1, 1),
+    }
+
+    def __init__(self, device_configuration, parent=None):
+        super().__init__(device_configuration, parent)
+        self._streaming_locked = False
+        self.init_ui()
+
+    def init_ui(self):
+        self._build_rf_ui(self.PARAM_MAPPINGS)
+
+
 class BIOPACSettingsPanel(DeviceSettingsPanel):
     def __init__(self, device_configuration, parent=None):
         super().__init__(device_configuration, parent)
@@ -139,8 +280,6 @@ class BIOPACSettingsPanel(DeviceSettingsPanel):
         self.init_ui()
 
     def init_ui(self):
-        from PyQt6.QtWidgets import QDoubleSpinBox, QLabel
-
         layout = QGridLayout()
         self.param_inputs = {}
         param_specs = [
@@ -203,8 +342,29 @@ class BIOPACSettingsPanel(DeviceSettingsPanel):
             cb.setEnabled(not locked)
 
 
-class DummySettingsPanel(DeviceSettingsPanel):
-    run_dpic_balance = pyqtSignal(str)
+class DummySettingsPanel(RFSettingsPanel):
+    """Dummy backend: a plain signal generator, or the RF simulator.
+
+    ``hardware`` in the config is what distinguishes them -- with it the dummy
+    stands in for a USRP group and gets the same RF tab.
+    """
+
+    PARAM_MAPPINGS = {
+        "tx_gain": ("TX Gain (dB)", (0, 70), 1, 1, 0),
+        "tx_amplitude": ("IF Amplitude", (0, 1), 1, 0.1, 2),
+        "tx_phase": ("IF Phase (deg)", (-180, 180), 1, 1, 1),
+        "if_freq": ("IF Frequency (kHz)", (20, 400), 1e3, 0.1, 2),
+        "samp_rate": ("Sample Rate (MSps)", (0.1, 10), 1e6, 0.1, 2),
+    }
+
+    LEGACY_PARAM_SPECS = [
+        ("samp_rate", "Sample Rate (Hz)", (1, 1000000), 100, 0),
+        ("num_channels", "Channels", (1, 64), 1, 0),
+        ("signal_freq", "Signal Freq. (Hz)", (0.01, 10000.0), 0.1, 2),
+        ("amplitude", "Amplitude", (0.0, 1000.0), 0.1, 2),
+        ("noise_std", "Noise Std-Dev", (0.0, 100.0), 0.1, 2),
+        ("chunk_duration", "Chunk Duration (s)", (0.001, 1.0), 0.01, 3),
+    ]
 
     def __init__(self, device_configuration, parent=None):
         super().__init__(device_configuration, parent)
@@ -214,30 +374,20 @@ class DummySettingsPanel(DeviceSettingsPanel):
 
     def init_ui(self):
         if self._rf_mode:
-            self._init_rf_ui()
+            self._build_rf_ui(self.PARAM_MAPPINGS)
         else:
             self._init_legacy_ui()
 
     def _init_legacy_ui(self):
-        from PyQt6.QtWidgets import QDoubleSpinBox, QLabel
-
         layout = QGridLayout()
         self.param_inputs = {}
-        param_specs = [
-            ("samp_rate", "Sample Rate (Hz)", (1, 1000000), 100, 0),
-            ("num_channels", "Channels", (1, 64), 1, 0),
-            ("signal_freq", "Signal Freq. (Hz)", (0.01, 10000.0), 0.1, 2),
-            ("amplitude", "Amplitude", (0.0, 1000.0), 0.1, 2),
-            ("noise_std", "Noise Std-Dev", (0.0, 100.0), 0.1, 2),
-            ("chunk_duration", "Chunk Duration (s)", (0.001, 1.0), 0.01, 3),
-        ]
         for row, (
             param_name,
             label_text,
             (min_val, max_val),
             step,
             decimals,
-        ) in enumerate(param_specs):
+        ) in enumerate(self.LEGACY_PARAM_SPECS):
             layout.addWidget(QLabel(label_text), row, 0)
             value = self.device_configuration.get_param(param_name)
             if decimals == 0:
@@ -255,86 +405,22 @@ class DummySettingsPanel(DeviceSettingsPanel):
                 widget.setValue(
                     float(value) if isinstance(value, int | float) else float(min_val)
                 )
+            widget.setMaximumWidth(self.PARAM_INPUT_WIDTH)
             widget.valueChanged.connect(
                 lambda val, param_name=param_name: self.update_param(param_name, val)
             )
             layout.addWidget(widget, row, 1)
             self.param_inputs[param_name] = widget
+        layout.setColumnStretch(2, 1)
         self.setLayout(layout)
-
-    def _init_rf_ui(self):
-        outer = QVBoxLayout()
-        grid = QGridLayout()
-
-        param_mappings = {
-            "tx_gain": ("TX Gain (dB)", (0, 70), 1, 1, 0),
-            "tx_amplitude": ("IF Amplitude", (0, 1), 1, 0.1, 2),
-            "tx_phase": ("IF Phase (deg)", (-180, 180), 1, 1, 1),
-            "if_freq": ("IF Frequency (kHz)", (20, 400), 1e3, 0.1, 2),
-            "samp_rate": ("Sample Rate (MSps)", (0.1, 10), 1e6, 0.1, 2),
-        }
-
-        self.param_inputs, row = add_param_rows(
-            grid,
-            self.device_configuration,
-            param_mappings,
-            self.update_param,
-        )
-
-        ctrl_row = QHBoxLayout()
-        self.balance_button = QPushButton("Balance")
-        self.balance_button.clicked.connect(self._on_balance_clicked)
-        ctrl_row.addWidget(self.balance_button)
-
-        cal_cfg = self.device_configuration.get_param("calibration") or {}
-        self.calibration_checkbox = QCheckBox("Calibration signal")
-        self.calibration_checkbox.setChecked(bool(cal_cfg.get("enabled", False)))
-        self.calibration_checkbox.toggled.connect(self._on_calibration_toggled)
-        ctrl_row.addWidget(self.calibration_checkbox)
-
-        self.cal_shape_combo = QComboBox()
-        self.cal_shape_combo.addItems(["triangle", "sawtooth", "rectangle"])
-        shape = cal_cfg.get("shape", "triangle")
-        shape_idx = self.cal_shape_combo.findText(shape)
-        if shape_idx >= 0:
-            self.cal_shape_combo.setCurrentIndex(shape_idx)
-        self.cal_shape_combo.currentTextChanged.connect(self._on_cal_shape_changed)
-        ctrl_row.addWidget(self.cal_shape_combo)
-        ctrl_row.addStretch()
-        grid.addLayout(ctrl_row, row, 0, 1, 4)
-
-        outer.addLayout(grid)
-        self.channel_map_panel = USRPChannelMapPanel(self.device_configuration)
-        self.channel_map_panel.channel_map_changed.connect(self._on_channel_map_changed)
-        outer.addWidget(self.channel_map_panel)
-        self.setLayout(outer)
-
-    def _on_balance_clicked(self):
-        self.run_dpic_balance.emit(self.cfg_id or self.device_name)
-
-    def _on_calibration_toggled(self, checked):
-        cal = dict(self.device_configuration.get_param("calibration") or {})
-        cal["enabled"] = checked
-        self.update_param("calibration", cal)
-
-    def _on_cal_shape_changed(self, shape):
-        cal = dict(self.device_configuration.get_param("calibration") or {})
-        cal["shape"] = shape
-        self.update_param("calibration", cal)
-
-    def _on_channel_map_changed(self, channel_map):
-        self.update_param("channel_map", channel_map)
 
     def set_streaming_locked(self, locked: bool):
         self._streaming_locked = locked
         if not self._rf_mode:
             return
-        self.calibration_checkbox.setEnabled(not locked)
-        self.cal_shape_combo.setEnabled(not locked)
-        self.channel_map_panel.set_streaming_locked(locked)
+        super().set_streaming_locked(locked)
 
     def get_emittable_signals(self):
-        signals = {"update_device_param": self.update_device_param}
         if self._rf_mode:
-            signals["run_dpic_balance"] = self.run_dpic_balance
-        return signals
+            return super().get_emittable_signals()
+        return {"update_device_param": self.update_device_param}

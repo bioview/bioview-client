@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
     QApplication,
     QDialog,
     QDialogButtonBox,
+    QDockWidget,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -198,6 +199,7 @@ class DeviceListPanel(QWidget):
 
     discover_requested = pyqtSignal()
     edit_requested = pyqtSignal(dict, dict)  # device_info, editable_properties
+    log_toggle_requested = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -224,6 +226,12 @@ class DeviceListPanel(QWidget):
         self.discover_btn.clicked.connect(self.discover_requested.emit)
         button_column.addWidget(self.discover_btn)
 
+        self.log_btn = QPushButton("Log")
+        self.log_btn.setCheckable(True)
+        self.log_btn.setToolTip("Show the log panel")
+        self.log_btn.clicked.connect(self.log_toggle_requested.emit)
+        button_column.addWidget(self.log_btn)
+
         self.edit_btn = QPushButton("Edit")
         self.edit_btn.setEnabled(False)
         self.edit_btn.clicked.connect(self._emit_edit_request)
@@ -237,6 +245,10 @@ class DeviceListPanel(QWidget):
         group_layout.addLayout(button_column)
 
         layout.addWidget(group)
+
+    def set_log_shown(self, shown: bool):
+        """Keep the button in sync when the dock is closed by its own X."""
+        self.log_btn.setChecked(bool(shown))
 
     def set_busy(self, busy: bool):
         self.discover_btn.setEnabled(not busy)
@@ -355,10 +367,25 @@ class ConfiguratorWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         self.device_panel = DeviceListPanel()
-        layout.addWidget(self.device_panel, stretch=3)
+        layout.addWidget(self.device_panel, stretch=1)
 
+        # The log is a flyout on the right rather than a permanent strip: the
+        # window is 620px wide and the device list needs all of it.
         self.log_panel = LogDisplayPanel()
-        layout.addWidget(self.log_panel, stretch=1)
+        self.log_dock = QDockWidget("Log", self)
+        self.log_dock.setWidget(self.log_panel)
+        self.log_dock.setAllowedAreas(
+            Qt.DockWidgetArea.RightDockWidgetArea | Qt.DockWidgetArea.LeftDockWidgetArea
+        )
+        self.log_dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetClosable
+            | QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QDockWidget.DockWidgetFeature.DockWidgetFloatable
+        )
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.log_dock)
+        self.log_dock.hide()
+        self.log_dock.visibilityChanged.connect(self._on_log_visibility_changed)
+        self.device_panel.log_toggle_requested.connect(self._toggle_log_dock)
 
         self.status_panel = StatusPanel()
         status_bar = QStatusBar()
@@ -367,6 +394,12 @@ class ConfiguratorWindow(QMainWindow):
 
         self.device_panel.discover_requested.connect(self.discover_devices)
         self.device_panel.edit_requested.connect(self.show_device_config)
+
+    def _toggle_log_dock(self):
+        self.log_dock.setVisible(not self.log_dock.isVisible())
+
+    def _on_log_visibility_changed(self, visible: bool):
+        self.device_panel.set_log_shown(visible)
 
     def _setup_client(self):
         self.client_worker = Client()
