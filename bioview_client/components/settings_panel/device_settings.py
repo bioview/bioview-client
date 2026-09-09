@@ -130,13 +130,113 @@ class RFSettingsPanel(DeviceSettingsPanel):
         # and a USRP's seven parameter rows would push them off the tab.
         right = QVBoxLayout()
         right.setSpacing(4)
-        right.addLayout(self._calibration_row())
+        right.addLayout(self._calibration_rows())
 
         self.channel_map_panel = USRPChannelMapPanel(self.device_configuration)
         self.channel_map_panel.channel_map_changed.connect(self._on_channel_map_changed)
         right.addWidget(self.channel_map_panel)
         right.addStretch(1)
         outer.addLayout(right, 1)
+
+    #: Burst timing controls, as
+    #: calibration key -> (label, tooltip, (min, max), step, decimals,
+    #: display multiplier). The multiplier is what the config value is divided
+    #: by for display, so a pulse stored in seconds is edited in milliseconds.
+    CAL_TIMING_FIELDS = {
+        "num_pulses": (
+            "Pulses",
+            "How many pulses each calibration burst contains.",
+            (1, 1000),
+            1,
+            0,
+            1.0,
+        ),
+        "pulse_duration_s": (
+            "Pulse (ms)",
+            "Duration of one calibration pulse.\n"
+            "This is the shape's period, so 100 ms is a 10 Hz triangle.",
+            (0.01, 10000.0),
+            1.0,
+            2,
+            1e-3,
+        ),
+        "packet_spacing_s": (
+            "Gap (s)",
+            "How often the burst repeats: the time from the start of one\n"
+            "burst to the start of the next. The burst itself lasts\n"
+            "pulses x pulse duration; the rest of this interval is silence.",
+            (0.001, 3600.0),
+            0.1,
+            3,
+            1.0,
+        ),
+    }
+
+    def _calibration_rows(self):
+        """The calibration controls: what the pilot looks like, then its timing.
+
+        Two rows rather than one: the burst timings are three more spin boxes,
+        and a single row of eight controls wraps into the channel map on any
+        window narrower than the rig it was laid out on.
+        """
+        rows = QVBoxLayout()
+        rows.setSpacing(4)
+        rows.addLayout(self._calibration_row())
+        rows.addLayout(self._calibration_timing_row())
+        return rows
+
+    def _calibration_timing_row(self):
+        """Number of pulses, pulse duration and burst repeat interval.
+
+        All three are live: the right burst timing depends on what is being
+        measured, and it used to be reachable only by editing the config file
+        and restarting the session.
+        """
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        cal_cfg = self.device_configuration.get_param("calibration") or {}
+        self.cal_timing_inputs = {}
+
+        for key, (
+            label,
+            tooltip,
+            (minimum, maximum),
+            step,
+            decimals,
+            multiplier,
+        ) in self.CAL_TIMING_FIELDS.items():
+            row.addWidget(QLabel(f"{label}:"))
+            if decimals == 0:
+                widget = QSpinBox()
+                widget.setRange(int(minimum), int(maximum))
+                widget.setSingleStep(int(step))
+            else:
+                widget = QDoubleSpinBox()
+                widget.setRange(float(minimum), float(maximum))
+                widget.setDecimals(decimals)
+                widget.setSingleStep(float(step))
+
+            widget.setToolTip(tooltip)
+            widget.setMaximumWidth(self.PARAM_INPUT_WIDTH)
+            value = cal_cfg.get(key)
+            if value is None:
+                value = minimum
+            display = float(value) / multiplier
+            widget.setValue(
+                int(round(display)) if decimals == 0 else max(float(minimum), display)
+            )
+            widget.valueChanged.connect(
+                lambda val, key=key, mult=multiplier, dec=decimals: (
+                    self._update_calibration(
+                        key, int(val) if dec == 0 else float(val) * mult
+                    )
+                )
+            )
+            self.cal_timing_inputs[key] = widget
+            row.addWidget(widget)
+
+        row.addStretch()
+        return row
 
     def _calibration_row(self):
         ctrl_row = QHBoxLayout()
@@ -424,3 +524,82 @@ class DummySettingsPanel(RFSettingsPanel):
         if self._rf_mode:
             return super().get_emittable_signals()
         return {"update_device_param": self.update_device_param}
+
+
+class MicrophoneSettingsPanel(DeviceSettingsPanel):
+    """Host audio input: which device, how fast, how many channels, how loud.
+
+    ``samp_rate`` is the recorded rate as well as the plotted one -- saving is
+    fed from the display stream -- so it is the one setting here worth thinking
+    about before a session rather than during it.
+    """
+
+    #: (label, (min, max), step, decimals). ``channels`` is a count here, not
+    #: the per-channel enable mask BIOPAC uses: a sound card's inputs are not
+    #: individually selectable.
+    PARAM_SPECS = [
+        ("samp_rate", "Sample Rate (Hz)", (1000, 96000), 1000, 0),
+        ("channels", "Channels", (1, 8), 1, 0),
+        ("gain", "Gain", (0.1, 100.0), 0.5, 2),
+    ]
+
+    def __init__(self, device_configuration, parent=None):
+        super().__init__(device_configuration, parent)
+        self._streaming_locked = False
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QGridLayout()
+        self.param_inputs = {}
+
+        row = 0
+        layout.addWidget(QLabel("Input Device"), row, 0)
+        self.device_label = QLabel(
+            str(self.device_configuration.get_param("device", "default") or "default")
+        )
+        # Read-only: the input is chosen in the configuration file and opening a
+        # different one means tearing down and reopening the PortAudio stream,
+        # which is not something to do from a spin box mid-session.
+        self.device_label.setWordWrap(True)
+        layout.addWidget(self.device_label, row, 1)
+
+        for offset, (
+            param_name,
+            label_text,
+            (min_val, max_val),
+            step,
+            decimals,
+        ) in enumerate(self.PARAM_SPECS):
+            row = offset + 1
+            layout.addWidget(QLabel(label_text), row, 0)
+            value = self.device_configuration.get_param(param_name)
+            if decimals == 0:
+                widget = QSpinBox()
+                widget.setRange(int(min_val), int(max_val))
+                widget.setSingleStep(int(step))
+                widget.setValue(
+                    int(value) if isinstance(value, int | float) else int(min_val)
+                )
+            else:
+                widget = QDoubleSpinBox()
+                widget.setRange(float(min_val), float(max_val))
+                widget.setDecimals(decimals)
+                widget.setSingleStep(float(step))
+                widget.setValue(
+                    float(value) if isinstance(value, int | float) else float(min_val)
+                )
+            widget.valueChanged.connect(
+                lambda val, param_name=param_name: self.update_param(param_name, val)
+            )
+            layout.addWidget(widget, row, 1)
+            self.param_inputs[param_name] = widget
+
+        layout.setColumnStretch(2, 1)
+        self.setLayout(layout)
+
+    def set_streaming_locked(self, locked: bool):
+        self._streaming_locked = locked
+        for param, widget in getattr(self, "param_inputs", {}).items():
+            # Gain is applied per chunk on the way out, so it is the one control
+            # that is safe -- and useful -- to move while a session is running.
+            widget.setEnabled(not locked or param == "gain")

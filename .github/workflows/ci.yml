@@ -36,6 +36,11 @@ jobs:
           # The client depends on bioview-common (a separate repo). Install it
           # from the same source the installer uses (see build.toml).
           pip install "bioview-common @ git+https://github.com/bioview/bioview-common.git@main"
+          # tests/test_server_launch.py drives a real bioview_server.Server: the
+          # launcher's "one server per machine" rule is only testable against the
+          # server it actually launches. The server installs cleanly here -- uhd is
+          # an optional extra and wmi is Windows-only -- so no hardware is needed.
+          pip install "bioview-server @ git+https://github.com/bioview/bioview-server.git@main"
           pip install .
 
       - name: Run tests

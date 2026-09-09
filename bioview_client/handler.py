@@ -1,7 +1,6 @@
 """Front-end agnostic client handler. See bioview-docs/architecture/client.md."""
 
 import contextlib
-import os
 import select
 import socket
 import threading
@@ -28,14 +27,13 @@ from bioview_common import (
     get_app_info,
     get_challenge_response,
     get_ip,
-    get_unique_path,
     parse_and_validate_response,
     send_command,
+    server_diagnostics,
 )
 from PyQt6.QtCore import QThread, QThreadPool, pyqtSignal
 
 from bioview_client.workers import (
-    DataSaver,
     DataStreamer,
     DeviceInitWorker,
     FunctionWorker,
@@ -99,12 +97,25 @@ def _sanitize_label(label: str) -> str:
 class Client(QThread):
     # Server control signals
     server_scan_completed = pyqtSignal(list)
+    # Emitted the moment a connection attempt starts, carrying a label for the
+    # server being reached. The handshake can take seconds on a LAN and used
+    # to look, from the UI, exactly like nothing happening.
+    server_connecting = pyqtSignal(str)
     server_connected = pyqtSignal(bool)
     server_disconnected = pyqtSignal(bool)
+    # The server went away on its own, as opposed to the user disconnecting
+    # from it. Carries the server that was lost, so the window can tell whether
+    # it was the local one it is entitled to restart.
+    server_lost = pyqtSignal(dict)
 
     # Server info signals
     server_scan_progress = pyqtSignal(int)
     server_status = pyqtSignal(dict)
+    # Server-level faults the operator has to be told about -- a backend that
+    # would not load, a UHD that does not match its bindings. Normalized by
+    # bioview_common.diagnostics, so the Monitor and the Configurator render
+    # the same list without either knowing what a backend is.
+    server_diagnostics = pyqtSignal(list)
 
     # Device control signals (success only; failures are logged, not signalled)
     devices_discovered = pyqtSignal(dict)
@@ -115,6 +126,15 @@ class Client(QThread):
     device_config_failed = pyqtSignal(str)
     device_init_succeeded = pyqtSignal(dict)
     device_init_failed = pyqtSignal()
+    # ({group_id: explained reason}, only_discover). Emitted after every device
+    # command, with an empty mapping when every group came up. The log already
+    # carries this; the signal exists so the UI can put a partial failure in
+    # front of the operator instead of leaving it to be noticed in the log.
+    device_init_report = pyqtSignal(dict, bool)
+    # ({group_id: status}, {group_id: reason}) while a device command is still
+    # running, once per change. The status bar follows the groups coming up one
+    # by one instead of jumping from "connecting" to the final answer.
+    device_init_progress = pyqtSignal(dict, dict)
     device_status_updated = pyqtSignal(dict)
     device_disconnect_succeeded = pyqtSignal()
     # Emitted when the server's advertised source list changes
@@ -179,7 +199,9 @@ class Client(QThread):
         self.data_streamer = None
 
         # Client-side saving; the saver thread is created when streaming starts
-        self.data_saver = None
+        # Recordings are written by the server (the save-rate stream never
+        # crosses the wire), so the client only tracks whether one is running.
+        self._recording_active = False
         self.enable_save = False
         self.save_dir = ""
         self.file_name = ""
@@ -258,13 +280,12 @@ class Client(QThread):
         self.save_label = label or None
 
     def record_param_change(self, device_id: str, param: str, value):
-        """Record a UI-driven device parameter tweak. Keeps our config snapshot
-        current (so a subsequent recording's start metadata is accurate) and, when
-        a recording is active, logs the change with a timestamp into the .bvr."""
+        """Keep our config snapshot current after a UI-driven parameter tweak.
+
+        The change itself is written into the recording by the server, which
+        already sees it when it applies the update."""
         with contextlib.suppress(Exception):
             self.config.update_device_param(device_id, param, value)
-        if self.data_saver is not None:
-            self.data_saver.record_change(device_id, param, value)
 
     def has_valid_save_target(self) -> bool:
         """Whether both a file name and a save folder have been provided."""
@@ -273,14 +294,26 @@ class Client(QThread):
         )
 
     def is_recording(self) -> bool:
-        """Whether a client-side recording is currently active."""
-        return self.data_saver is not None
+        """Whether a recording is currently being written for this session."""
+        return self._recording_active
 
     def record_annotation(self, text: str) -> bool:
-        """Store an annotation under the recording's ``Annotations`` metadata."""
-        if self.data_saver is None:
+        """Add an annotation to the running recording.
+
+        The file lives on the server, so the note is sent there rather than
+        written locally.
+        """
+        if not self._recording_active:
             return False
-        self.data_saver.record_annotation(text)
+
+        response = self._send_command_locked(Command.MARK_EVENT, {"text": text})
+        if response is None:
+            return False
+        resp_type, resp_payload = parse_and_validate_response(response)
+        if resp_type != Response.SUCCESS.name:
+            err = (resp_payload or {}).get("message", "")
+            self.log_message.emit("error", f"Could not mark event: {err}")
+            return False
         return True
 
     @staticmethod
@@ -368,9 +401,9 @@ class Client(QThread):
                     and self._connection_dropped()
                 ):
                     self.log_message.emit("warning", "Lost connection to server")
-                    self.disconnect_from_server()
+                    self._handle_lost_server()
             except (OSError, ConnectionResetError, BrokenPipeError):
-                self.disconnect_from_server()
+                self._handle_lost_server()
             finally:
                 time.sleep(CONNECTION_CHECK_INTERVAL)
 
@@ -597,6 +630,25 @@ class Client(QThread):
             with self._connect_guard_lock:
                 self._connecting = False
 
+    def _server_data_port(self) -> int:
+        """The data port of the server being connected to.
+
+        Taken from what that server advertised in its discovery reply, since
+        it is the only authority on where it is listening. Falls back to this
+        client's configured port for a server too old to say.
+        """
+        advertised = (self.selected_server or {}).get("data_port")
+        try:
+            return int(advertised)
+        except (TypeError, ValueError):
+            return self.data_port
+
+    @staticmethod
+    def server_label(server: dict) -> str:
+        """How a server is named in a message to the user."""
+        server = server or {}
+        return server.get("hostname") or server.get("ip") or "server"
+
     def _do_connect_to_server(self):
         if not self.selected_server:
             if len(self.discovered_servers) == 0:
@@ -606,6 +658,12 @@ class Client(QThread):
             self.log_message.emit(
                 "info", f"Connecting to server: {self.selected_server.get('ip')}"
             )
+
+        # Before the socket work, not after: the handshake is the part that
+        # takes time, so a window that only hears about it afterwards shows
+        # nothing for the whole wait. The client status is deliberately left
+        # alone -- the connection has not changed anything yet.
+        self.server_connecting.emit(self.server_label(self.selected_server))
 
         try:
             with self._control_lock:
@@ -630,7 +688,9 @@ class Client(QThread):
 
             self.data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.data_socket.settimeout(5)
-            self.data_socket.connect((self.selected_server["ip"], self.data_port))
+            self.data_socket.connect(
+                (self.selected_server["ip"], self._server_data_port())
+            )
             self.data_connected = True
 
             # Keep the address we actually reached the server on: the payload
@@ -643,6 +703,7 @@ class Client(QThread):
 
             self.status = ClientStatus.SERVER_CONNECTED
             self.server_connected.emit(True)
+            self._publish_server_diagnostics(self.selected_server)
         except Exception as e:
             self.status = ClientStatus.SERVER_DISCONNECTED
             self._stop_data_streamer()
@@ -659,14 +720,44 @@ class Client(QThread):
             self.log_message.emit("error", f"Server connection failed: {e}")
             self.server_disconnected.emit(True)
 
+    def _publish_server_diagnostics(self, server_info: dict):
+        """Hand the window whatever the server said is wrong with itself.
+
+        The catalogue does the wording; this only decides *when* to ask, which
+        is once per successful connection. Never allowed to break a connection
+        that otherwise succeeded.
+        """
+        try:
+            issues = server_diagnostics(server_info)
+        except Exception as e:
+            self.log_message.emit("debug", f"Could not read server diagnostics: {e}")
+            return
+
+        for issue in issues:
+            self.log_message.emit(
+                "error", f"{issue['title']}. {issue['message']} [{issue['detail']}]"
+            )
+        if issues:
+            self.server_diagnostics.emit(issues)
+
+    def _handle_lost_server(self):
+        """Tear down a connection the far end dropped, and say that it was lost.
+
+        Distinct from disconnect_from_server(), which is also what the user's
+        own Disconnect does: only one of the two is a fault worth telling the
+        user about, and only one of them means a server may need restarting.
+        """
+        lost = dict(self.selected_server or {})
+        was_connected = self.status >= ClientStatus.SERVER_CONNECTED
+        self.disconnect_from_server()
+        if was_connected:
+            self.server_lost.emit(lost)
+
     def disconnect_from_server(self):
         # Stop the receiver before closing the socket it reads.
         self._stop_data_streamer()
 
-        if self.data_saver is not None:
-            with contextlib.suppress(Exception):
-                self.data_saver.stop_saving()
-            self.data_saver = None
+        self._recording_active = False
 
         with self._control_lock:
             if self.control_socket:
@@ -779,7 +870,20 @@ class Client(QThread):
         worker.signals.finished.connect(
             lambda status: self._on_device_command_finished(status, only_discover)
         )
+        worker.signals.progress.connect(self._on_device_command_progress)
         self.thread_pool.start(worker)
+
+    def _on_device_command_progress(self, group_status_dict, group_errors):
+        """Relay the server's running view of the groups as it changes.
+
+        Kept separate from the completion handler: nothing here decides the
+        client's status or starts the data receiver, it only says what the
+        groups are doing right now.
+        """
+        self.device_states = dict(group_status_dict)
+        if group_errors:
+            self.device_errors = dict(group_errors)
+        self.device_init_progress.emit(dict(group_status_dict), dict(group_errors))
 
     @staticmethod
     def _is_connected(status_value) -> bool:
@@ -808,7 +912,8 @@ class Client(QThread):
             return
 
         self.device_states = group_status_dict
-        self._log_device_outcomes(group_status_dict, only_discover)
+        failures = self._log_device_outcomes(group_status_dict, only_discover)
+        self.device_init_report.emit(failures, only_discover)
 
         if only_discover:
             self.status = ClientStatus.DEVICES_DISCOVERED
@@ -829,10 +934,15 @@ class Client(QThread):
         self._discovering_devices = False
 
     def _log_device_outcomes(self, group_status_dict, only_discover: bool):
-        """Report what happened to each device group, and why when it failed."""
+        """Report what happened to each device group, and why when it failed.
+
+        Returns ``{group_id: explanation}`` for the groups that did not come
+        up, so the caller can surface them without re-deriving the wording.
+        """
         action = "Discovery" if only_discover else "Initialization"
         good = {DeviceStatus.AVAILABLE.value, DeviceStatus.CONNECTED.value}
         errors = self.device_errors or {}
+        failures = {}
 
         for group, state in group_status_dict.items():
             state_text = getattr(state, "value", state)
@@ -843,6 +953,7 @@ class Client(QThread):
             reason = errors.get(group)
             # The shared catalogue keeps Monitor and Configurator wording identical.
             explained = describe_failure(reason) if reason else ""
+            failures[group] = explained or str(state_text)
             self.log_message.emit(
                 "error",
                 f"{group}: {state_text}" + (f" -- {explained}" if explained else ""),
@@ -855,6 +966,7 @@ class Client(QThread):
             "debug",
             f"{action} finished: {ok}/{len(group_status_dict)} device group(s) ready",
         )
+        return failures
 
     def disconnect_device(self):
         self.log_message.emit("info", "Disconnecting devices...")
@@ -941,9 +1053,22 @@ class Client(QThread):
             f"Streaming {len(self.data_sources or [])} data source(s); "
             f"saving {'on' if self.enable_save else 'off'}",
         )
+        params = self.config.to_dict()
+        # The recording is written server-side, so the save target travels with
+        # the start command rather than staying local.
+        experiment = params.setdefault("Experiment", {})
+        if self.enable_save:
+            experiment["file_name"] = (self.file_name or "").strip()
+            experiment["save_dir"] = self.save_dir or ""
+            if self.save_label:
+                experiment["save_label"] = _sanitize_label(self.save_label)
+        else:
+            # An empty file name is how the server is told not to record.
+            experiment["file_name"] = ""
+
         response = self._send_command_locked(
             command=Command.START_STREAMING,
-            params=self.config.to_dict(),
+            params=params,
             timeout=STREAMING_COMMAND_TIMEOUT,
         )
         resp_type, resp_payload = parse_and_validate_response(response)
@@ -970,42 +1095,16 @@ class Client(QThread):
             self.log_message.emit("error", f"Failed to start streaming: {msg}")
 
     def _start_saving(self):
-        """Create and start the client-side disk writer if saving is enabled."""
-        self.data_saver = None
-        if not self.enable_save:
-            return
+        """Note that the server is recording this session, if saving is on.
 
-        save_dir = self.save_dir or os.getcwd()
-        base = os.path.splitext((self.file_name or "").strip())[0] or "bioview_recording"
-        if self.save_label:
-            base = f"{base}_{_sanitize_label(self.save_label)}"
-        file_name = f"{base}.bvr"
-
-        try:
-            save_path = get_unique_path(save_dir, file_name)
-            sources = self.data_sources or []
-            device_config = {}
-            if self.config is not None:
-                device_config = {
-                    dev_id: cfg.to_dict() for dev_id, cfg in self.config.devices.items()
-                }
-            self.data_saver = DataSaver(
-                save_path=save_path,
-                sources=sources,
-                device_config=device_config,
-                log_signal=self.log_message,
-            )
-            self.data_saver.start_saving()
-        except Exception as e:
-            self.data_saver = None
-            self.log_message.emit("error", f"Unable to start saving: {e}")
+        Nothing is written here: the file holds the save-rate stream, which only
+        exists on the server. This flag is what gates the annotation UI.
+        """
+        self._recording_active = bool(self.enable_save and self.has_valid_save_target())
 
     def _handle_received_data(self, data, sources=None):
         # The per-chunk source list is authoritative when present; the list
         # advertised at connect time is the fallback.
-        if self.data_saver is not None:
-            self.data_saver.add(data)
-
         chunk_sources = sources if sources else self.data_sources
         self.data_received.emit(data, chunk_sources)
 
@@ -1034,9 +1133,7 @@ class Client(QThread):
 
         # The data socket and receiver stay up for the whole session: the
         # server only pauses its backends, and keeps the same connection.
-        if self.data_saver is not None:
-            self.data_saver.stop_saving()
-            self.data_saver = None
+        self._recording_active = False
 
         self.status = ClientStatus.DEVICES_CONNECTED
         self.streaming_stopped.emit(True)

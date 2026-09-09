@@ -16,14 +16,88 @@ from .routine import (
 )
 
 
+def list_audio_outputs() -> list[str]:
+    """Descriptions of every host audio output Qt can play through.
+
+    Used to log what is available: a name that matches nothing is the common
+    way ``audio_output_device`` goes wrong, and the log is the only place the
+    operator can see what they should have written.
+    """
+    try:
+        from PyQt6.QtMultimedia import QMediaDevices
+
+        return [device.description() for device in QMediaDevices.audioOutputs()]
+    except Exception:  # noqa: BLE001 - QtMultimedia may be unavailable
+        return []
+
+
+def resolve_audio_output(requested: str | None):
+    """Pick a ``QAudioDevice`` for ``requested``; returns ``(device, note, level)``.
+
+    ``device`` is None when Qt's default should be used; ``note`` is a message
+    worth logging at ``level``.
+
+    Matching is by description -- exact first, then as a case-insensitive
+    substring -- so a config can say ``"headphones"`` rather than the full
+    Windows device string, while a device whose whole name is a substring of
+    another can still be named precisely. A request that matches nothing falls
+    back to the default *and says so*, naming what was available: silently
+    playing to a different speaker than the one asked for is exactly the
+    failure this exists to prevent.
+    """
+    from PyQt6.QtMultimedia import QMediaDevices
+
+    outputs = QMediaDevices.audioOutputs()
+    if not outputs:
+        return None, "No audio output device is available on this machine", "warning"
+
+    if not requested or str(requested).strip().lower() == "default":
+        default = QMediaDevices.defaultAudioOutput()
+        name = default.description() if default is not None else "unknown"
+        return (
+            None,
+            f"Playing instructions through the default output ({name})",
+            "info",
+        )
+
+    wanted = str(requested).strip().casefold()
+    for match in (
+        lambda name: wanted == name,
+        lambda name: wanted in name,
+    ):
+        for device in outputs:
+            if match(device.description().casefold()):
+                return (
+                    device,
+                    f"Playing instructions through {device.description()}",
+                    "info",
+                )
+
+    available = ", ".join(d.description() for d in outputs)
+    return (
+        None,
+        f"No audio output matches {requested!r}; falling back to the default. "
+        f"Available outputs: {available}",
+        "warning",
+    )
+
+
 class InstructionController(QObject):
     log_event = pyqtSignal(str, str)
     finished = pyqtSignal()  # emitted when non-looping media reaches its end
 
-    def __init__(self, spec: InstructionSpec, host_widget=None, parent=None):
+    def __init__(
+        self,
+        spec: InstructionSpec,
+        host_widget=None,
+        parent=None,
+        output_device: str | None = None,
+    ):
         super().__init__(parent)
         self.spec = spec
         self.host_widget = host_widget
+        # Per-instruction choice wins over the experiment-wide default.
+        self.output_device = getattr(spec, "output_device", None) or output_device
 
         # Media (audio/video)
         self._player = None
@@ -66,6 +140,8 @@ class InstructionController(QObject):
             with contextlib.suppress(Exception):
                 self._player.mediaStatusChanged.disconnect(self._on_media_status)
             with contextlib.suppress(Exception):
+                self._player.errorOccurred.disconnect(self._on_player_error)
+            with contextlib.suppress(Exception):
                 self._player.stop()
             with contextlib.suppress(Exception):
                 self._player.setSource(QUrl())
@@ -96,10 +172,38 @@ class InstructionController(QObject):
 
         self._player = QMediaPlayer(self)
         self._audio_out = QAudioOutput(self)
+
+        # Chosen before the output is attached to the player: QAudioOutput
+        # binds its device when it is set, and switching afterwards is not
+        # applied to media already queued on it.
+        #
+        # Never fatal: a routine playing through the wrong speaker is a bad
+        # session, but one that refuses to start because the outputs could not
+        # be enumerated is a worse one.
+        try:
+            device, note, level = resolve_audio_output(self.output_device)
+        except Exception as e:  # noqa: BLE001 - fall back to Qt's default
+            device = None
+            note = f"Could not choose an audio output: {e}"
+            level = "warning"
+        if device is not None:
+            self._audio_out.setDevice(device)
+        if note:
+            self.log_event.emit(level, note)
+
+        # QAudioOutput starts at full scale, but a previous session's volume is
+        # restored on some platforms; set it explicitly so a routine is never
+        # silently played at zero.
+        self._audio_out.setMuted(False)
+        self._audio_out.setVolume(1.0)
+
         self._player.setAudioOutput(self._audio_out)
         # -1 == infinite loop, 1 == play once
         self._player.setLoops(-1 if self.spec.loop else 1)
         self._player.mediaStatusChanged.connect(self._on_media_status)
+        # A decode or backend failure is otherwise completely silent: the
+        # player just never produces sound.
+        self._player.errorOccurred.connect(self._on_player_error)
 
         if with_video:
             self._dialog = InstructionDialog(
@@ -110,6 +214,13 @@ class InstructionController(QObject):
 
         self._player.setSource(QUrl.fromLocalFile(str(path)))
         self._player.play()
+
+    def _on_player_error(self, _error, message: str):
+        self.log_event.emit(
+            "error",
+            f"Could not play {Path(self.spec.file).name}: "
+            f"{message or 'unknown media error'}",
+        )
 
     def _on_media_status(self, status):
         from PyQt6.QtMultimedia import QMediaPlayer

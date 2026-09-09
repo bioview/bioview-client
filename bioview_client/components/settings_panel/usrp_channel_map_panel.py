@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from bioview_common.datatypes.configuration.usrp_channel_map import (
     build_global_registry,
+    components_from_config,
     inject_rx_indices,
     resolve_channel_map,
 )
@@ -434,7 +435,12 @@ class USRPChannelMapPanel(QGroupBox):
         """Update preview, warnings and the empty-state hint together."""
         channel_map = self._build_channel_map()
         group_id = self.device_configuration.get_param("device_name") or "USRP"
-        sources, _, dpic = resolve_channel_map(group_id, channel_map, self._hardware())
+        sources, _, dpic = resolve_channel_map(
+            group_id,
+            channel_map,
+            self._hardware(),
+            components=components_from_config(self.device_configuration.to_dict()),
+        )
         labels = sorted([s.label for s in sources])
         source_txt = ", ".join(labels) if labels else "—"
         dpic_txt = ", ".join(

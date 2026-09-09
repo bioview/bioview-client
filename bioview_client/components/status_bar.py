@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QStatusBar,
     QVBoxLayout,
     QWidget,
@@ -321,10 +322,19 @@ class DeviceStatusPanel(QWidget):
         self.layout.addWidget(device_widget)
 
     def update_device_status(self, group_id, new_status):
+        """Set one group's indicator, adding it if the bar has not seen it yet.
+
+        A group the panel was not built with used to be dropped in silence,
+        which is exactly what happened to a configuration loaded after the
+        window opened: the server reported it, and nothing showed it.
+        """
         widget = self.device_widgets.get(group_id, None)
 
-        if widget:
-            widget.update_status(new_status)
+        if widget is None:
+            self.add_device(group_id, new_status)
+            return
+
+        widget.update_status(new_status)
 
 
 class RoutineProgressBar(QWidget):
@@ -479,8 +489,49 @@ class StatusBar(QStatusBar):
     }
     SERVER_TEXT_DEFAULT = "BioView Server Disconnected"
 
+    #: How long a completed-state message stays up before the bar goes quiet.
+    ACTIVITY_TIMEOUT_MS = 4000
+
+    #: How long an open-ended operation runs before the bar says so. Below
+    #: this, a message that changes itself reads as a glitch; above it, an
+    #: unchanging message reads as a hang.
+    SLOW_ACTIVITY_MS = 8000
+
+    #: Theme colour per activity level. "streaming" is its own level rather
+    #: than a success: starting and stopping a stream is the routine thing this
+    #: application does, and reporting it in the same green as "the devices
+    #: came up" spends the colour that should mean something went right. "info"
+    #: shares that neutral yellow: a plain notice is neither progress nor a
+    #: problem, and blue read as a state of its own next to the indicators.
+    ACTIVITY_COLORS = {
+        "info": "yellow",
+        "success": "green",
+        "warning": "orange",
+        "error": "red",
+        "streaming": "yellow",
+    }
+
+    #: Levels whose colour is knocked back from the palette value. The theme's
+    #: yellow is a full-strength alert colour; a routine state change wants the
+    #: same hue at a lower voice.
+    _MUTED_LEVELS = {"streaming", "info"}
+    _MUTED_FACTOR = 135
+
+    #: The bar reports state; it is not itself a control. Only the widgets that
+    #: actually do something take a hover, and the frames Qt draws around
+    #: status-bar items are removed so the strip reads as one flat surface.
+    _BAR_STYLE = """
+        QStatusBar { background: transparent; border: none; }
+        QStatusBar::item { border: none; }
+    """
+
     def __init__(self, device_status: dict = None, parent=...):
         super().__init__(parent)
+        self.setStyleSheet(self._BAR_STYLE)
+        # The grip is the one part of the bar that lights up under the cursor
+        # without being a control anyone uses: the window resizes from its
+        # edges regardless.
+        self.setSizeGripEnabled(False)
 
         # Use a QWidget with a layout to group widgets
         self.container = QWidget()
@@ -506,9 +557,43 @@ class StatusBar(QStatusBar):
 
         self.more_button = QPushButton(" More…")
         self.more_button.setToolTip("Choose and connect to a BioView server")
-        self.more_button.setFlat(True)
+        # Not flat. A flat button has no border until the cursor reaches it,
+        # and then paints a bare rectangle of highlight into an otherwise
+        # empty strip -- which is what made the *bar* look like the thing
+        # lighting up. Given an ordinary button frame the highlight lands
+        # inside a shape that was already visibly a button, so the hover reads
+        # as the button's and the bar around it stays quiet.
+        self.more_button.setFlat(False)
+        self.more_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        # Sized to its label so the frame does not stretch across the bar.
+        self.more_button.setSizePolicy(
+            QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed
+        )
         self.more_button.clicked.connect(self.open_server_flyout)
         self._layout.addWidget(self.more_button, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        # Transient state messages ("Initializing devices…", "Initialized
+        # successfully"). Empty, and taking no space, whenever nothing is
+        # happening.
+        self.activity_label = QLabel("")
+        self.activity_label.setContentsMargins(12, 0, 6, 0)
+        self._layout.addWidget(self.activity_label, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        # Clears a completed-state message after ACTIVITY_TIMEOUT_MS. Single
+        # shot and restarted per message, so a burst of updates leaves only the
+        # last one on screen for its full time.
+        self._activity_timer = QTimer(self)
+        self._activity_timer.setSingleShot(True)
+        self._activity_timer.timeout.connect(self.clear_activity)
+
+        # Replaces an open-ended message with a "still working" one once the
+        # operation has run long enough that the first message stops being
+        # reassuring. Armed only when the caller supplies the second wording.
+        self._slow_timer = QTimer(self)
+        self._slow_timer.setSingleShot(True)
+        self._slow_timer.timeout.connect(self._on_activity_slow)
+        self._slow_message = None
+        self._slow_level = "warning"
 
         self._update_icons()
         self._layout.addStretch()
@@ -528,6 +613,11 @@ class StatusBar(QStatusBar):
 
         self.container.setLayout(self._layout)
 
+        # Everything above except the buttons is a readout. Taking them off the
+        # mouse means the cursor crossing the bar cannot put any of them into a
+        # hover state, while the buttons keep their own.
+        self._make_readouts_inert()
+
         self.addPermanentWidget(self.container, stretch=1)
 
         # Forward signals and callbacks from components
@@ -538,6 +628,94 @@ class StatusBar(QStatusBar):
         self.server_connector.server_connection_state_updated.connect(
             lambda status: self.set_server_status(status)
         )
+
+    def _make_readouts_inert(self):
+        """Take the non-interactive widgets in the bar off the mouse.
+
+        The bar carries labels, indicators and a progress bar that do nothing
+        when clicked. Left mouse-visible they each accept enter/leave events,
+        which is what made moving across the strip feel like hovering a
+        control. ``self.container`` itself stays interactive so the buttons
+        inside it keep working.
+        """
+        inert = (
+            self.server_indicator,
+            self.server_status_label,
+            self.activity_label,
+            self.routine_progress,
+            self.device_status_panel,
+        )
+        for widget in inert:
+            with contextlib.suppress(Exception):
+                widget.setAttribute(
+                    Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+                )
+
+    # Transient activity messages
+    @classmethod
+    def activity_color(cls, level: str) -> QColor:
+        """Colour for an activity level, muted where the level asks for it."""
+        colour = get_qcolor(cls.ACTIVITY_COLORS.get(level, "yellow"))
+        if level in cls._MUTED_LEVELS:
+            colour = colour.darker(cls._MUTED_FACTOR)
+        return colour
+
+    def _paint_activity(self, message: str, level: str):
+        self.activity_label.setText(message)
+        self.activity_label.setStyleSheet(
+            f"color: {self.activity_color(level).name()}; font-weight: 600;"
+        )
+
+    def show_activity(
+        self,
+        message: str,
+        level: str = "info",
+        timeout_ms: int | None = None,
+        slow_message: str | None = None,
+        slow_after_ms: int | None = None,
+        slow_level: str = "warning",
+    ):
+        """Show a state-change message in the bar.
+
+        ``timeout_ms`` of 0 (the default for ``info``) leaves the message up
+        until it is replaced or cleared -- an operation that is still running
+        should not stop announcing itself halfway through. A finished state
+        passes a timeout so the bar goes quiet again on its own.
+
+        ``slow_message`` is what the bar says if the operation is still running
+        ``slow_after_ms`` later. Connecting, initializing and balancing all
+        have a normal duration and a duration that means something is wrong,
+        and the difference is invisible from a message that never changes. The
+        escalation is cancelled by the next message, whatever it is, so the
+        second wording can only appear while the first one is still true.
+        """
+        self._paint_activity(message, level)
+
+        self._activity_timer.stop()
+        self._slow_timer.stop()
+        self._slow_message = None
+
+        if timeout_ms is None:
+            timeout_ms = 0 if level == "info" else self.ACTIVITY_TIMEOUT_MS
+        if timeout_ms > 0:
+            self._activity_timer.start(int(timeout_ms))
+
+        if slow_message:
+            self._slow_message = slow_message
+            self._slow_level = slow_level
+            self._slow_timer.start(int(slow_after_ms or self.SLOW_ACTIVITY_MS))
+
+    def _on_activity_slow(self):
+        """The operation is still running; say so rather than repeating itself."""
+        if self._slow_message:
+            self._paint_activity(self._slow_message, self._slow_level)
+            self._slow_message = None
+
+    def clear_activity(self):
+        self._activity_timer.stop()
+        self._slow_timer.stop()
+        self._slow_message = None
+        self.activity_label.setText("")
 
     def _forward_signals(self):
         # Re-exposed from the embedded ServerConnector.
@@ -593,6 +771,19 @@ class StatusBar(QStatusBar):
             colour, indicator = "red", DeviceStatus.UNAVAILABLE
         self.server_status_label.setStyleSheet(f"color: {get_qcolor(colour).name()}")
         self.server_indicator.update_status(indicator)
+
+    def set_server_connecting(self, label: str = ""):
+        """Say that a connection attempt is in flight, and to which server.
+
+        Not a ClientStatus: the client is not connected yet and nothing about
+        its state has changed, so this is only how the bar reads while the
+        handshake runs.
+        """
+        self.server_status_label.setText(
+            f"Connecting to {label}…" if label else "Connecting to BioView Server…"
+        )
+        self.server_status_label.setStyleSheet(f"color: {get_qcolor('yellow').name()}")
+        self.server_indicator.update_status(DeviceStatus.CONNECTING)
 
     def set_server_status(self, status: ClientStatus):
         """Centralize server-related UI updates based on ClientStatus."""

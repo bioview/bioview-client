@@ -135,6 +135,21 @@ class CommonSettingsPanel(QGroupBox):
     def update_grid(self):
         self.grid_layout_changed.emit(self.rows_input.value(), self.cols_input.value())
 
+    def grid_size(self) -> tuple[int, int]:
+        return self.rows_input.value(), self.cols_input.value()
+
+    def set_grid_size(self, rows: int, cols: int):
+        """Show a layout chosen elsewhere without asking for it again.
+
+        Silent: the caller has already resized the grid, and letting the
+        spin boxes emit would rebuild it a second time -- which drops every
+        source that was just placed in it.
+        """
+        for widget, value in ((self.rows_input, rows), (self.cols_input, cols)):
+            blocked = widget.blockSignals(True)
+            widget.setValue(int(value))
+            widget.blockSignals(blocked)
+
     def request_channel_update(self, action: str, source: DataSource):
         """Handle channel selection changes"""
         if action == "remove":

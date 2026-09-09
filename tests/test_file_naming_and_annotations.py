@@ -26,47 +26,68 @@ def test_has_valid_save_target(qapp):
     assert client.has_valid_save_target() is False
 
 
-def test_record_annotation_requires_active_recording(qapp):
+def test_record_annotation_requires_active_recording(qapp, monkeypatch):
+    """Annotations go to the server, which owns the recording and its trailer."""
+    from bioview_common import Command, Response
+
     client = Client()
-    # No active recording -> annotation is not recorded.
+    # No active recording -> nothing is sent.
     assert client.is_recording() is False
     assert client.record_annotation("hello") is False
 
-    # With an active recording, the annotation is forwarded to the saver.
-    class FakeSaver:
-        def __init__(self):
-            self.annotations = []
+    sent = []
 
-        def record_annotation(self, text):
-            self.annotations.append(text)
+    def fake_send(command, params=None, timeout=None):
+        sent.append((command, params))
+        return b"ignored"
 
-    client.data_saver = FakeSaver()
+    monkeypatch.setattr(client, "_send_command_locked", fake_send)
+    monkeypatch.setattr(
+        "bioview_client.handler.parse_and_validate_response",
+        lambda _raw: (Response.SUCCESS.name, {}),
+    )
+
+    client._recording_active = True
     assert client.is_recording() is True
     assert client.record_annotation("event A") is True
-    assert client.data_saver.annotations == ["event A"]
+    assert sent == [(Command.MARK_EVENT, {"text": "event A"})]
 
 
-def test_timed_mode_filename_labeling(qapp, tmp_path):
-    """A timed-mode run appends the sanitized routine label to the file name."""
+def test_record_annotation_reports_server_refusal(qapp, monkeypatch):
+    from bioview_common import Response
+
+    client = Client()
+    client._recording_active = True
+    monkeypatch.setattr(client, "_send_command_locked", lambda *a, **k: b"ignored")
+    monkeypatch.setattr(
+        "bioview_client.handler.parse_and_validate_response",
+        lambda _raw: (Response.ERROR.name, {"message": "No recording is active"}),
+    )
+    assert client.record_annotation("event A") is False
+
+
+def test_save_target_is_sent_to_the_server(qapp, tmp_path):
+    """The server writes the file, so the save target travels with Start.
+
+    The client no longer builds the path itself; it only has to hand over the
+    name, folder and (for a timed run) the sanitized routine label.
+    """
     client = Client()
     client.set_save_enabled(True)
     client.set_save_param("file_name", "session.bvr")
     client.set_save_param("save_dir", str(tmp_path))
 
-    # Unlimited run -> <file name>.bvr
     client.set_save_label(None)
     client._start_saving()
-    assert client.data_saver is not None
-    unlimited_name = client.data_saver.save_path
-    client.data_saver.stop_saving()
-    assert unlimited_name.endswith("session.bvr")
+    assert client.is_recording() is True
 
-    # Timed run -> <file name>_<label>.bvr
     client.set_save_label("Text Routine")
+    assert _sanitize_label(client.save_label) == "Text_Routine"
+
+    # Saving off, or no valid target, means no recording is claimed.
+    client.set_save_enabled(False)
     client._start_saving()
-    timed_name = client.data_saver.save_path
-    client.data_saver.stop_saving()
-    assert timed_name.endswith("session_Text_Routine.bvr")
+    assert client.is_recording() is False
 
 
 def test_annotation_panel_emits_signal(qapp):

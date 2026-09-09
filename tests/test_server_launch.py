@@ -33,7 +33,9 @@ def running_server():
     thread.start()
 
     deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline and not launch._server_running(port=control_port):
+    while time.monotonic() < deadline:
+        if launch._server_running(port=control_port):
+            break
         time.sleep(0.05)
     else_started = launch._server_running(port=control_port)
     if not else_started:
@@ -99,6 +101,7 @@ def test_every_client_entry_point_starts_a_server(monkeypatch, entry_point, role
 
 def test_a_client_role_ensures_a_server_and_releases_it(monkeypatch):
     events = []
+    ports_seen = {}
     sentinel = object()
 
     monkeypatch.setattr(
@@ -112,11 +115,17 @@ def test_a_client_role_ensures_a_server_and_releases_it(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
         "bioview_client.configurator",
-        types.SimpleNamespace(run_configurator=lambda rest: 0),
+        types.SimpleNamespace(
+            run_configurator=lambda rest, **ports: ports_seen.update(ports) or 0
+        ),
     )
 
     assert launch.run_client("configurator", 9001, 9002, []) == 0
     assert events == [("ensure", "configurator"), ("release", sentinel)]
+    assert ports_seen == {"control_port": 9001, "data_port": 9002}, (
+        "a window left to its compiled-in defaults would look for its server "
+        "on the wrong port"
+    )
 
 
 def test_only_client_roles_and_the_child_server_are_offered():
@@ -160,3 +169,148 @@ def test_a_server_still_in_use_is_left_alone_when_one_window_closes(monkeypatch)
     monkeypatch.setattr(launch, "_server_info", lambda **kw: {"clients": 0})
     launch._release_server(child, CONTROL_PORT)
     assert terminated == [child], "last window out shuts the server down"
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_heartbeat():
+    """A heartbeat outliving its test would keep probing a closed port."""
+    yield
+    launch._stop_heartbeat()
+
+
+def test_a_window_keeps_its_server_alive_while_it_is_still_starting_up():
+    """The window is a client of its server long before it manages to connect.
+
+    The Monitor builds its client only once the configuration dialog has been
+    answered, and nobody is obliged to answer it. Tying the server's lifetime
+    to a fixed timeout would just move that cliff, so it is tied to the window
+    process instead: while the process lives, it says so.
+    """
+    control_port, data_port = _free_port(), _free_port()
+    srv = Server(
+        local_only=True,
+        control_port=control_port,
+        data_port=data_port,
+        exit_when_idle=1.0,
+    )
+    thread = threading.Thread(target=srv.start, daemon=True)
+    thread.start()
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if launch._server_running(port=control_port):
+            break
+        time.sleep(0.05)
+
+    monkeyed = launch.SERVER_HEARTBEAT_S
+    launch.SERVER_HEARTBEAT_S = 0.2
+    try:
+        launch._start_heartbeat(control_port)
+        # Well past the idle timeout, with no client ever connecting.
+        time.sleep(3.0)
+        assert srv.running, "server retired while a window was still starting"
+    finally:
+        launch.SERVER_HEARTBEAT_S = monkeyed
+        launch._stop_heartbeat()
+        srv.stop()
+        thread.join(timeout=5)
+
+
+def test_a_closing_window_stops_claiming_its_server(monkeypatch):
+    """The claim must be dropped before the shutdown decision, or a window
+    would go on holding open the server it has just decided nobody wants."""
+    monkeypatch.setattr(launch, "_terminate", lambda child, **kw: None)
+    monkeypatch.setattr(launch, "_server_info", lambda **kw: {"clients": 0})
+
+    launch._start_heartbeat(_free_port())
+    assert launch._heartbeat["thread"] is not None
+
+    launch._release_server(None, CONTROL_PORT)
+    assert launch._heartbeat["thread"] is None
+
+
+def test_a_server_that_never_comes_up_is_reported_rather_than_ignored(monkeypatch):
+    """A window that can never connect is worse than no window at all."""
+    dead = types.SimpleNamespace(poll=lambda: 1)
+    spawns = []
+
+    monkeypatch.setattr(
+        launch, "_spawn_server", lambda cp, dp: spawns.append(cp) or dead
+    )
+    monkeypatch.setattr(launch, "_server_running", lambda **kw: False)
+    monkeypatch.setattr(launch, "_wait_for_server", lambda cp, timeout: False)
+
+    with pytest.raises(launch.ServerStartupError):
+        launch._ensure_server(9001, 9002)
+
+    assert len(spawns) == 2, "a lone child dying is usually a race worth retrying"
+
+
+def test_a_child_that_lost_the_race_leaves_the_winner_alone(monkeypatch):
+    """Losing the port to another window is not a failure: that window's
+    server is the one server, and it is not ours to shut down or replace."""
+    dead = types.SimpleNamespace(poll=lambda: 1)
+    spawns = []
+
+    monkeypatch.setattr(
+        launch, "_spawn_server", lambda cp, dp: spawns.append(cp) or dead
+    )
+    monkeypatch.setattr(launch, "_server_running", lambda **kw: False)
+    monkeypatch.setattr(launch, "_wait_for_server", lambda cp, timeout: True)
+
+    assert launch._ensure_server(9001, 9002) is None
+    assert len(spawns) == 1, "the winner's server must not be raced a second time"
+
+
+def test_a_restart_reuses_a_server_somebody_else_already_brought_back(monkeypatch):
+    """Two windows can notice the same death. The second must not start a
+    duplicate server, nor fail because it lost the race."""
+    spawns = []
+    monkeypatch.setattr(launch, "_spawn_server", lambda cp, dp: spawns.append(cp))
+    monkeypatch.setattr(launch, "_server_running", lambda **kw: True)
+
+    launch.restart_server(9001, 9002)
+    assert spawns == []
+
+
+def test_a_restart_that_produces_no_server_says_so(monkeypatch):
+    """The dialog puts this reason in front of the user, so it has to be real
+    rather than a silently reopened window that still cannot do anything."""
+    monkeypatch.setattr(launch, "_server_running", lambda **kw: False)
+    monkeypatch.setattr(launch, "_wait_for_server", lambda cp, timeout: False)
+    monkeypatch.setattr(
+        launch, "_spawn_server", lambda cp, dp: types.SimpleNamespace(poll=lambda: None)
+    )
+    monkeypatch.setattr(launch, "_terminate", lambda child, **kw: None)
+
+    with pytest.raises(launch.ServerStartupError):
+        launch.restart_server(9001, 9002)
+
+
+def test_the_window_takes_responsibility_for_the_server_it_restarted(monkeypatch):
+    """Whoever closes the window has to release the *current* server, not the
+    dead one it replaced, or the restarted server is left running."""
+    replacement = types.SimpleNamespace(poll=lambda: None)
+    monkeypatch.setattr(launch, "_server_running", lambda **kw: False)
+    monkeypatch.setattr(launch, "_wait_for_server", lambda cp, timeout: True)
+    monkeypatch.setattr(launch, "_spawn_server", lambda cp, dp: replacement)
+
+    terminated = []
+    monkeypatch.setattr(
+        launch, "_terminate", lambda child, **kw: terminated.append(child)
+    )
+    monkeypatch.setattr(
+        launch, "_server_info", lambda **kw: {"clients": 0, "windows": 0}
+    )
+
+    launch._server_child["proc"] = None
+    try:
+        launch.restart_server(9001, 9002)
+        assert launch._server_child["proc"] is replacement
+
+        # The caller still holds the handle to the server that died.
+        dead = types.SimpleNamespace(poll=lambda: 1)
+        launch._release_server(dead, 9001)
+        assert terminated == [replacement]
+    finally:
+        launch._server_child["proc"] = None

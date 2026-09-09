@@ -5,7 +5,13 @@ See bioview-docs/usage/configurator.md.
 
 import sys
 
-from bioview_common import APP_VERSION, ClientStatus, DeviceType
+from bioview_common import (
+    APP_VERSION,
+    CONTROL_PORT,
+    DATA_PORT,
+    ClientStatus,
+    DeviceType,
+)
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QGuiApplication
 from PyQt6.QtWidgets import (
@@ -32,6 +38,7 @@ from PyQt6.QtWidgets import (
 from bioview_client.assets import APP_DESKTOP_NAME, get_app_icon
 from bioview_client.autoconnect import start_localhost_autoconnect
 from bioview_client.components import (
+    DiagnosticsReporter,
     LogDisplayPanel,
     device_details,
     device_health_warning,
@@ -346,11 +353,17 @@ class StatusPanel(QWidget):
 
 
 class ConfiguratorWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, control_port: int = CONTROL_PORT, data_port: int = DATA_PORT):
         super().__init__()
+        self.control_port = control_port
+        self.data_port = data_port
         self.client_worker = None
         self._pending_device = None
         self._config_dialog = None
+        # Every backend fault concerns this window: setting up hardware is the
+        # only thing it does. The Monitor filters the same list down to the
+        # device types its configuration uses.
+        self._diagnostics = DiagnosticsReporter(self)
         self._init_ui()
         self._setup_client()
 
@@ -402,11 +415,14 @@ class ConfiguratorWindow(QMainWindow):
         self.device_panel.set_log_shown(visible)
 
     def _setup_client(self):
-        self.client_worker = Client()
+        self.client_worker = Client(
+            control_port=self.control_port, data_port=self.data_port
+        )
 
         self.client_worker.server_connected.connect(self.on_server_connected)
         self.client_worker.server_disconnected.connect(self.on_server_disconnected)
         self.client_worker.log_message.connect(self.log_panel.add_log_message)
+        self.client_worker.server_diagnostics.connect(self.on_server_diagnostics)
         self.client_worker.devices_listed.connect(self.on_devices_listed)
         self.client_worker.device_list_failed.connect(self.on_device_list_failed)
         self.client_worker.device_config_updated.connect(self.on_device_config_updated)
@@ -447,6 +463,10 @@ class ConfiguratorWindow(QMainWindow):
             warning = device_health_warning(device)
             if warning:
                 self.log_panel.add_log_message("warning", warning)
+
+    def on_server_diagnostics(self, issues: list):
+        """Raise the server's own faults, once each, in the shared modal."""
+        QTimer.singleShot(0, lambda: self._diagnostics.report(issues))
 
     def on_device_list_failed(self, message):
         self.device_panel.set_busy(False)
@@ -522,7 +542,13 @@ class ConfiguratorWindow(QMainWindow):
         event.accept()
 
 
-def run_configurator(argv=None) -> int:
+def run_configurator(
+    argv=None, control_port: int = CONTROL_PORT, data_port: int = DATA_PORT
+) -> int:
+    """Open the Configurator against the server the launcher started.
+
+    The ports are passed in rather than parsed here: the launcher owns them.
+    """
     import qdarktheme
 
     qdarktheme.enable_hi_dpi()
@@ -533,7 +559,7 @@ def run_configurator(argv=None) -> int:
     app.setWindowIcon(get_app_icon())
     qdarktheme.setup_theme(theme="dark")
 
-    window = ConfiguratorWindow()
+    window = ConfiguratorWindow(control_port=control_port, data_port=data_port)
     window.show()
 
     window.log_panel.add_log_message("info", f"BioView Configurator {APP_VERSION}")

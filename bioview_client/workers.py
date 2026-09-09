@@ -1,12 +1,8 @@
 import contextlib
 import json
-import os
-import queue
 import socket
 import struct
-import threading
 import time
-from datetime import datetime
 
 import numpy as np  # TODO: Investigate if this is strictly needed or not
 from bioview_common import (
@@ -128,6 +124,12 @@ class ScanWorker(QRunnable):
 class DeviceInitSignals(QObject):
     # Emit a list of devices when discovery completes
     finished = pyqtSignal(dict)
+    # ({group_id: status}, {group_id: reason}) each time the server's view of
+    # the groups changes while the command is still running. The server brings
+    # the groups up one at a time and has always reported that per group; the
+    # client used to keep it to a debug log line, so the status bar sat on
+    # "connecting" for every group until the last one finished.
+    progress = pyqtSignal(dict, dict)
 
 
 class DeviceInitWorker(QRunnable):
@@ -190,6 +192,8 @@ class DeviceInitWorker(QRunnable):
                     f"({time.monotonic() - started:.0f}s)"
                     + (f": {states}" if states else ""),
                 )
+                errors = (resp_payload or {}).get("device_errors") or {}
+                self._emit_progress(device_status, errors)
 
             time.sleep(DEVICE_OP_POLL_INTERVAL)
 
@@ -197,6 +201,18 @@ class DeviceInitWorker(QRunnable):
             f"{self.command.name} timed out after {self.overall_timeout:.0f}s "
             "with the server still reporting the operation as pending"
         )
+
+    def _emit_progress(self, device_status, device_errors):
+        """Publish a mid-command status map. Never allowed to break the poll.
+
+        An empty map is dropped: the server clears its group states while it
+        re-runs discovery, and a window that acted on that would blank the
+        status bar halfway through an initialization.
+        """
+        if not device_status:
+            return
+        with contextlib.suppress(RuntimeError):
+            self.signals.progress.emit(dict(device_status or {}), dict(device_errors))
 
     def _extract_result(self, resp_type, resp_payload):
         device_status = (resp_payload or {}).get("device_status", {})
@@ -236,6 +252,13 @@ class DeviceInitWorker(QRunnable):
                 raise ValueError("Malformed response from server")
 
             if resp_type == Response.DEVICE_CONNECTING.name:
+                # The acknowledgement already names every group in the request,
+                # all of them "connecting". Publishing it puts the whole group
+                # list into the status bar before the first one is reached.
+                self._emit_progress(
+                    (resp_payload or {}).get("device_status", {}),
+                    (resp_payload or {}).get("device_errors", {}),
+                )
                 deadline = time.monotonic() + self.overall_timeout
                 _, resp_payload, poll_type = self._poll_until_complete(deadline)
                 device_status = self._extract_result(
@@ -356,144 +379,3 @@ class DataStreamer(QThread):
 
     def stop(self):
         self.running = False
-
-
-# 8-byte magic marking a metadata trailer at the end of a .bvr file
-BVR_TRAILER_MAGIC = b"BVRMETA1"
-
-
-class DataSaver(threading.Thread):
-    """Client-side disk writer for .bvr recordings.
-
-    Runs on its own thread so disk I/O never blocks the data receiver. The
-    "bioview-raw-v2" file layout is documented in
-    bioview-docs/reference/bvr-format.md.
-    """
-
-    def __init__(self, save_path, sources=None, device_config=None, log_signal=None):
-        super().__init__(daemon=True)
-        self.save_path = str(save_path)
-        self.sources = sources or []
-        self.device_config = device_config or {}
-        self._log_signal = log_signal
-        self._queue = queue.Queue()
-        self._stop_event = threading.Event()
-        self._file = None
-        self._header_written = False
-
-        # Timestamped device-parameter changes recorded during this run
-        self._changes = []
-        self._changes_lock = threading.Lock()
-        # Timestamped event annotations ("Mark Event") recorded during this run
-        self._annotations = []
-        self._annotations_lock = threading.Lock()
-        self._start_time = None
-
-    def _log(self, level, msg):
-        if self._log_signal is not None:
-            with contextlib.suppress(Exception):
-                self._log_signal.emit(level, msg)
-
-    def start_saving(self):
-        try:
-            parent = os.path.dirname(self.save_path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            # Not a context manager: the file stays open until stop_saving().
-            self._file = open(self.save_path, "wb")  # noqa: SIM115
-            self._start_time = datetime.now()
-            header = {
-                "format": "bioview-raw-v2",
-                "dtype": "float32",
-                "layout": "time_major",
-                "num_sources": len(self.sources),
-                "sources": self.sources,
-                "start_time": self._start_time.isoformat(),
-                "start_time_parts": {
-                    "year": self._start_time.year,
-                    "month": self._start_time.month,
-                    "day": self._start_time.day,
-                    "hour": self._start_time.hour,
-                    "minute": self._start_time.minute,
-                    "second": self._start_time.second,
-                },
-                "device_config": self.device_config,
-            }
-            header_bytes = json.dumps(header, default=str).encode("utf-8")
-            self._file.write(struct.pack("!I", len(header_bytes)) + header_bytes)
-            self._header_written = True
-            self.start()
-            self._log("info", f"Saving data to {self.save_path}")
-        except Exception as e:
-            self._log("error", f"Unable to open save file: {e}")
-            self._file = None
-
-    def add(self, data):
-        if self._file is not None and not self._stop_event.is_set():
-            self._queue.put(data)
-
-    def record_change(self, device_id: str, param: str, value):
-        """Append a timestamped device-parameter change to the recording's
-        metadata trailer."""
-        entry = {
-            "timestamp": datetime.now().isoformat(),
-            "device_id": device_id,
-            "param": param,
-            "value": value,
-        }
-        with self._changes_lock:
-            self._changes.append(entry)
-
-    def record_annotation(self, text: str) -> dict:
-        """Append a timestamped annotation to the recording trailer."""
-        now = datetime.now()
-        elapsed = None
-        if self._start_time is not None:
-            elapsed = (now - self._start_time).total_seconds()
-        entry = {
-            "timestamp": now.isoformat(),
-            "elapsed_seconds": elapsed,
-            "text": str(text),
-        }
-        with self._annotations_lock:
-            self._annotations.append(entry)
-        return entry
-
-    def _write_trailer(self):
-        if self._file is None:
-            return
-        with self._changes_lock:
-            changes = list(self._changes)
-        with self._annotations_lock:
-            annotations = list(self._annotations)
-        trailer = {
-            "end_time": datetime.now().isoformat(),
-            "param_changes": changes,
-            "Annotations": annotations,
-        }
-        trailer_bytes = json.dumps(trailer, default=str).encode("utf-8")
-        self._file.write(trailer_bytes)
-        self._file.write(struct.pack("!Q", len(trailer_bytes)))
-        self._file.write(BVR_TRAILER_MAGIC)
-
-    def run(self):
-        while not self._stop_event.is_set() or not self._queue.empty():
-            try:
-                data = self._queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            try:
-                # data is (num_sources, num_samples); store time-major for easy append
-                block = np.ascontiguousarray(np.asarray(data).T, dtype=np.float32)
-                self._file.write(block.tobytes())
-            except Exception as e:
-                self._log("error", f"Save write error: {e}")
-
-        with contextlib.suppress(Exception):
-            if self._file is not None:
-                self._write_trailer()
-                self._file.flush()
-                self._file.close()
-
-    def stop_saving(self):
-        self._stop_event.set()

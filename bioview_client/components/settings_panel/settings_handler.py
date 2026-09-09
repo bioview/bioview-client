@@ -3,7 +3,12 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import QHBoxLayout, QScrollArea, QVBoxLayout, QWidget
 
 from .common_settings import CommonSettingsPanel
-from .device_settings import BIOPACSettingsPanel, DummySettingsPanel, USRPSettingsPanel
+from .device_settings import (
+    BIOPACSettingsPanel,
+    DummySettingsPanel,
+    MicrophoneSettingsPanel,
+    USRPSettingsPanel,
+)
 from .panel_utils import DEFAULT_MAX_PANEL_HEIGHT, wrap_scrollable
 
 
@@ -27,6 +32,7 @@ def _panel_weight(config):
 SETTINGS_PANEL_MAPPING = {
     SUPPORTED_CONFIGURATION_TYPES.USRP: USRPSettingsPanel,
     SUPPORTED_CONFIGURATION_TYPES.BIOPAC: BIOPACSettingsPanel,
+    SUPPORTED_CONFIGURATION_TYPES.MICROPHONE: MicrophoneSettingsPanel,
     SUPPORTED_CONFIGURATION_TYPES.DUMMY: DummySettingsPanel,
     SUPPORTED_CONFIGURATION_TYPES.EXPERIMENT: CommonSettingsPanel,
 }
@@ -231,6 +237,13 @@ class SettingsPanel(QWidget):
         """Populate the experiment panel's plot-source selector."""
         if self.experiment_panel is not None:
             self.experiment_panel.set_available_sources(sources)
+
+    def set_grid_size(self, rows: int, cols: int):
+        """Reflect a plot-grid layout chosen elsewhere in the spin boxes."""
+        if self.experiment_panel is not None and hasattr(
+            self.experiment_panel, "set_grid_size"
+        ):
+            self.experiment_panel.set_grid_size(rows, cols)
 
     def send_to_log(self, level, msg):
         self.log_event.emit(level, msg)

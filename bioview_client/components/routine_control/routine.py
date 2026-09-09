@@ -58,6 +58,9 @@ class InstructionSpec:
     loop: bool = False
     font_size: int = DEFAULT_TEXT_FONT_SIZE
     line_gap: float | None = None  # seconds between lines; None => all at once
+    # Host audio output to play through. ``None`` falls back to the
+    # experiment-wide ``audio_output_device``, and then to Qt's default.
+    output_device: str | None = None
 
 
 @dataclass
@@ -97,12 +100,15 @@ def parse_instruction(
     if line_gap is not None:
         line_gap = float(line_gap)
 
+    output_device = raw.get("output_device", None)
+
     return InstructionSpec(
         type=instr_type,
         file=file_path,
         loop=bool(raw.get("loop", False)),
         font_size=int(raw.get("font_size", DEFAULT_TEXT_FONT_SIZE)),
         line_gap=line_gap,
+        output_device=str(output_device) if output_device else None,
     )
 
 

@@ -7,11 +7,14 @@ for at startup. See bioview-docs/architecture/client.md.
 import argparse
 import contextlib
 import logging  # TODO: Remove
+import math
 import sys
 import time
 from pathlib import Path
 
 from bioview_common import (
+    CONTROL_PORT,
+    DATA_PORT,
     SUPPORTED_CONFIGURATION_TYPES,
     ClientStatus,
     DataSource,
@@ -26,22 +29,27 @@ from PyQt6.QtWidgets import (
     QDialog,
     QHBoxLayout,
     QMainWindow,
+    QMessageBox,
     QVBoxLayout,
     QWidget,
 )
 
+from bioview_client import launch
 from bioview_client.assets import APP_DESKTOP_NAME, get_app_icon
 from bioview_client.autoconnect import start_localhost_autoconnect
 from bioview_client.components import (
     AnnotateEventPanel,
     AppControlPanel,
     ConfigurationPrompt,
+    DiagnosticsReporter,
     InstructionController,
     LogDisplayPanel,
     LogWindow,
     PlotGrid,
+    ServerLostDialog,
     SettingsPanel,
     StatusBar,
+    list_audio_outputs,
     parse_timed_modes,
 )
 from bioview_client.components.common import Toast
@@ -93,11 +101,27 @@ def split_configurations(configurations):
     return configurations, experiment_config, group_configs
 
 
+def _is_local_server(server: dict) -> bool:
+    """True for a server on this machine, which is the only one we may restart."""
+    address = (server or {}).get("ip") or ""
+    return address in ("127.0.0.1", "localhost", "::1")
+
+
 class BioViewMonitor(QMainWindow):
     """The main acquisition window.
 
     Missing ``group_configs``/``experiment_config`` are prompted for via a dialog.
     """
+
+    #: How long each open-ended operation runs before the status bar stops
+    #: saying "working" and starts saying "still working". One number per
+    #: operation, because what counts as slow differs by an order of
+    #: magnitude: a handshake is a second, a USRP initialization is a minute.
+    CONNECT_SLOW_MS = 6000
+    SCAN_SLOW_MS = 8000
+    DISCOVER_SLOW_MS = 15000
+    INIT_SLOW_MS = 30000
+    BALANCE_SLOW_MS = 20000
 
     def __init__(
         self,
@@ -106,10 +130,14 @@ class BioViewMonitor(QMainWindow):
         # experiment_config: Dict = None,
         autodiscover: bool = True,
         autoconnect: bool = False,
+        control_port: int = CONTROL_PORT,
+        data_port: int = DATA_PORT,
     ):
         super().__init__()
         self.autodiscover = autodiscover
         self.autoconnect = autoconnect
+        self.control_port = control_port
+        self.data_port = data_port
 
         self.config_file = config_file
         if isinstance(self.config_file, list | tuple):
@@ -132,6 +160,27 @@ class BioViewMonitor(QMainWindow):
         self.device_status = {k: DeviceStatus.NOINIT for k in self.group_configs}
 
         self.saving_status = False
+
+        # Groups that failed the most recent initialization, so the success
+        # handler does not report an unqualified success over a partial one.
+        self._pending_init_failures = {}
+
+        # Server-level faults, shown once each. Scoped to the device types this
+        # session actually uses: a BIOPAC driver that will not load is not this
+        # operator's problem if the configuration has no BIOPAC in it.
+        self._diagnostics = DiagnosticsReporter(self)
+        self._configured_device_types = {
+            str(cfg.get_param("device_type", "")).lower()
+            for cfg in self.group_configs.values()
+        }
+
+        # What the status bar has been told about each group, so a repeated
+        # status from the poll is not announced twice.
+        self._announced_group_status = {}
+
+        # True while a scan the user pressed for is outstanding; see
+        # on_server_scan_completed.
+        self._scan_requested = False
 
         # Sources the configuration asks to plot as soon as they are
         # discovered, and the names already honoured. Ticking is a one-shot
@@ -159,9 +208,13 @@ class BioViewMonitor(QMainWindow):
         self.routine_timer.timeout.connect(self._on_routine_tick)
 
         self._init_ui()
+        self._check_routine_instructions()
 
         self.client_worker = Client(
-            experiment_config=self.experiment_config, group_configs=self.group_configs
+            experiment_config=self.experiment_config,
+            group_configs=self.group_configs,
+            control_port=self.control_port,
+            data_port=self.data_port,
         )
         self._connect_client_signals()
         self.client_worker.start_client()
@@ -255,6 +308,10 @@ class BioViewMonitor(QMainWindow):
         self._action_height = action_height + top_layout.spacing()
         self._apply_vertical_budget(int(0.8 * height))
 
+        # The grid has to be big enough for what the configuration asked to
+        # plot before any source arrives; see _size_grid_for_defaults.
+        self._size_grid_for_defaults()
+
         self.status_bar = StatusBar(device_status=self.device_status, parent=self)
         self.setStatusBar(self.status_bar)
 
@@ -285,6 +342,52 @@ class BioViewMonitor(QMainWindow):
         self.plot_grid.setMinimumHeight(int(0.45 * window_height))
         self._splitter.setSizes([controls_height, plots_height])
 
+    #: Spin-box limits in the settings panel; the grid cannot exceed them or
+    #: the displayed layout would not match the one in use.
+    MAX_GRID_ROWS = 4
+    MAX_GRID_COLS = 3
+
+    @classmethod
+    def _grid_for(cls, count: int) -> tuple[int, int]:
+        """Smallest near-square layout holding ``count`` plots, 2x2 at minimum.
+
+        Columns are filled before rows: a plot is a time series, so width buys
+        more than height does.
+        """
+        if count <= 4:
+            return 2, 2
+        cols = min(cls.MAX_GRID_COLS, math.ceil(math.sqrt(count)))
+        rows = min(cls.MAX_GRID_ROWS, math.ceil(count / cols))
+        return rows, cols
+
+    def _size_grid_for_defaults(self):
+        """Grow the plot grid to fit every configured ``display_sources`` entry.
+
+        The grid defaults to 2x2 and ``add_source`` refuses once the cells run
+        out, so a configuration naming five sources silently lost its fifth --
+        and lost it permanently, because a default is only ever applied once
+        (see ``_apply_default_sources``). The count is known at startup, so the
+        grid is sized for it before the first source is advertised.
+        """
+        wanted = len(self._default_source_names)
+        if wanted <= 0:
+            return
+
+        rows, cols = self._grid_for(wanted)
+        if (rows, cols) == (self.plot_grid.rows, self.plot_grid.cols):
+            return
+
+        self.plot_grid.update_grid(rows, cols)
+        self.settings_panel.set_grid_size(rows, cols)
+
+        if rows * cols < wanted:
+            self.log_display_panel.log_message(
+                "warning",
+                f"The configuration lists {wanted} display sources but the plot "
+                f"grid holds at most {rows * cols}; the extra sources will not "
+                "be plotted.",
+            )
+
     def showEvent(self, event):
         """Re-apply the budget once, against the height the window really got.
 
@@ -298,11 +401,15 @@ class BioViewMonitor(QMainWindow):
 
     def _connect_client_signals(self):
         """Connect client signals to UI handlers."""
+        self.client_worker.server_scan_completed.connect(self.on_server_scan_completed)
         self.client_worker.server_scan_completed.connect(
             self.status_bar.on_scan_complete
         )
+        self.client_worker.server_connecting.connect(self.on_server_connecting)
         self.client_worker.server_connected.connect(self.on_server_connected)
         self.client_worker.server_disconnected.connect(self.on_server_disconnected)
+        self.client_worker.server_lost.connect(self.on_server_lost)
+        self.client_worker.server_diagnostics.connect(self.on_server_diagnostics)
 
         self.client_worker.server_scan_progress.connect(
             self.status_bar.update_scan_progress
@@ -313,6 +420,9 @@ class BioViewMonitor(QMainWindow):
         )
         self.client_worker.device_init_failed.connect(self.on_device_init_failed)
         self.client_worker.device_init_succeeded.connect(self.on_devices_ready)
+        self.client_worker.device_init_succeeded.connect(self.on_device_init_succeeded)
+        self.client_worker.device_init_report.connect(self.on_device_init_report)
+        self.client_worker.device_init_progress.connect(self.on_device_init_progress)
         self.client_worker.devices_discovered.connect(self.on_devices_ready)
         self.client_worker.device_disconnect_succeeded.connect(
             self.update_status_bar_and_buttons
@@ -401,9 +511,7 @@ class BioViewMonitor(QMainWindow):
         self.plot_grid.log_event.connect(self.log_display_panel.log_message)
 
     def _connect_statusbar_signals(self):
-        self.status_bar.network_scan_requested.connect(
-            self.client_worker.discover_servers
-        )
+        self.status_bar.network_scan_requested.connect(self.on_network_scan_requested)
 
         self.status_bar.network_scan_cancel_requested.connect(
             self.client_worker.cancel_scan
@@ -422,19 +530,157 @@ class BioViewMonitor(QMainWindow):
         )
 
         self.status_bar.discover_devices_requested.connect(
-            lambda: self.client_worker.initialize_devices(True)
+            self.on_device_discovery_requested
         )
 
     def on_dpic_balance_started(self, device_id: str):
         self.settings_panel.set_balance_running(device_id, True)
+        self.status_bar.show_activity(
+            f"Balancing {device_id}…",
+            level="info",
+            slow_message=f"Still balancing {device_id} — the search sweeps "
+            "phase and amplitude and can take a few minutes",
+            slow_after_ms=self.BALANCE_SLOW_MS,
+        )
 
-    def on_dpic_balance_finished(self, device_id: str, _ok: bool, _message: str):
+    def on_dpic_balance_finished(self, device_id: str, ok: bool, message: str):
         self.settings_panel.set_balance_running(device_id, False)
+        self.status_bar.show_activity(
+            f"Balanced {device_id}" if ok else f"Balance failed on {device_id}",
+            level="success" if ok else "error",
+        )
+        if not ok and message:
+            QTimer.singleShot(
+                0,
+                lambda: self._show_error_dialog(
+                    "DPIC balance",
+                    f"The balance on {device_id} did not complete.",
+                    message,
+                ),
+            )
 
     def on_dpic_balance_progress(self, device_id: str, progress: dict):
         self.settings_panel.apply_balance_progress(device_id, progress)
+        # The sweep name and point count are the only evidence the search is
+        # moving at all; the panel shows them on the button, but the button is
+        # off-screen whenever the settings strip is scrolled elsewhere.
+        stage = progress.get("stage")
+        point, planned = progress.get("point"), progress.get("planned")
+        if stage and point and planned:
+            self.status_bar.show_activity(
+                f"Balancing {device_id}: {stage} {point}/{planned}", level="info"
+            )
+
+    def on_server_scan_completed(self, servers: list):
+        """Report a scan the user asked for. Background rescans stay silent.
+
+        While the window is disconnected it re-scans every few seconds by
+        itself; announcing each of those would put "No BioView servers found"
+        on screen on a five-second loop and make the bar useless for anything
+        that is actually happening.
+        """
+        if not self._scan_requested:
+            return
+        self._scan_requested = False
+
+        count = len(servers or [])
+        self.status_bar.show_activity(
+            f"Found {count} BioView server(s)" if count else "No BioView servers found",
+            level="success" if count else "warning",
+        )
+
+    def on_network_scan_requested(self):
+        self._scan_requested = True
+        self.status_bar.show_activity(
+            "Searching the network for BioView servers…",
+            level="info",
+            slow_message="Still searching — no server has answered yet",
+            slow_after_ms=self.SCAN_SLOW_MS,
+        )
+        self.client_worker.discover_servers()
+
+    def on_server_connecting(self, label: str):
+        self.status_bar.set_server_connecting(label)
+        self.status_bar.show_activity(
+            f"Connecting to {label}…",
+            level="info",
+            slow_message=f"Still connecting to {label} — check that the server "
+            "is running and reachable",
+            slow_after_ms=self.CONNECT_SLOW_MS,
+        )
+
+    def on_server_diagnostics(self, issues: list):
+        """Put a server-level fault in front of the operator, once each.
+
+        Filtered to the device types this configuration uses: the server
+        reports every backend it could not load, and most of them are not
+        this session's concern.
+        """
+        QTimer.singleShot(
+            0,
+            lambda: self._diagnostics.report(issues, self._configured_device_types),
+        )
+
+    def on_device_init_progress(self, group_status: dict, group_errors: dict):
+        """Follow the device groups coming up one at a time.
+
+        The server initializes them in sequence and has always reported each
+        one as it lands; the window used to wait for the whole command to
+        finish before touching the status bar, so a rig where the third group
+        hangs looked identical to one that was simply slow.
+        """
+        for group_id, raw_status in group_status.items():
+            if group_id == "metadata":
+                continue
+
+            status = raw_status
+            if not isinstance(status, DeviceStatus):
+                with contextlib.suppress(Exception):
+                    status = DeviceStatus(raw_status)
+            if not isinstance(status, DeviceStatus):
+                continue
+
+            if self._announced_group_status.get(group_id) == status:
+                continue
+            self._announced_group_status[group_id] = status
+
+            self.device_status[group_id] = status
+            self.status_bar.update_device_status(group_id, status)
+
+            message, level = self._group_activity(group_id, status, group_errors)
+            if message:
+                self.status_bar.show_activity(message, level=level)
+
+    @staticmethod
+    def _group_activity(group_id, status: DeviceStatus, group_errors: dict):
+        """What the bar should say about one group reaching ``status``."""
+        if status == DeviceStatus.CONNECTING:
+            return f"Connecting {group_id}…", "info"
+        if status == DeviceStatus.CONNECTED:
+            return f"{group_id} connected", "success"
+        if status == DeviceStatus.UNAVAILABLE:
+            reason = (group_errors or {}).get(group_id)
+            return f"{group_id} failed" + (f": {reason}" if reason else ""), "error"
+        return None, "info"
+
+    def on_device_discovery_requested(self):
+        self.status_bar.show_activity(
+            "Discovering devices…",
+            level="info",
+            slow_message="Still discovering — enumerating hardware can take a while",
+            slow_after_ms=self.DISCOVER_SLOW_MS,
+        )
+        self._announced_group_status.clear()
+        self.client_worker.initialize_devices(True)
 
     def _handle_streaming_status_changed(self, is_streaming: bool):
+        # Its own level, not "success": starting and stopping a stream is the
+        # routine thing this application does, and green is reserved for
+        # something having gone right.
+        self.status_bar.show_activity(
+            "Streaming started" if is_streaming else "Streaming stopped",
+            level="streaming",
+        )
         if hasattr(self.settings_panel, "set_streaming_locked"):
             self.settings_panel.set_streaming_locked(is_streaming)
         if is_streaming:
@@ -605,7 +851,25 @@ class BioViewMonitor(QMainWindow):
 
         self.command_bar.initialize_button.setEnabled(False)
 
+        # No timeout: initialization runs for up to a couple of minutes with a
+        # USRP in the session, and a message that expires halfway through reads
+        # as "nothing is happening". The per-group messages that follow replace
+        # this one as each group is reached.
+        self._announced_group_status.clear()
+        self.status_bar.show_activity(
+            "Initialization started…",
+            level="info",
+            slow_message="Still initializing — bringing up a USRP takes a minute",
+            slow_after_ms=self.INIT_SLOW_MS,
+        )
+
         self.client_worker.initialize_devices()
+
+    def on_device_init_succeeded(self, _device_status=None):
+        """At least one group came up. Partial failures are reported separately
+        by ``on_device_init_report``, which knows which groups they were."""
+        if not self._pending_init_failures:
+            self.status_bar.show_activity("Initialized successfully!", level="success")
 
     def on_device_init_failed(self):
         """Reset UI when device initialization fails or times out."""
@@ -615,6 +879,91 @@ class BioViewMonitor(QMainWindow):
             self.status_bar.update_device_status(group_id, DeviceStatus.DISCONNECTED)
         if self.client_worker:
             self.command_bar.update_button_states(self.client_worker.status)
+        self.status_bar.show_activity("Initialization failed", level="error")
+
+        # A per-group report explains itself and raises its own dialog. This is
+        # the other case: the command failed outright, so no group has a state
+        # and the only account of it is a log line the operator cannot see.
+        if not self._pending_init_failures:
+            reasons = "\n".join(
+                f"{group}: {reason}"
+                for group, reason in (self.client_worker.device_errors or {}).items()
+            )
+            QTimer.singleShot(
+                0,
+                lambda: self._show_error_dialog(
+                    "Device initialization",
+                    "No device group could be initialized.",
+                    reasons
+                    or "The server returned no device status. Check that it is "
+                    "still running, then try again.",
+                ),
+            )
+
+    def on_device_init_report(self, failures: dict, only_discover: bool):
+        """Put a partial device failure in front of the operator.
+
+        The log already carries every line of this, but a session starts with
+        the log window closed and a half-initialized rig looks identical to a
+        healthy one until a plot stays flat. Discovery is excluded: a device
+        that is merely absent from a scan is not a failure worth a modal.
+        """
+        # Read by on_device_init_succeeded, which is emitted after this and
+        # must not claim an unqualified success.
+        self._pending_init_failures = dict(failures or {})
+
+        if only_discover or not failures:
+            return
+
+        total = len([k for k in self.device_status if k != "metadata"])
+        ok = max(0, total - len(failures))
+        self.status_bar.show_activity(
+            f"Initialized with errors ({ok}/{total} device groups ready)",
+            level="warning",
+        )
+
+        # Queued, not shown inline: a modal spins its own event loop, and this
+        # is running inside a signal emitted from the device-init worker.
+        QTimer.singleShot(
+            0, lambda: self._show_init_failure_dialog(dict(failures), ok, total)
+        )
+
+    def _show_init_failure_dialog(self, failures: dict, ok: int, total: int):
+        detail = "\n\n".join(
+            f"{group}:\n    {reason}" for group, reason in failures.items()
+        )
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Device initialization")
+        box.setText(
+            f"{len(failures)} of {total} device group(s) failed to initialize."
+            if total
+            else f"{len(failures)} device group(s) failed to initialize."
+        )
+        # The reasons go in the body rather than behind "Show Details": they
+        # are the whole point of the dialog, and one extra click hides them
+        # from exactly the operator who needed them.
+        box.setInformativeText(
+            f"{ok} group(s) are ready and the session can continue without "
+            f"these:\n\n{detail}"
+        )
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.exec()
+
+    def _show_error_dialog(self, title: str, text: str, detail: str = ""):
+        """A modal for a failure that has no other way of reaching the user.
+
+        Everything it shows has already been logged; the log window starts
+        closed, which is exactly why this exists.
+        """
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setWindowTitle(title)
+        box.setText(text)
+        if detail:
+            box.setInformativeText(detail)
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.exec()
 
     def _show_toast(self, message: str, level: str = "info"):
         """Show a transient toast notification overlaid on the main window."""
@@ -775,12 +1124,71 @@ class BioViewMonitor(QMainWindow):
         else:
             self.client_worker.stop_streaming()
 
+    def _check_routine_instructions(self):
+        """Report unplayable instruction files, and name the audio outputs.
+
+        A missing file only surfaces today as one error line at the moment the
+        routine starts, by which point the recording is already running and
+        silent. Both checks are cheap and both are done up front.
+        """
+        media_kinds = {"audio", "video"}
+        missing = [
+            (mode.label, mode.instruction.file)
+            for mode in self.timed_modes
+            if mode.instruction and not Path(mode.instruction.file).exists()
+        ]
+        for label, file_path in missing:
+            self.log_display_panel.log_message(
+                "warning",
+                f"Routine '{label}': instruction file not found ({file_path}). "
+                "It will not play.",
+            )
+
+        if not any(
+            mode.instruction and mode.instruction.type in media_kinds
+            for mode in self.timed_modes
+        ):
+            return
+
+        outputs = list_audio_outputs()
+        requested = self.experiment_config.get_param("audio_output_device", None)
+        if not outputs:
+            self.log_display_panel.log_message(
+                "warning", "No audio output device is available; routines will be silent"
+            )
+            return
+
+        self.log_display_panel.log_message(
+            "info",
+            "Audio outputs available: " + "; ".join(outputs),
+        )
+        if requested and not any(
+            str(requested).strip().casefold() in name.casefold() for name in outputs
+        ):
+            self.log_display_panel.log_message(
+                "warning",
+                f"audio_output_device {requested!r} matches none of them; the "
+                "default output will be used",
+            )
+
+    def _on_instruction_log(self, level: str, message: str):
+        self.log_display_panel.log_message(level, message)
+        # A routine that cannot play its instruction is otherwise indicated
+        # only in a log window that is closed by default, while the recording
+        # runs on regardless.
+        if level == "error":
+            self._show_toast(message, level="error")
+
     def _start_instruction(self, spec):
         self._stop_instruction()
         if spec is None:
             return
-        self.instruction_controller = InstructionController(spec, host_widget=self)
-        self.instruction_controller.log_event.connect(self.log_display_panel.log_message)
+        self.instruction_controller = InstructionController(
+            spec,
+            host_widget=self,
+            output_device=self.experiment_config.get_param("audio_output_device", None),
+        )
+        self.instruction_controller.log_event.connect(self._on_instruction_log)
         self.instruction_controller.start()
 
     def _stop_instruction(self):
@@ -794,6 +1202,10 @@ class BioViewMonitor(QMainWindow):
     # Client worker helper functions
     def on_server_connected(self, connected: bool = True):
         self.log_display_panel.log_message("info", "Connected to server")
+        self.status_bar.show_activity(
+            f"Connected to {Client.server_label(self.client_worker.selected_server)}",
+            level="success",
+        )
 
         try:
             self.status_bar.set_server_status(ClientStatus.SERVER_CONNECTED)
@@ -810,6 +1222,8 @@ class BioViewMonitor(QMainWindow):
             self.populate_plot_grid_sources(data_sources)
 
     def on_server_disconnected(self):
+        self.status_bar.show_activity("Disconnected from server", level="warning")
+        self._announced_group_status.clear()
         try:
             self.status_bar.set_server_status(ClientStatus.SERVER_DISCONNECTED)
         except Exception:
@@ -819,8 +1233,82 @@ class BioViewMonitor(QMainWindow):
         self.settings_panel.set_available_sources([])
         self.plot_grid.clear_sources()
 
+        self._forget_device_status()
+
         self.command_bar.update_button_states(self.client_worker.status)
         self.log_display_panel.log_message("warning", "Disconnected from server")
+
+    def _forget_device_status(self):
+        """Drop what we believed about the devices; the server is gone.
+
+        Whatever was initialized belonged to a server this window can no longer
+        reach. Keeping the old statuses on screen would leave the operator
+        looking at devices that are ready according to the UI and absent
+        according to everything else.
+        """
+        for group_id in self.device_status:
+            self.device_status[group_id] = DeviceStatus.NOINIT
+            with contextlib.suppress(Exception):
+                self.status_bar.update_device_status(group_id, DeviceStatus.NOINIT)
+
+    def _resume_reconnect_attempts(self, was_local: bool):
+        """Restart the retry timers that stopped when this window first connected.
+
+        Both stop themselves on success and nothing used to start them again,
+        so a window that lost its server sat disconnected forever -- even once
+        a server was back and answering on the very port it was watching.
+
+        Only ever called for a server that *went away*, never for a disconnect
+        the user asked for: the Monitor pointedly does not relatch onto
+        localhost, so that someone who disconnected on purpose is not dragged
+        straight back. And the localhost probe is only resumed for a window
+        that was using the local server, or losing a LAN server would quietly
+        move the window onto a different machine's.
+        """
+        timers = ["_rescan_timer"]
+        if was_local:
+            timers.append("_localhost_timer")
+
+        for name in timers:
+            timer = getattr(self, name, None)
+            if timer is not None and not timer.isActive():
+                with contextlib.suppress(Exception):
+                    timer.start()
+
+    def on_server_lost(self, server: dict):
+        """The server went away by itself. Say so, and offer to start another.
+
+        Only for a server this window is entitled to restart: a LAN server
+        belongs to another machine, and the retry timers are the whole answer
+        there.
+        """
+        self.log_display_panel.log_message("error", "The server stopped responding")
+        self.status_bar.show_activity(
+            "The server stopped responding", level="error", timeout_ms=0
+        )
+
+        was_local = _is_local_server(server)
+        self._resume_reconnect_attempts(was_local)
+
+        if not was_local:
+            return
+
+        dialog = ServerLostDialog(
+            restart=lambda: launch.restart_server(self.control_port, self.data_port),
+            parent=self,
+        )
+        outcome = dialog.exec()
+
+        if outcome == ServerLostDialog.QUIT:
+            self.close()
+            return
+
+        if outcome == QDialog.DialogCode.Accepted:
+            self.log_display_panel.log_message("info", "Server restarted")
+            # The re-armed localhost timer does the reconnecting; nudge it so
+            # the window does not sit disconnected for another whole interval.
+            with contextlib.suppress(Exception):
+                self.client_worker.quick_connect_localhost()
 
     def on_streaming_started(self):
         if hasattr(self.settings_panel, "set_streaming_locked"):
@@ -864,8 +1352,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run_monitor(argv=None) -> int:
+def run_monitor(
+    argv=None, control_port: int = CONTROL_PORT, data_port: int = DATA_PORT
+) -> int:
     """Build the Qt application, show the window and run the event loop.
+
+    The ports come from the launcher rather than the command line: it is the
+    launcher that parsed them and started the server on them.
 
     Returns the Qt exit code rather than calling ``sys.exit``, so the caller
     can clean up afterwards.
@@ -889,6 +1382,8 @@ def run_monitor(argv=None) -> int:
         config_file=args.config_file,
         autodiscover=args.autodiscover,
         autoconnect=args.autoconnect,
+        control_port=control_port,
+        data_port=data_port,
     )
     # Maximized, not fullscreen: the title bar and taskbar stay visible.
     window.showMaximized()
