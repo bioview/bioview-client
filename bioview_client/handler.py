@@ -217,6 +217,12 @@ class Client(QThread):
         self.scan_pool.setMaxThreadCount(32)
         self._cancel_scan = False
 
+        # Balances hold a worker for minutes at a time, one per group. On the
+        # shared pool a rig with enough groups would leave nothing for Start,
+        # Stop or a parameter change.
+        self.balance_pool = QThreadPool()
+        self.balance_pool.setMaxThreadCount(16)
+
         # Keeps the fast localhost probe and a LAN autoconnect from racing
         self._connecting = False
         self._connect_guard_lock = threading.Lock()
@@ -228,10 +234,11 @@ class Client(QThread):
         self._start_streaming_lock = threading.Lock()
         self._start_streaming_pending = False
 
-        # One balance at a time, and never on the GUI thread; see
-        # run_dpic_balance().
+        # One balance per device group at a time, and never on the GUI thread;
+        # see run_dpic_balance(). Groups run side by side: each is its own
+        # hardware, so a second group has nothing to wait for.
         self._dpic_balance_lock = threading.Lock()
-        self._dpic_balance_running = False
+        self._dpic_balance_running = set()
 
         # Serializes send/recv against close across threads
         self._control_lock = threading.Lock()
@@ -1188,13 +1195,16 @@ class Client(QThread):
             return False
 
         with self._dpic_balance_lock:
-            already_running = self._dpic_balance_running
-            self._dpic_balance_running = True
+            already_running = device_id in self._dpic_balance_running
+            self._dpic_balance_running.add(device_id)
         if already_running:
-            # The flag is left set: the run that owns it is still going and
-            # will clear it. The button stays disabled for the same reason --
-            # re-enabling it here would only invite another refusal.
-            self.log_message.emit("warning", "A DPIC balance is already running")
+            # The entry is left in place: the run that owns it is still going
+            # and will clear it. The button stays disabled for the same reason
+            # -- re-enabling it here would only invite another refusal. Other
+            # groups are untouched; theirs can start while this one runs.
+            self.log_message.emit(
+                "warning", f"A DPIC balance is already running on {device_id}"
+            )
             self.dpic_balance_started.emit(device_id)
             return False
 
@@ -1212,7 +1222,7 @@ class Client(QThread):
                 dev, False, message
             )
         )
-        self.thread_pool.start(worker)
+        self.balance_pool.start(worker)
         return True
 
     def _report_dpic_refusal(self, device_id: str, message: str):
@@ -1227,9 +1237,36 @@ class Client(QThread):
 
     def _on_dpic_balance_done(self, device_id: str, ok: bool, message: str):
         with self._dpic_balance_lock:
-            self._dpic_balance_running = False
+            self._dpic_balance_running.discard(device_id)
         self.log_message.emit("info" if ok else "error", message)
         self.dpic_balance_finished.emit(device_id, ok, message)
+
+    @staticmethod
+    def _dpic_state_for(status_payload, device_id: str):
+        """This group's balance state from a status reply.
+
+        Returns None when the server reports no balance state at all, and an
+        empty dict when it reports state but not yet for this group -- one
+        cannot be polled, the other only has to be waited for.
+
+        Balances run per group, so the per-group map is what a concurrent run
+        must read: the singular ``dpic_balance`` field is whichever group
+        started last, and reading it while two searches ran let one group's
+        outcome end the other group's wait. It is still the fallback for a
+        server that predates the map.
+        """
+        payload = status_payload or {}
+        states = payload.get("dpic_balances")
+        if isinstance(states, dict):
+            return states.get(device_id) or {}
+        state = payload.get("dpic_balance") or {}
+        if not state:
+            return None
+        # An old server tracks one balance; make sure it is this one's.
+        reported = state.get("device_id")
+        if reported is not None and reported != device_id:
+            return {}
+        return state
 
     def _run_dpic_balance_blocking(self, device_id: str):
         """Ask the server to start a balance, then poll until it reports one.
@@ -1259,11 +1296,13 @@ class Client(QThread):
             status_type, status_payload = parse_and_validate_response(status)
             if status_type != Response.SUCCESS.name:
                 continue
-            state = (status_payload or {}).get("dpic_balance") or {}
+            state = self._dpic_state_for(status_payload, device_id)
             # A server that does not report balance state at all cannot be
             # polled; treat the acknowledged start as all the answer there is.
-            if not state:
+            if state is None:
                 return True, "DPIC balance started"
+            if not state:
+                continue  # Reported, but this group's entry has not appeared yet.
 
             progress = state.get("progress")
             if isinstance(progress, dict) and progress:

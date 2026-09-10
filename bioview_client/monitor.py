@@ -182,6 +182,11 @@ class BioViewMonitor(QMainWindow):
         # on_server_scan_completed.
         self._scan_requested = False
 
+        # Groups whose balance is in flight. Searches run side by side, so one
+        # group finishing must not retire the status bar out from under the
+        # ones still going.
+        self._balancing_devices = []
+
         # Sources the configuration asks to plot as soon as they are
         # discovered, and the names already honoured. Ticking is a one-shot
         # per name: the config states the starting view, it does not keep
@@ -535,20 +540,37 @@ class BioViewMonitor(QMainWindow):
 
     def on_dpic_balance_started(self, device_id: str):
         self.settings_panel.set_balance_running(device_id, True)
+        if device_id not in self._balancing_devices:
+            self._balancing_devices.append(device_id)
+        running = ", ".join(self._balancing_devices)
         self.status_bar.show_activity(
-            f"Balancing {device_id}…",
+            f"Balancing {running}…",
             level="info",
-            slow_message=f"Still balancing {device_id} — the search sweeps "
+            slow_message=f"Still balancing {running} — the search sweeps "
             "phase and amplitude and can take a few minutes",
             slow_after_ms=self.BALANCE_SLOW_MS,
         )
 
     def on_dpic_balance_finished(self, device_id: str, ok: bool, message: str):
         self.settings_panel.set_balance_running(device_id, False)
-        self.status_bar.show_activity(
-            f"Balanced {device_id}" if ok else f"Balance failed on {device_id}",
-            level="success" if ok else "error",
-        )
+        if device_id in self._balancing_devices:
+            self._balancing_devices.remove(device_id)
+        outcome = f"Balanced {device_id}" if ok else f"Balance failed on {device_id}"
+        if self._balancing_devices:
+            # Saying only "Balanced A" while B is still sweeping reads as done.
+            remaining = ", ".join(self._balancing_devices)
+            self.status_bar.show_activity(
+                f"{outcome} — still balancing {remaining}…",
+                level="info",
+                slow_message=f"Still balancing {remaining} — the search sweeps "
+                "phase and amplitude and can take a few minutes",
+                slow_after_ms=self.BALANCE_SLOW_MS,
+            )
+        else:
+            self.status_bar.show_activity(
+                outcome,
+                level="success" if ok else "error",
+            )
         if not ok and message:
             QTimer.singleShot(
                 0,
