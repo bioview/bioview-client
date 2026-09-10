@@ -8,8 +8,7 @@ from bioview_common.datatypes.configuration.hardware_params import (
     GLOBAL_RX_PARAMS,
     GLOBAL_TX_PARAMS,
     resolve_param_values,
-    update_device_rx_param,
-    update_device_tx_param,
+    update_device_param,
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
@@ -132,9 +131,9 @@ def add_param_rows(
 def hardware_aware_update_param(device_configuration, param: str, value, idx=None):
     """Update config object using nested hardware when present."""
     if param in GLOBAL_TX_PARAMS:
-        return update_device_tx_param(device_configuration, param, value, idx)
+        return update_device_param(device_configuration, param, value, idx, kind="tx")
     if param in GLOBAL_RX_PARAMS:
-        return update_device_rx_param(device_configuration, param, value, idx)
+        return update_device_param(device_configuration, param, value, idx, kind="rx")
     if idx is not None:
         current_value = resolve_param_values(device_configuration, param)
         updated_value = list(current_value)

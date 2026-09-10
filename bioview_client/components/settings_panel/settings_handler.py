@@ -5,7 +5,6 @@ from PyQt6.QtWidgets import QHBoxLayout, QScrollArea, QVBoxLayout, QWidget
 from .common_settings import CommonSettingsPanel
 from .device_settings import (
     BIOPACSettingsPanel,
-    DummySettingsPanel,
     MicrophoneSettingsPanel,
     USRPSettingsPanel,
 )
@@ -33,7 +32,6 @@ SETTINGS_PANEL_MAPPING = {
     SUPPORTED_CONFIGURATION_TYPES.USRP: USRPSettingsPanel,
     SUPPORTED_CONFIGURATION_TYPES.BIOPAC: BIOPACSettingsPanel,
     SUPPORTED_CONFIGURATION_TYPES.MICROPHONE: MicrophoneSettingsPanel,
-    SUPPORTED_CONFIGURATION_TYPES.DUMMY: DummySettingsPanel,
     SUPPORTED_CONFIGURATION_TYPES.EXPERIMENT: CommonSettingsPanel,
 }
 

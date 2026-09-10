@@ -338,7 +338,7 @@ class DataStreamer(QThread):
                 return None
             try:
                 chunk = self.data_conn.recv(num_bytes - received)
-            except socket.timeout:
+            except TimeoutError:
                 continue  # idle gap; keep waiting while still running
             except OSError as e:
                 if self.running:

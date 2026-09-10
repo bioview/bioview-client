@@ -44,16 +44,16 @@ def test_selection_state_round_trips(qapp, sources):
 
 def test_monitor_registers_a_default_experiment_config(qapp):
     """A config with only device groups still gets an Experiment settings tab."""
-    from bioview_common import DummyConfiguration
+    from bioview_common import BiopacConfiguration
 
     from bioview_client.monitor import split_configurations
 
-    groups = {"Dummy": DummyConfiguration({})}
+    groups = {"Device": BiopacConfiguration({})}
     configurations, experiment_config, group_configs = split_configurations(groups)
 
     assert isinstance(experiment_config, ExperimentConfiguration)
     assert "Experiment" in configurations
-    assert list(group_configs) == ["Dummy"]
+    assert list(group_configs) == ["Device"]
 
     panel = SettingsPanel(configurations)
     assert panel.experiment_panel is not None

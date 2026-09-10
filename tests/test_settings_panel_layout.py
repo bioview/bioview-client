@@ -8,7 +8,7 @@ ends flush with the window edge.
 """
 
 import pytest
-from bioview_common import DummyConfiguration, ExperimentConfiguration
+from bioview_common import BiopacConfiguration, ExperimentConfiguration
 
 from bioview_client.components.settings_panel import SettingsPanel
 
@@ -16,7 +16,7 @@ from bioview_client.components.settings_panel import SettingsPanel
 def _panel(count):
     configurations = {"Experiment": ExperimentConfiguration({})}
     for i in range(count - 1):
-        configurations[f"Dummy{i}"] = DummyConfiguration({})
+        configurations[f"Device{i}"] = BiopacConfiguration({})
     return SettingsPanel(configurations)
 
 
@@ -59,9 +59,9 @@ def test_fewer_panels_than_columns_share_the_whole_strip(qapp):
 
 def test_every_configuration_gets_a_panel_and_keeps_its_id(qapp):
     panel = _panel(3)
-    assert set(panel.setting_widgets) == {"Experiment", "Dummy0", "Dummy1"}
+    assert set(panel.setting_widgets) == {"Experiment", "Device0", "Device1"}
     # The group box carries the identity the tab bar used to.
-    assert panel.setting_widgets["Dummy0"].title() == "Dummy0 Settings"
+    assert panel.setting_widgets["Device0"].title() == "Device0 Settings"
     assert panel.experiment_panel is not None
 
 
@@ -75,7 +75,7 @@ def _weighted_panel(shares):
     configurations = {}
     for i, share in enumerate(shares):
         cfg = {} if share is None else {"panel_width": share}
-        configurations[f"Dummy{i}"] = DummyConfiguration(cfg)
+        configurations[f"Device{i}"] = BiopacConfiguration(cfg)
     return SettingsPanel(configurations)
 
 

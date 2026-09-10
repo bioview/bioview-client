@@ -135,9 +135,6 @@ class CommonSettingsPanel(QGroupBox):
     def update_grid(self):
         self.grid_layout_changed.emit(self.rows_input.value(), self.cols_input.value())
 
-    def grid_size(self) -> tuple[int, int]:
-        return self.rows_input.value(), self.cols_input.value()
-
     def set_grid_size(self, rows: int, cols: int):
         """Show a layout chosen elsewhere without asking for it again.
 

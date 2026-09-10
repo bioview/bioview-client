@@ -85,9 +85,9 @@ class DeviceSettingsPanel(QGroupBox):
 class RFSettingsPanel(DeviceSettingsPanel):
     """Shared RF device tab: parameter grid, calibration row, channel map.
 
-    The USRP panel and the dummy backend's RF panel differ only in which
-    parameters they expose, so the layout and every calibration/channel-map
-    handler live here -- they were duplicated line for line and drifted apart.
+    Every RF device shares the layout and the calibration / channel-map
+    handlers; a subclass supplies only the parameters it exposes. These were
+    duplicated line for line per device and drifted apart.
     """
 
     run_dpic_balance = pyqtSignal(str)
@@ -440,90 +440,6 @@ class BIOPACSettingsPanel(DeviceSettingsPanel):
             widget.setEnabled(not locked)
         for cb in getattr(self, "channel_checks", []):
             cb.setEnabled(not locked)
-
-
-class DummySettingsPanel(RFSettingsPanel):
-    """Dummy backend: a plain signal generator, or the RF simulator.
-
-    ``hardware`` in the config is what distinguishes them -- with it the dummy
-    stands in for a USRP group and gets the same RF tab.
-    """
-
-    PARAM_MAPPINGS = {
-        "tx_gain": ("TX Gain (dB)", (0, 70), 1, 1, 0),
-        "tx_amplitude": ("IF Amplitude", (0, 1), 1, 0.1, 2),
-        "tx_phase": ("IF Phase (deg)", (-180, 180), 1, 1, 1),
-        "if_freq": ("IF Frequency (kHz)", (20, 400), 1e3, 0.1, 2),
-        "samp_rate": ("Sample Rate (MSps)", (0.1, 10), 1e6, 0.1, 2),
-    }
-
-    LEGACY_PARAM_SPECS = [
-        ("samp_rate", "Sample Rate (Hz)", (1, 1000000), 100, 0),
-        ("num_channels", "Channels", (1, 64), 1, 0),
-        ("signal_freq", "Signal Freq. (Hz)", (0.01, 10000.0), 0.1, 2),
-        ("amplitude", "Amplitude", (0.0, 1000.0), 0.1, 2),
-        ("noise_std", "Noise Std-Dev", (0.0, 100.0), 0.1, 2),
-        ("chunk_duration", "Chunk Duration (s)", (0.001, 1.0), 0.01, 3),
-    ]
-
-    def __init__(self, device_configuration, parent=None):
-        super().__init__(device_configuration, parent)
-        self._streaming_locked = False
-        self._rf_mode = bool(device_configuration.get_param("hardware"))
-        self.init_ui()
-
-    def init_ui(self):
-        if self._rf_mode:
-            self._build_rf_ui(self.PARAM_MAPPINGS)
-        else:
-            self._init_legacy_ui()
-
-    def _init_legacy_ui(self):
-        layout = QGridLayout()
-        self.param_inputs = {}
-        for row, (
-            param_name,
-            label_text,
-            (min_val, max_val),
-            step,
-            decimals,
-        ) in enumerate(self.LEGACY_PARAM_SPECS):
-            layout.addWidget(QLabel(label_text), row, 0)
-            value = self.device_configuration.get_param(param_name)
-            if decimals == 0:
-                widget = QSpinBox()
-                widget.setRange(int(min_val), int(max_val))
-                widget.setSingleStep(int(step))
-                widget.setValue(
-                    int(value) if isinstance(value, int | float) else int(min_val)
-                )
-            else:
-                widget = QDoubleSpinBox()
-                widget.setRange(float(min_val), float(max_val))
-                widget.setDecimals(decimals)
-                widget.setSingleStep(float(step))
-                widget.setValue(
-                    float(value) if isinstance(value, int | float) else float(min_val)
-                )
-            widget.setMaximumWidth(self.PARAM_INPUT_WIDTH)
-            widget.valueChanged.connect(
-                lambda val, param_name=param_name: self.update_param(param_name, val)
-            )
-            layout.addWidget(widget, row, 1)
-            self.param_inputs[param_name] = widget
-        layout.setColumnStretch(2, 1)
-        self.setLayout(layout)
-
-    def set_streaming_locked(self, locked: bool):
-        self._streaming_locked = locked
-        if not self._rf_mode:
-            return
-        super().set_streaming_locked(locked)
-
-    def get_emittable_signals(self):
-        if self._rf_mode:
-            return super().get_emittable_signals()
-        return {"update_device_param": self.update_device_param}
 
 
 class MicrophoneSettingsPanel(DeviceSettingsPanel):

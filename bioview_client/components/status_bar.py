@@ -162,7 +162,7 @@ class ServerConnector(QWidget):
                 display_name = server.get("ip", None)
 
             if not display_name:
-                display_name = "Dummy Server"
+                display_name = "Unnamed Server"
 
             self.server_dropdown.addItem(display_name)
 
